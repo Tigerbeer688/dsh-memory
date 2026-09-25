@@ -187,6 +187,8 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
 
   /** 最近一次观测到的宿主会话标识（见 sessionIdOf；空串 = 未知/无会话）。 */
   let lastSession = ''
+  /** 最近一次真实用户消息（脱敏后，截断 300 字）；knowledge 召回查询词来源。 */
+  let lastUserMsg = ''
 
   /** 记忆沉淀（fire-and-forget）。认知图未就绪则跳过并告警（不退回 AEIS）。 */
   const memorize = (label: string, run: (g: MdcgClient) => Promise<unknown>): void => {
@@ -225,8 +227,6 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     // 去重状态：同一块内容只保留一份 surface 节点，避免随步数线性增长。
     let lastRecallText = ''
     let skippedSincePush = 0
-    // 缓存最近用户消息，用于动态生成 knowledge 召回查询词
-    let lastUserMsg = ''
     ctx.on('system-prompt/assemble', async (assembly, _ctx, next) => {
       try {
         // 异步取最近记忆节点（失败静默——不阻塞模型请求）
