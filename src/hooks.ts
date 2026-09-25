@@ -205,6 +205,8 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     // 去重状态：同一块内容只保留一份 surface 节点，避免随步数线性增长。
     let lastRecallText = ''
     let skippedSincePush = 0
+    // 缓存最近用户消息，用于动态生成 knowledge 召回查询词
+    let lastUserMsg = ''
     ctx.on('system-prompt/assemble', async (assembly, _ctx, next) => {
       try {
         // 异步取最近记忆节点（失败静默——不阻塞模型请求）
@@ -222,6 +224,35 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
             })
           } else {
             skippedSincePush += 1
+          }
+          // 2) knowledge 层：基于当前对话上下文召回高相关度教训
+          if (lastUserMsg) {
+            try {
+              const query = lastUserMsg.slice(0, 80) + ' 教训 经验 错误'
+              const kr = await graph.recall(query, 8)
+              const kItems = (kr && Array.isArray((kr as any).pack)) ? (kr as any).pack : (kr && Array.isArray((kr as any).results)) ? (kr as any).results : (Array.isArray(kr) ? kr : [])
+              ctx.logger.info(`dsh-memory: knowledge-recall(query="${query.slice(0, 40)}") 返回 ${kItems.length} 条`)
+              const kText = kItems
+                .filter((r: any) => {
+                  const content = (r && r.content) || (r && r.node && r.node.content) || ''
+                  const score = r && r.score ? r.score : 0
+                  return content.length > 20 && score >= 0.15
+                })
+                .slice(0, 5)
+                .map((r: any) => {
+                  const content = (r && r.content) || (r && r.node && r.node.content) || ''
+                  const score = r && r.score ? r.score.toFixed(2) : '?'
+                  const preview = String(content).replace(/\s+/g, ' ').trim().slice(0, 200)
+                  return `- [knowledge|score=${score}] ${preview}`
+                })
+                .join('\n')
+              if (kText) {
+                assembly.contexts.push({
+                  name: 'lingshu:knowledge-recall',
+                  text: escapePromptBraces(`【灵枢交易教训】\n${kText}`),
+                })
+              }
+            } catch (e: any) { ctx.logger.warn(`dsh-memory: knowledge-recall 失败: ${e.message}`) }
           }
         }
       }
@@ -243,6 +274,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       if (!text) return
       const safe = sanitize(text)  // 脱敏：纯凭据消息 → null → 跳过写入
       if (safe === null) return
+      lastUserMsg = safe.slice(0, 300) // 缓存最近用户消息供 knowledge 召回使用
       memorize('user', (g) => g.remember(safe, {
         role: 'user', tags: ['dsh', 'user'], importance: opts.importance,
       }))
