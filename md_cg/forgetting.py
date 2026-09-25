@@ -48,7 +48,7 @@ import os
 import time
 
 from . import lifecycle, nodefile
-from .fsutil import append_jsonl, atomic_write, read_jsonl
+from .fsutil import append_jsonl, atomic_write, publish, read_jsonl
 from .mdcg import bigrams
 
 # ---------------------------------------------------------------- 判据常量
@@ -80,6 +80,7 @@ LOG_FILE = "_forgetting.jsonl"
 
 # ---------------------------------------------------------------- 三问
 
+# 生效条件：role 与 verification_basis 各自经 str(x or "").strip().lower() 后按序判——role 命中模块常量 EXTERNAL_ROLES 返回 "external_surprising"；否则 role 命中 INTERNAL_ROLES、或两者都不命中前者时 verification_basis 命中 DETERMINISTIC_BASIS，返回 "internal_deterministic"；否则 role 为 "assistant"/"agent" 返回 "self_generated"；全不命中返回 "unknown"。
 def source_kind(role=None, verification_basis=None):
     """Q3 的来源面：内部确定性产生 vs 外部惊奇来源。"""
     r = str(role or "").strip().lower()
@@ -95,6 +96,7 @@ def source_kind(role=None, verification_basis=None):
     return "unknown"
 
 
+# 生效条件：new_grams 为空集（假值）时返回 0.0；非空时返回 len(new_grams & body_grams)/len(new_grams)。
 def _coverage(new_grams, body_grams):
     if not new_grams:
         return 0.0
@@ -107,6 +109,7 @@ def _coverage(new_grams, body_grams):
 _TEMPLATE_LABELS = ("功能名", "生效条件", "子功能", "执行", "验证方式", "不适用条件")
 
 
+# 生效条件：content 为 None 或假值时按 "" 处理，结果为空串；否则逐行剥离 "#" 与 _TEMPLATE_LABELS 标签后以 "" 直接拼接。
 def payload(content):
     """剥离 CCG 固定标签后的**内容骨架**（保留字段值，丢弃字段名与标记）。"""
     out = []
@@ -123,6 +126,7 @@ def payload(content):
     return "".join(out)
 
 
+# 生效条件：content 经 payload/bigrams 得空集合时直接返回零值 best（max=0.0、with=None、compared=0）；否则遍历 cg.index 的 nodes，跳过 nid==exclude，layer 为真值时只比较 str(layer 字段 or "")==layer 的节点，cg.get(nid) 抛异常/返回假值、或该节点 content 的 bigrams 为空则跳过，每计入一个节点后若 n>=limit 立即 break（故 limit 为 0 或负数时只比较首项即停），返回覆盖度最大者 best（无覆盖度提升时不更新 with/jaccard，compared 为实际计入数）。
 def redundancy(cg, content, layer="contextual", exclude=None, limit=MAX_COMPARE):
     """Q1 重复？——新内容被既有同层节点覆盖的最大比例。"""
     new = bigrams(payload(content))
@@ -157,6 +161,7 @@ def redundancy(cg, content, layer="contextual", exclude=None, limit=MAX_COMPARE)
     return best
 
 
+# 生效条件：dup 必填并转 float；dup=0 时 p 取 EPS，返回 -log2(EPS) 这一有限大值；dup>=1 时返回 0.0。
 def self_information(dup):
     """Q3 的自信息代理：I = -log2(min(1, dup + ε))，单位 bit。
 
@@ -167,6 +172,7 @@ def self_information(dup):
     return -math.log(p, 2.0)
 
 
+# 生效条件：hint 非 None 且可转 float（含 hint=0）时返回 from="hint" 的裁剪分数；否则用 novelty、SOURCE_WEIGHT.get(kind, SOURCE_WEIGHT["unknown"])、len(content)/200 三因子启发式。
 def importance_score(hint, novelty, kind, content):
     """Q2 重要？——显式 hint 优先，否则启发式（对齐 longterm_snapshot 四因子简化版）。"""
     if hint is not None:
@@ -182,6 +188,7 @@ def importance_score(hint, novelty, kind, content):
     return {"score": round(max(0.0, min(1.0, s)), 4), "from": "heuristic"}
 
 
+# 生效条件：以 source_kind(role,verification_basis) 的 kind 与 redundancy(cg,content,layer=layer,exclude=node_id) 的 red["max"] 为输入，按 if/elif 顺序取首个命中分支——imp["score"]≥PROTECT_IMPORTANCE→"ACCEPT"；否则 kind=="internal_deterministic" 且 red["max"]≥DUP_DROP→"DROP"；否则 red["max"]≥DUP_MERGE→"MERGE"；否则 red["max"]≥DUP_DROP 且 imp["score"]<IMPORTANCE_MIN→"DEFER"；否则 imp["score"]≥IMPORTANCE_MIN→"ACCEPT"；否则 novelty≥NOVELTY_MIN→"ACCEPT"；否则→"DEFER"。
 def assess(cg, content, layer="contextual", role=None, verification_basis=None,
            importance_hint=None, node_id=None):
     """三问 → 四态裁决。返回完整判据（可审计，不只给结论）。"""
@@ -226,6 +233,7 @@ def assess(cg, content, layer="contextual", role=None, verification_basis=None,
 
 # ---------------------------------------------------------------- 落库动作
 
+# 生效条件：cg 与 rec 必填；append_jsonl 写 cg.root/LOG_FILE 抛任意异常时被吞掉，仍返回 rec。
 def log(cg, rec):
     """裁决留痕（append-only）。DROP/DEFER 也留痕——否则遗忘变黑箱。"""
     try:
@@ -235,6 +243,7 @@ def log(cg, rec):
     return rec
 
 
+# 生效条件：cg 与 node_id 必填，delta 默认 0.05；cg.get(node_id) 抛异常或返回假值时返回 None；imp 跨过 PROTECT_IMPORTANCE 即写 protected。
 def reinforce(cg, node_id, delta=0.05):
     """MERGE 的落库动作：不新增节点，把「又一次见到」折算成既有节点的强化。
 
@@ -276,6 +285,7 @@ def reinforce(cg, node_id, delta=0.05):
             "merge_count": fm["merge_count"], "protected": bool(fm.get("protected"))}
 
 
+# 生效条件：cg 必填，limit 默认 100；日志路径不存在时返回 []；否则返回 out[-limit:]，limit=0 时 -0 退化为 out[0:] 即全量。
 def history(cg, limit=100):
     """读取遗忘留痕（最近 limit 条）。"""
     p = os.path.join(cg.root, LOG_FILE)
@@ -296,6 +306,7 @@ def history(cg, limit=100):
     return out[-limit:]
 
 
+# 生效条件：cg 必填；日志路径不存在返回 {"total": 0, "by_verdict": {}}；否则流式累计行数与 verdict 分布。
 def summary(cg):
     """遗忘留痕聚合（流式，不把全量日志读进内存）：总数 + 四态分布。"""
     p = os.path.join(cg.root, LOG_FILE)
@@ -339,6 +350,7 @@ VERIFIED_BASES = ("formal_proof", "compiler", "test", "textbook", "public_kb")
 TIER_WORKING = 0.40
 
 
+# 生效条件：e 必填；protected 为真、importance>=PROTECT_IMPORTANCE、或 evidence_count>=3 且 verification_basis 在 VERIFIED_BASES → "longterm"；importance>=TIER_WORKING 或 vb 在 VERIFIED_BASES → "working"；否则 "candidate"。
 def _tier_of(e: dict) -> str:
     """索引快照 → 分层：longterm（长期）/ working（工作）/ candidate（候选待评估）。"""
     imp = float(e.get("importance", 0.5) or 0.5)
@@ -351,19 +363,23 @@ def _tier_of(e: dict) -> str:
     return "candidate"
 
 
+# 生效条件：e 必填；e["edges"] 为假值（缺失/空列表）且 e["subgraph"] 为假值时返回 True，否则 False。
 def _is_island(e: dict) -> bool:
     """无边孤岛：既无出边也无子图声明（夜间整理的首要候选）。"""
     return (not (e.get("edges") or [])) and (not e.get("subgraph"))
 
 
+# 生效条件：cg 必填且提供 cg.root，恒返回 os.path.join(cg.root, LONGTERM_DIR)。
 def longterm_dir(cg) -> str:
     return os.path.join(cg.root, LONGTERM_DIR)
 
 
+# 生效条件：cg 必填，恒返回 longterm_dir(cg) 下的 "current.json" 路径。
 def current_path(cg) -> str:
     return os.path.join(longterm_dir(cg), "current.json")
 
 
+# 生效条件：apply 为真且由 cg.index 的 nodes（layer 为假值时不过滤、为真时仅取 layer 字段相等者，max_rows 为真值时先取 ids[:int(max_rows)]）算出的 snapshot_id 与 current.json 所记 snapshot_id 不同或其记录的 path 文件不存在（same 为假）时，才写断面文件、原子更新 current 指针、执行 _prune 并追加维护日志；apply 为假时只返回 dry_run=True 的统计（out 与 force 在源码中未被引用）。
 def longterm_assess(cg, apply=False, out=None, layer=None, keep=LONGTERM_KEEP,
                     max_rows=None, force=False, actor="maintain"):
     """评估后分层落盘：生成一个可回溯的长期记忆断面。
@@ -419,7 +435,7 @@ def longterm_assess(cg, apply=False, out=None, layer=None, keep=LONGTERM_KEEP,
                        "content_hash": e.get("content_hash")}
                 f.write(json.dumps(row, ensure_ascii=False) + "\n")
                 written += 1
-        os.replace(tmp, path)
+        publish(tmp, path)
         atomic_write(current_path(cg), json.dumps(
             {"snapshot_id": snapshot_id, "ts": time.time(), "path": rel,
              "total": total, "tiers": tiers, "by_layer": by_layer,
@@ -440,6 +456,7 @@ def longterm_assess(cg, apply=False, out=None, layer=None, keep=LONGTERM_KEEP,
     }
 
 
+# 生效条件：cg 与 keep 必填；keep<=0 时不删除任何断面返回 []；否则删除除最近 keep 个 .jsonl 外的旧断面。
 def _prune(cg, keep):
     """只保留最近 keep 个断面文件（按文件名时间前缀排序）。"""
     d = longterm_dir(cg)
@@ -457,6 +474,7 @@ def _prune(cg, keep):
     return removed
 
 
+# 生效条件：cg 必填，limit 默认 20；目录不可读返回 []；否则新的在前逐个 append，因先 append 后判 len(out)>=limit，limit=0 时仍返回 1 条快照。
 def longterm_list(cg, limit=20):
     """列出历史断面（新的在前）：{snapshot_id, path, ts, total, tiers}。"""
     d = longterm_dir(cg)
@@ -481,6 +499,7 @@ def longterm_list(cg, limit=20):
     return {"current": cur, "snapshots": out}
 
 
+# 生效条件：longterm_dir(cg) 不可列出（OSError）时返回 {"ok":False,"error":"no_snapshot"}；否则在倒序文件名中取首个满足 snapshot_id 为 None 或为其子串的 .jsonl（snapshot_id="" 与任意文件名匹配），无匹配返回 {"ok":False,"error":"snapshot_not_found"}；命中则逐行聚合该文件（空行与 json.loads 抛 ValueError 的行跳过），返回 file/total/tiers/by_layer/islands。
 def longterm_show(cg, snapshot_id=None):
     """读取某个断面的分层统计（不载全量行，只聚合）。"""
     d = longterm_dir(cg)
@@ -524,6 +543,7 @@ def longterm_show(cg, snapshot_id=None):
 # 写入**之前**的新奇检测：重复项并入既有（MERGE），而非新增；无关噪音丢弃；
 # 有歧义的半重复留痕待复核。这是「写入侧前置」的落库动作，比夜间整理更早一步。
 
+# 生效条件：cg 与 content 必填；恒经 assess 得四态并映射 decision（ACCEPT→write 等），落留痕后返回 ok=True，不写任何节点。
 def prefeed(cg, content, layer="contextual", role=None, verification_basis=None,
             importance_hint=None, node_id=None):
     """前馈裁决（不写盘）：返回四态 + 判据，并留痕 `_forgetting.jsonl`。
@@ -548,10 +568,12 @@ def prefeed(cg, content, layer="contextual", role=None, verification_basis=None,
     return {"ok": True, "action": "prefeed", **rec}
 
 
+# 生效条件：content 为 None 或假值时按 "" 计算，恒返回 "pre_"+sha1(content).hexdigest()[:12]。
 def _prefeed_id(content):
     return "pre_" + hashlib.sha1((content or "").encode("utf-8")).hexdigest()[:12]
 
 
+# 生效条件：cg 必填，limit 默认 100；action 为假值（None/空串）时不过滤，真值只留该 action；返回 recs[-int(limit):]，limit=0 时退化为全量。
 def maintain_history(cg, limit=100, action=None):
     """维护留痕（`_maintain.jsonl` 最近 limit 条），可按 action 过滤。"""
     recs = list(read_jsonl(os.path.join(cg.root, MAINTAIN_LOG)))

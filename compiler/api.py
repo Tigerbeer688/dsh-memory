@@ -10,7 +10,7 @@ LLM 辞意辅助（llm_bridge）为外部可插拔面：经 CompileOptions.llm_b
 from dataclasses import dataclass, field
 from typing import List, Optional, Dict, Any
 from .lexer import tokenize, Token, TokenType
-from .parser import parse_tokens, ProgramNode
+from .parser import parse_tokens, ProgramNode, NodeType
 from .name_checker import NameChecker
 from .codegen import CodeGenerator
 
@@ -20,6 +20,7 @@ from .codegen import CodeGenerator
 # =============================================================================
 
 @dataclass
+# 生效条件：不适用（无必需形参与模块级常量）
 class CompileOptions:
     """编译选项"""
     llm_assist: bool = False        # 是否启用 LLM 辅助（辞意/说故校验）
@@ -37,6 +38,7 @@ class CompileOptions:
 # =============================================================================
 
 @dataclass
+# 生效条件：不适用（无必需形参与模块级常量）
 class CompileResult:
     """编译结果"""
     success: bool = False
@@ -55,13 +57,16 @@ class CompileResult:
     verdict: Optional[Dict] = None
     
     @property
+# 生效条件：不适用（无必需形参与模块级常量）
     def has_errors(self) -> bool:
         return len(self.errors) > 0
     
     @property
+# 生效条件：不适用（无必需形参与模块级常量）
     def has_warnings(self) -> bool:
         return len(self.warnings) > 0
     
+# 生效条件：self.success 为真值时首行输出「✅ 编译成功」，否则输出「❌ 编译失败 (len(self.errors) 个错误)」；随后附加 token_count、statement_count、compile_time_ms:.1f；self.errors 非空时追加错误块（仅 errors[:10] 的前 10 条），self.warnings 非空时追加警告块（仅 warnings[:5] 的前 5 条），返回以 "\n" 连接的 lines。
     def summary(self) -> str:
         """生成摘要文本"""
         lines = []
@@ -91,6 +96,7 @@ class CompileResult:
 # 核心编译函数
 # =============================================================================
 
+# 生效条件：source 为协议源串；options 为 None 时回落 CompileOptions()；tokenize 产生 lex_errors 即提前返回，语法错误或 ast 为 None 即提前返回，名实校验有 name_errors 即提前返回；仅当 options.llm_assist 且 options.llm_bridge 同时为真值才调用 _llm_assist（异常只记入 warnings）；最终 result.success 取决于 errors 是否为空，verdict 的 reason/passed 参与追加错误。
 def compile_source(source: str, options: Optional[CompileOptions] = None) -> CompileResult:
     """
     核心编译函数 —— 所有入口的统一调用点
@@ -130,12 +136,14 @@ def compile_source(source: str, options: Optional[CompileOptions] = None) -> Com
         return result
     
     # ---- 第二步：语法分析 ----
-    parser = parse_tokens(tokens, [])
-    ast = parser
+    # Parser 把语法错误 append 进**调用方传入的共享列表**（ProgramNode
+    # 本身没有 errors 属性——旧写法 getattr(ast,'errors',[]) 恒 []，
+    # 含语法错误的源码在这里静默通过）。传入列表读取即可回流。
+    syntax_errors: List[str] = []
+    ast = parse_tokens(tokens, syntax_errors)
     result.ast = ast
-    
+
     # 获取语法错误
-    syntax_errors = getattr(ast, 'errors', []) if ast else []
     if syntax_errors:
         result.errors.extend(syntax_errors)
     
@@ -171,6 +179,9 @@ def compile_source(source: str, options: Optional[CompileOptions] = None) -> Com
     code = gen.generate(ast)
     result.code = code
     result.warnings.extend(gen.warnings)
+    # codegen 错误（如未支持的表达式类型、非法函数名）回流——
+    # 不支持的操作必须编译 fail，而非 success + 非法/残缺产物
+    result.errors.extend(gen.errors)
     
     # ---- 第六步：验证单元终裁 ----
     verdict = _verification_verdict(result, options)
@@ -186,6 +197,7 @@ def compile_source(source: str, options: Optional[CompileOptions] = None) -> Com
     return result
 
 
+# 生效条件：source 为协议源串；options 为 None 时先构造 CompileOptions()，随后无论入参如何都重建为仅携带 llm_assist、strict、llm_bridge 的新 CompileOptions（output_format/include_comments/indent_size 回落默认）并以此调用 compile_source，返回 valid=result.success 与 errors/warnings/token_count/statement_count。
 def validate_source(source: str, options: Optional[CompileOptions] = None) -> Dict:
     """
     仅校验（不生成代码）
@@ -215,6 +227,7 @@ def validate_source(source: str, options: Optional[CompileOptions] = None) -> Di
 # 内部函数
 # =============================================================================
 
+# 生效条件：传入 ast 与 llm_bridge 后先调用 _ast_to_text(ast)，llm_bridge.understand(ast_text, context={"phase": "ciyi_check"}) 返回真值时追加进 suggestions["name_meaning"]，llm_bridge.suggest_verification(ast_text, {"phase": "shuogu_check"}) 返回真值时追加进 suggestions["reasoning"]，两键均为假值时保持空列表，恒返回该 suggestions。
 def _llm_assist(ast: ProgramNode, llm_bridge) -> Optional[Dict]:
     """
     LLM 辅助校验（辞意/说故）
@@ -243,6 +256,7 @@ def _llm_assist(ast: ProgramNode, llm_bridge) -> Optional[Dict]:
     return suggestions
 
 
+# 生效条件：ast 为含 statements 的 ProgramNode（直接取 ast.statements，无 getattr 兜底），逐条按 stmt.type 分派——CONDITION_STMT 输出「条件语句: 若 …」并在 stmt.then_body 为真值时追加「  则: …」，INSTRUCTION_STMT 输出「指令: 名 操作数」，SHUYUE 输出步骤数、WENYUE 输出 question[:50]、DAYUE 输出 answer[:50]，其余类型跳过，返回以 "\n" 连接的 parts。
 def _ast_to_text(ast: ProgramNode) -> str:
     """将 AST 转换为文本描述（供 LLM 理解）"""
     parts = []
@@ -266,6 +280,7 @@ def _ast_to_text(ast: ProgramNode) -> str:
     return "\n".join(parts)
 
 
+# 生效条件：node 为 None 时返回空串；否则按属性探测分派——有 name 返回 str(node.name)，有 value 返回 str(node.value)，有 operator 返回 `f"{left} {node.operator} {right}"`（left/right 缺失时按空串参与），以上皆无则返回 str(type(node).__name__)。
 def _node_to_text(node) -> str:
     """将单个 AST 节点转为文本"""
     if node is None:
@@ -281,6 +296,7 @@ def _node_to_text(node) -> str:
     return str(type(node).__name__)
 
 
+# 生效条件：result.errors 非空时返回 passed=False、reason=f"编译错误: {result.errors[0]}"、authority="VERIFICATION_UNIT"；errors 为空时返回 passed=True、reason="路径有效：结构一致且缩小信息差"、authority 同前、confidence=0.85（形参 options 在函数体内未被读取）。
 def _verification_verdict(result: CompileResult, options: CompileOptions) -> Dict:
     """
     验证单元终裁
@@ -313,6 +329,7 @@ def _verification_verdict(result: CompileResult, options: CompileOptions) -> Dic
 # 便捷函数
 # =============================================================================
 
+# 生效条件：source 为协议源串且以默认 options（未传参，走 CompileOptions()）调用 compile_source，result.success 为真时返回 result.code，否则返回 `"# 编译错误:\n# " + "\n# ".join(result.errors)`。
 def quick_compile(source: str) -> str:
     """
     快速编译 —— 返回生成的代码或错误信息

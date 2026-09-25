@@ -37,7 +37,7 @@
 
 import { delimiter } from 'node:path'
 import { LingshuBridge, type McpCallResult } from '../bridge.js'
-import { pythonPathValue, repoRoot } from './datapath.js'
+import { pythonPathValue, runRoot } from './datapath.js'
 
 /** md_cg 子进程与根目录配置。 */
 export interface MdcgOptions {
@@ -47,9 +47,12 @@ export interface MdcgOptions {
   args?: string[]
   /** 认知图根目录（MDCG_ROOT）。 */
   root: string
-  /** Python 子进程工作目录，默认**插件仓根**（issue #12：Python 只把 cwd
-   *  注入 sys.path，宿主在插件仓外启动时 `python -m md_cg.mcp_server`
-   *  找不到随包 md_cg → 必然 ModuleNotFoundError → 静默降级只读 guest）。 */
+  /** Python 子进程工作目录，默认 `runRoot()`——**插件包目录之外**的稳定目录
+   *  （issue #18：Windows 不允许删除/改名「正被某进程当作 cwd」的目录，
+   *  cwd 落在包内会让 pnpm 更新本包必然 `ERR_PNPM_EBUSY` 且永不自愈）。
+   *  模块解析**不依赖 cwd**：`python -m` 靠 `PYTHONPATH`
+   *  （见 `pythonPathValue()`）解析随包 md_cg，issue #12 口径不变。
+   *  显式传入本项时完全尊重原值。 */
   cwd?: string
   /** 调用主体标识（MDCG_ACTOR）。私有内容按 (tenant, actor) 派生 DEK，
    *  故与迁移脚本 --actor 必须一致，否则读不到已迁移节点。 */
@@ -74,6 +77,56 @@ export interface MdcgOptions {
 }
 
 const DEFAULT_ARGS = ['-m', 'md_cg.mcp_server']
+
+/** 子进程环境构造参数（`MdcgOptions` 中与环境相关的那半）。 */
+export interface MdcgChildEnvOptions {
+  root: string
+  surface?: 'kernel' | 'full'
+  tenant?: string
+  clearance?: string
+  actor?: string
+  identity?: string
+  env?: Record<string, string>
+}
+
+/**
+ * MCP 子进程环境：**唯一构造点**（导出即为了让机械守卫能断言它——
+ * 见 `test/python-utf8-mode.test.ts`）。勿在别处另拼 env。
+ *
+ * ⚠️ 两条编码注入是**硬约束**，不是可选项：
+ *
+ * ① `PYTHONIOENCODING=utf-8`（子进程**自身** stdio）：Windows 下 piped 子进程默认
+ *    gbk + surrogateescape，Node 写出的 UTF-8 中文会被解成孤立代理字符（\udcXX），
+ *    md_cg 在落盘 / 回写 stdout 时抛 UnicodeEncodeError——中文记忆（主场景）全失败。
+ *
+ * ② `PYTHONUTF8=1`（子进程**后代**的默认 text 编码，PEP 540）：`PYTHONIOENCODING`
+ *    会被后代继承（后代于是往管道写 UTF-8），但**文本解码口径不被继承**——后代读
+ *    `subprocess.run(..., text=True)` 时取的是 locale（本机 cp936），于是
+ *    「子进程写 UTF-8、父进程按 gbk 读」→ 读线程崩死、诊断静默丢失。
+ *    2026-09-20 实证现场（`npm test` 周期复现，来源为子进程的后代代码单元）：
+ *      Exception in thread Thread-N (_readerthread):
+ *      UnicodeDecodeError: 'gbk' codec can't decode byte 0x82 in position 181
+ *    UTF-8 模式把默认 text 编码改为 UTF-8，读写两侧同口径（且解码结果正确，
+ *    而非 `errors="replace"` 那种替换字符）。
+ *
+ * 确定性对照实验（P1 复现 / P3 消除）见 `test/python-utf8-mode.test.ts`。
+ * `opts.env` 最后展开——显式覆盖优先。
+ */
+export function mdcgChildEnv(opts: MdcgChildEnvOptions): Record<string, string> {
+  return {
+    PYTHONIOENCODING: 'utf-8',
+    PYTHONUTF8: '1',
+    MDCG_ROOT: opts.root,
+    // 工具面必须是 full：写入通道 mdcg_remember 属细粒度工具（见 MdcgOptions.surface）。
+    MDCG_MCP_SURFACE: opts.surface ?? 'full',
+    MDCG_TENANT: opts.tenant ?? 'default',
+    MDCG_CLEARANCE: opts.clearance ?? 'private',
+    PYTHONPATH: pythonPathValue(),
+    ...(opts.actor ? { MDCG_ACTOR: opts.actor } : {}),
+    ...(opts.identity ? { MDCG_IDENTITY: opts.identity } : {}),
+    ...(opts.env ?? {}),
+  }
+}
 
 /** 认知图依据强度：这些 basis 视为「强依据」，可支撑 pass。
  *  取值须在 md_cg.mdcg.VERIFICATION_BASIS 允许集内：
@@ -122,27 +175,13 @@ export class MdcgClient {
   readonly bridge: LingshuBridge
 
   constructor(opts: MdcgOptions) {
-    // issue #12：cwd 与 PYTHONPATH 双保险锚定插件仓根——cwd 是 `python -m`
-    // 解析随包包的主通道，PYTHONPATH 覆盖显式自定义 args 的场景。opts.env
-    // 显式提供 PYTHONPATH 时完全接管（其展开在最后：显式配置原样尊重）。
-    const cwd = opts.cwd ?? repoRoot()
-    const env: Record<string, string> = {
-      // ⚠️ 必须显式 utf-8：Windows 下 piped 子进程默认 gbk + surrogateescape，
-      // Node 写出的 UTF-8 中文会被解成孤立代理字符（\udcXX），md_cg 在落盘 /
-      // 回写 stdout 时抛 UnicodeEncodeError —— 中文记忆（本插件的主场景）全部失败。
-      // md_cg 自带测试（test_p2_mcp.py）与 test/bridge.test.ts 均以
-      // PYTHONIOENCODING=utf-8 启动子进程，此处对齐该约定；opts.env 可覆盖。
-      PYTHONIOENCODING: 'utf-8',
-      MDCG_ROOT: opts.root,
-      // 工具面必须是 full：写入通道 mdcg_remember 属细粒度工具（见 MdcgOptions.surface）。
-      MDCG_MCP_SURFACE: opts.surface ?? 'full',
-      MDCG_TENANT: opts.tenant ?? 'default',
-      MDCG_CLEARANCE: opts.clearance ?? 'private',
-      PYTHONPATH: pythonPathValue(),
-      ...(opts.actor ? { MDCG_ACTOR: opts.actor } : {}),
-      ...(opts.identity ? { MDCG_IDENTITY: opts.identity } : {}),
-      ...(opts.env ?? {}),
-    }
+    // 子进程 cwd 必须落在插件包目录之外，否则 pnpm 更新本插件时
+    // rmdir 包目录会撞上 Windows 的「目录被当作 CWD」共享冲突 → ERR_PNPM_EBUSY。
+    // 模块解析不依赖 cwd：PYTHONPATH（pythonPathValue()）已锚定随包 md_cg；
+    // opts.env 显式提供 PYTHONPATH 时完全接管（其展开在最后）。详见 datapath.runRoot()。
+    const cwd = opts.cwd ?? runRoot()
+    // 编码与模块解析口径见 mdcgChildEnv() 头注（含 2026-09-20 读线程崩溃现场）。
+    const env = mdcgChildEnv(opts)
     this.bridge = new LingshuBridge({
       python: opts.python,
       args: opts.args ?? DEFAULT_ARGS,

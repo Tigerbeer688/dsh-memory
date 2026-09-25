@@ -1,12 +1,12 @@
-# 工作纪律（工作纪律_认知图条目_v1.1）· 17 条
+# 工作纪律（工作纪律_认知图条目_v1.1）· 18 条
 
 > 本文件由 `scripts/render_discipline.py` 从真源
 > `docs/工作纪律_认知图条目_v1.1.json` 渲染生成，**请勿手改**；改真源后重跑渲染。
-> 真源指纹（SHA256 前16位）：01f7f0be85eb1fac
+> 真源指纹（SHA256 前16位）：26bff32d73644699
 
 ## 概述
 
-工作纪律集: 4条方法论(理论先行/全面处理/白箱方法/根因) + 3条执行(验证/双副本/兜底) + 1条思考(中文思考/协作模式分级) + 1条保密(敏感信息隔离) + 3条图像线(选源护栏/历史查询优先/算法权威唯一) + 1条协作(访谈澄清:先问清再动手) + 1条合规(内容政策合规:公开产物过内容政策+隐私双清单) + 2条执行调度与运行环境(命令执行统一走python/UTF-8: 显式encoding+PYTHONUTF8=1, 规避GBK; 任务派发统一走蜂巢: 任何执行性任务经蜂巢spawn/submit执行并留痕, agent本体只做编排) + 1条记忆闭环(任务收尾归档:每次任务执行完只将核心修改(内容/原因/位置/验证结论)按CCG六要素(功能名/生效条件/子功能/执行/验证方式/不适用条件)成文存入灵枢记忆, 不写中间过程)
+工作纪律集: 4条方法论(理论先行/全面处理/白箱方法/根因) + 3条执行(验证/双副本/兜底) + 1条思考(中文思考/协作模式分级) + 1条保密(敏感信息隔离) + 3条图像线(选源护栏/历史查询优先/算法权威唯一) + 1条协作(访谈澄清:先问清再动手) + 1条合规(内容政策合规:公开产物过内容政策+隐私双清单) + 2条执行调度与运行环境(命令执行统一走python/UTF-8: 显式encoding+PYTHONUTF8=1, 规避GBK; 任务派发统一走蜂巢: 任何执行性任务经蜂巢spawn/submit执行并留痕, agent本体只做编排, L1出口=产物落点为只读判定(不改仓库/外部状态)可直跑须留痕) + 1条记忆闭环(任务收尾归档:每次任务执行完只将核心修改(内容/原因/位置/验证结论)按CCG六要素(功能名/生效条件/子功能/执行/验证方式/不适用条件)成文存入灵枢记忆, 不写中间过程) + 1条信息获取(工作区索引优先: 查工作区文件先读 WORKSPACE_INDEX.md(仓根, 由 scripts/workspace_index.py 从 git 追踪面管线生成), 尚无则先跑 --write 生成再读, 不以重复全盘浏览代替; 索引是会陈化的手工件, 故须管线生成+机械守卫, 否则退化为误导源)
 
 ## 执行公约
 
@@ -135,9 +135,16 @@
 ### 17. 任务派发统一走蜂巢
 
 - **触发**：执行性任务｜多智能体协作｜批量/并行工作｜探索盘点｜运行测试/脚本
-- **动作**：任务→拆spec(LLM委托型=默认exec.py: model+user_prompt+context_files; 确定性执行=自定义worker, 契约「读spec.json写result.json」)→hive_spawn/CLI submit→poll→汇总; 兜底情形须声明「蜂巢不可用, 兜底降级」
-- **不适用**：纯会话内对话/问答(无执行动作)｜蜂巢不可用且任务必须立即执行(兜底须声明)｜情感交互｜闲聊
-- **声明**：按工作纪律第17条: 任务派发统一走蜂巢——任何执行性任务经蜂巢 spawn/submit 执行并留痕(spec/status/result), agent本体只做编排; 宿主自带subagent/team不是等价通道, 兜底须声明。
+- **动作**：任务→按产物落点判据定层级(不改仓库/外部状态的只读判定=L1直跑并按任务留痕一条(复核者=使用者+GitHub使用者); 改状态=必派发, 不得自我豁免)→拆spec(LLM委托型=默认exec.py: model+user_prompt+context_files; 确定性执行=自定义worker, 契约「读spec.json写result.json」)→hive_spawn/CLI submit→poll→汇总; 兜底情形须声明「蜂巢不可用, 兜底降级」
+- **不适用**：纯会话内对话/问答(无执行动作)｜蜂巢不可用且任务必须立即执行(兜底须声明)｜L1只读判定(产物落点=不改仓库/不改外部状态的本地只读命令, 秒级·可逆·高频, 如跑门禁/测试/回归/lint看结论; 判据是产物落点而非「任务简单」的主观感受, 直跑须输出一行「L1 直跑：<命令> — 风险/频次/可逆性」留痕, 留痕粒度按任务(同一任务的多条只读命令合并为一条留痕, 不逐命令逐行); 层级归属的复核者=使用者+GitHub使用者)｜情感交互｜闲聊
+- **声明**：按工作纪律第17条: 任务派发统一走蜂巢——任何执行性任务经蜂巢 spawn/submit 执行并留痕(spec/status/result), agent本体只做编排; 宿主自带subagent/team不是等价通道, 兜底须声明。L1只读判定(产物落点=不改仓库/外部状态)可直跑, 须输出「L1 直跑：<命令> — 风险/频次/可逆性」留痕。
+
+### 18. 工作区索引优先
+
+- **触发**：查找工作区文件｜需要了解工作区结构｜跨目录检索定位｜长会话续接/上下文压缩后查找工作区文件
+- **动作**：定位工作区文件→先读 WORKSPACE_INDEX.md(仓根)→有则按表中职责/关键入口直接定位→无则先 python scripts/workspace_index.py --write 生成再读→守卫报陈化先重生成→不以重复全盘浏览代替; 新增顶层目录/根级文件须在脚本 DIR_ROLES/ROOT_FILES 登记后重生成; 上下文压缩/长会话续接后, 先 cg route『工作区索引』重建纪律视野(压缩会丢弃未留下执行痕迹的纪律, 只剩被声明过的条目——须主动召回)
+- **不适用**：已明确路径的单文件操作｜纯会话内对话/问答(无文件查找)｜仓外路径/系统路径(git 追踪面之外)
+- **声明**：按工作纪律第18条: 工作区索引优先——查工作区文件先读 WORKSPACE_INDEX.md(仓根, 管线生成); 无则先跑 scripts/workspace_index.py --write 生成再读, 不以重复全盘浏览代替。
 
 ## 声明出口（`response.direct` 原文 · 未输出即未执行）
 
@@ -159,7 +166,8 @@
 | 14 | 按工作纪律第14条: 内容政策合规——对外公开产物必须过「内容政策+隐私」双清单，过滤在生成阶段做；已发布发现违规要删条+重写git历史+通知平台清缓存。 |
 | 15 | 按工作纪律第15条: 命令执行统一走python——argv列表+显式UTF-8+PYTHONUTF8=1, 不经Windows shell, 规避GBK解码异常。 |
 | 16 | 按工作纪律第16条: 任务收尾归档——每次任务执行完只提炼核心修改(内容/原因/位置/验证结论)并按 CCG 六要素(功能名/生效条件/子功能/执行/验证方式/不适用条件)成文存入灵枢记忆, 写入后发起一次读取查询确认写入成功且可检索, 禁写中间过程/试错/调试等无效信息, 与第2条形成「查记忆→执行→写记忆→读回确认」闭环。 |
-| 17 | 按工作纪律第17条: 任务派发统一走蜂巢——任何执行性任务经蜂巢 spawn/submit 执行并留痕(spec/status/result), agent本体只做编排; 宿主自带subagent/team不是等价通道, 兜底须声明。 |
+| 17 | 按工作纪律第17条: 任务派发统一走蜂巢——任何执行性任务经蜂巢 spawn/submit 执行并留痕(spec/status/result), agent本体只做编排; 宿主自带subagent/team不是等价通道, 兜底须声明。L1只读判定(产物落点=不改仓库/外部状态)可直跑, 须输出「L1 直跑：<命令> — 风险/频次/可逆性」留痕。 |
+| 18 | 按工作纪律第18条: 工作区索引优先——查工作区文件先读 WORKSPACE_INDEX.md(仓根, 管线生成); 无则先跑 scripts/workspace_index.py --write 生成再读, 不以重复全盘浏览代替。 |
 
 ## 记忆接口速查（`cg` / `stg`）
 
@@ -168,10 +176,11 @@
 | op | 用途 | 常用参数 |
 |---|---|---|
 | `route` | 任务开始路由记忆（返回知识 + 建议能力，不执行） | `intent`（任务意图） |
-| `read` | 召回/检索/按 id 取（`session`=只取该会话归属的记忆，缺省不过滤） | `query` / `node_id` / `k` / `layer` / `budget_tokens` / `context` / `session` |
+| `read` | 召回/检索/按 id 取（`session`=只取该会话归属的记忆，缺省不过滤；`validity=true`=时效过滤（显式启用，缺省不过滤），**仅排除「已过期」，「未生效」一律保留**——两者语义相反） | `query` / `node_id` / `k` / `layer` / `budget_tokens` / `context` / `session` / `validity` |
+| `edges` | 三元组反查（**只读**）：按派生边任意端/谓词/时间反查「这条记忆从哪来 / 谁由它派生」（subject/predicate/object 即 child/relation/parent）；`expand_nodes=true` 附命中端点节点卡 | `child` / `parent` / `relation` / `batch` / `start_time` / `end_time` / `time_axis` / `ordering` / `offset` / `limit` / `aggregation` / `expand_nodes` |
 | `write` | 写入（先按 content_kind 审核 + 冲突检测，ACCEPT 落盘 / DEFER 入审核队列 / REJECT 入负记忆）。**自动归属**：frontmatter 带 `writer`/`session`/`harness`（服务端身份，不可伪造） | `content` / `content_kind`（text/code/…）/ `node_id`（同 id 即改写）/ `layer` / `tags` / `importance` / `verification_basis` / `condition_space` / `gated` / `consistency` / `on_conflict`（reject\|defer\|record） |
 | `verify` | 对节点做证据验证（confirmed/weakened/falsified）——**非队列裁决** | `node_id` / `verdict` / `evidence` |
-| `review` | 审核队列：`action=list/rounds/records` 查看；传 `pid`+`decision`+`reason` 即裁决落盘（accept/reject/edit/merge，**需 can_admin**；本机未配置外部验证器时写入恒 DEFER 入队，靠此裁决落盘） | `action` / `pid` / `decision` / `reason` / `edits` / `merge_into` |
+| `review` | 审核队列：`action=list/rounds/records/stats` 查看；传 `pid`+`decision`+`reason` 即裁决落盘（accept/reject/edit/merge/noop，**需 can_admin**；`noop`=已评估且判定不改动任何现有记忆，只留痕不入库、不进负记忆；本机未配置外部验证器时写入恒 DEFER 入队，靠此裁决落盘） | `action` / `pid` / `decision` / `reason` / `edits` / `merge_into` |
 | `task` | 结构层任务实体（工程台账，跨会话/上下文压缩后不遗忘）：`name` 即身份（同名即同任务，slug 归一），`action` = open/status/plan_add/get/list/find/session（缺省 list）；**迁 `done` 必须同时给 `result`**（缺一不收，拒收不落盘）；未提供的字段沿用旧值（结果不会被静默清空） | `name` / `action` / `plan`（分步计划，每轮覆盖） / `change`（计划变更，逐轮追加） / `result` / `task_status`（active\|blocked\|done\|dropped） / `goal` / `acceptance` / `boundary` / `condition` / `node_id` |
 | `recent` | 近期事件窗口 | `action`（add/list/clear）/ `limit` |
 | `forget` / `protect` | 软删除/恢复 / 写保护 | `node_id` |
@@ -179,7 +188,7 @@
 
 三条调用铁律：
 1. **`op` 必填**——漏传会触发参数签名推导兜底（返回标记 `op_derived: true`），复杂任务中也必须显式传，防静默执行错误意图。
-2. **返回 `moved_to: "review_queue"` / `verdict: DEFER/REJECT` 时不要重试**——这是校验闸门的正常行为（返回自带 `hint` 说明），重试同样结果；落盘须由设计者权限（can_admin）经 `op=review` 裁决（decision=accept/reject/edit/merge，本机工具：`python scripts/review_cli.py list`），agent 端无裁决权是设计（写入者不得自裁自决），转告使用者即可。
+2. **返回 `moved_to: "review_queue"` / `verdict: DEFER/REJECT` 时不要重试**——这是校验闸门的正常行为（返回自带 `hint` 说明），重试同样结果；落盘须由设计者权限（can_admin）经 `op=review` 裁决（decision=accept/reject/edit/merge/noop，本机工具：`python scripts/review_cli.py list`），agent 端无裁决权是设计（写入者不得自裁自决），转告使用者即可。
 3. `stg` 同理经 `op` 分发（`timeline` / `relation` / `anchors` 等）。
 
 ## 收尾强制流程（任务完成时不可跳过）

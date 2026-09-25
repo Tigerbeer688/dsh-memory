@@ -15,6 +15,9 @@ import { dirname, join, resolve } from 'node:path'
 import { fileURLToPath } from 'node:url'
 import { LingshuBridge } from '../src/bridge.js'
 import { MdcgClient } from '../src/lib/mdcg_client.js'
+// issue #19：测试也须按平台取解释器——写死 'python' 会让整套测试在
+// Linux/macOS（只有 python3）上全挂，把「缺陷」当成「测试环境问题」。
+import { defaultPython } from '../src/lib/python_path.js'
 
 /** 本仓根目录：md_cg 随仓库自带，靠 PYTHONPATH 解析（无需 pip 安装）。 */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
@@ -31,7 +34,7 @@ function safeCleanup(dir: string): void {
 /** 构造指向本仓 md_cg 的桥；surface 决定工具面（kernel=cg/stg，full=+细粒度）。 */
 function createBridge(root: string, surface: 'kernel' | 'full' = 'full'): LingshuBridge {
   return new LingshuBridge({
-    python: 'python',
+    python: defaultPython(),
     args: ['-m', 'md_cg.mcp_server'],
     env: {
       PYTHONPATH: REPO_ROOT,
@@ -40,6 +43,9 @@ function createBridge(root: string, surface: 'kernel' | 'full' = 'full'): Lingsh
       MDCG_MCP_SURFACE: surface,
       // 集成测试用 legacy 身份（recorder：可写 contextual/knowledge/structural），
       // 省去签发令牌；真实部署推荐 MDCG_TOKEN（见 dsh/cordis.yml.example）。
+      // 显式清空 MDCG_TOKEN：隔离宿主部署面的令牌 env（否则 _build_principal
+      // 走令牌优先路径，宿主令牌与本机令牌文件不匹配 → server 拒启动，测试全红）
+      MDCG_TOKEN: '',
       MDCG_LEGACY_ENV_AUTH: '1',
       MDCG_ACTOR: 'dsh-test',
       MDCG_TENANT: 'default',
@@ -73,9 +79,9 @@ test('issue #12 回归：宿主 cwd 在插件仓外且零路径参数，MdcgClie
   // cwd 注入 sys.path → `python -m md_cg.mcp_server` 必然 ModuleNotFoundError。
   process.chdir(tmpdir())
   const client = new MdcgClient({
-    python: 'python',
+    python: defaultPython(),
     root: join(dir, 'mdcg'),
-    env: { MDCG_LEGACY_ENV_AUTH: '1', MDCG_ACTOR: 'dsh-test' },
+    env: { MDCG_TOKEN: '', MDCG_LEGACY_ENV_AUTH: '1', MDCG_ACTOR: 'dsh-test' },
     timeoutMs: 15_000,
     maxRetryDelayMs: 5_000,
   })

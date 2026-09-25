@@ -12,7 +12,13 @@
   python scripts/review_cli.py reject  <pid> --reason "内容有误"
   python scripts/review_cli.py edit    <pid> --content "修正后内容" --reason "..."
   python scripts/review_cli.py merge   <pid> --into <已有节点id> --reason "..."
+  python scripts/review_cli.py noop    <pid> --reason "已评估，判定无需改动"
   python scripts/review_cli.py rounds  <pid>        # 某提案裁决轮次历史
+  python scripts/review_cli.py stats                # 裁决动作统计（含 noop）
+
+noop 语义：**已评估、判定不改变任何现有记忆**——只留痕（decisions.jsonl +
+审计 md 节点）并关闭提案，不落业务节点、不进负记忆。它与 reject 的区别是
+「评估过了、无需改动」而非「否掉这条候选」，故不可借 noop 绕过 accept 门控。
 
 裁决留痕：decisions.jsonl + 审计 md 节点（由 review_decide 内部完成）。
 """
@@ -34,6 +40,7 @@ from md_cg.mdcos import MdCGSecure        # noqa: E402
 from md_cg.security import Principal      # noqa: E402
 
 
+# 生效条件：args 的 root 属性为真值（含 getattr 缺省 None 时回落）否则回落 os.environ.get("MDCG_ROOT", "")，两者皆空串或该值经 os.path.isdir 判定不是目录时 sys.exit 退出，否则返回该 root。
 def _root(args):
     root = getattr(args, "root", None) or os.environ.get("MDCG_ROOT", "")
     if not root:
@@ -44,6 +51,7 @@ def _root(args):
     return root
 
 
+# 生效条件：args 就绪时先构造写死权限的 Principal(actor="designer-cli", clearance="secret", can_write=True, can_admin=True, role="designer", auth_mode="local-cli")，再以 _root(args) 取到的存储根返回 MdCGSecure(root, principal=p)。
 def _cg(args):
     p = Principal(actor="designer-cli", clearance="secret",
                   can_write=True, can_admin=True, role="designer",
@@ -51,11 +59,13 @@ def _cg(args):
     return MdCGSecure(_root(args), principal=p)
 
 
+# 生效条件：rec 支持 .get 时，取 rec.get("content") 为假值则取 rec.get("statement")、再为假值则取空串，把其中的换行替换为空格，并按 width（缺省 66）切片后仅当 len(text) > width 才追加 "…"，返回该字符串。
 def _brief(rec, width=66):
     text = (rec.get("content") or rec.get("statement") or "").replace("\n", " ")
     return text[:width] + ("…" if len(text) > width else "")
 
 
+# 生效条件：cg 与 args 就绪时按 args.cmd 分派——"list" 时 cg.review_list() 为空则打印空队列并返回 0、非空则逐条打印（tags 取真值拼接、layer/round 为假值显示 "?"/0）后返回 0；"rounds" 时打印 cg.review_rounds(args.pid) 并返回 0；"stats" 时打印 cg.review_stats() 的记录数/提案数/待审数/已关闭数与动作分布（含 noop 计数）并返回 0；"edit" 时以 args.content 加真值 args.tags（按逗号分割并剔除空项）/args.layer 组成 edits 调 cg.review_decide；其余 cmd（含 noop）以 getattr(args, "into", None) 与 args.reason 调 cg.review_decide；后两类再按 out.get("ok") 为真返回 0，否则打印 out 并返回 1。
 def _execute(cg, args):
     """按子命令执行裁决（cg 的生命周期由 main 统一收尾）。"""
     if args.cmd == "list":
@@ -74,6 +84,17 @@ def _execute(cg, args):
 
     if args.cmd == "rounds":
         print(json.dumps(cg.review_rounds(args.pid), ensure_ascii=False, indent=1))
+        return 0
+
+    if args.cmd == "stats":
+        st = cg.review_stats()
+        by = st.get("by_decision") or {}
+        print("裁决记录 %d 条 · 提案 %d 个 · 待审 %d 条 · 已关闭 %d 个" % (
+            st.get("records", 0), st.get("proposals", 0),
+            st.get("pending", 0), st.get("closed", 0)))
+        print("  动作分布：%s" % ("、".join(
+            "%s=%d" % (k, by[k]) for k in sorted(by)) or "（无记录）"))
+        print("  其中 noop（已评估、判定无需改动）= %d 条" % st.get("noop", 0))
         return 0
 
     if args.cmd == "edit":
@@ -97,6 +118,7 @@ def _execute(cg, args):
     return 1
 
 
+# 生效条件：argv 为 None（默认）时由 argparse 解析 sys.argv、否则解析传入的 argv（子命令 dest="cmd" 为 required，已注册 list/accept/reject/edit/merge/rounds 并带 --root 等参数），解析成功后构造 cg=_cg(args) 并返回 _execute(cg, args)，finally 中执行 cg.close()。
 def main(argv=None):
     ap = argparse.ArgumentParser(description="灵枢审核队列裁决（designer 权限）")
     common = argparse.ArgumentParser(add_help=False)
@@ -104,7 +126,10 @@ def main(argv=None):
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("list", help="列出待审条目", parents=[common])
-    for name, help_ in (("accept", "按原样写入落盘"), ("reject", "丢弃（只记裁决）")):
+    sub.add_parser("stats", help="裁决动作统计（含 noop）", parents=[common])
+    for name, help_ in (("accept", "按原样写入落盘"),
+                        ("reject", "丢弃（只记裁决）"),
+                        ("noop", "已评估、判定不改变现有记忆（只留痕）")):
         s = sub.add_parser(name, help=help_, parents=[common])
         s.add_argument("pid")
         s.add_argument("--reason", default="", help="裁决理由（进留痕）")

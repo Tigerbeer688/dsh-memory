@@ -75,6 +75,7 @@ _ILLEGAL_RE = re.compile(r"[^0-9A-Za-z\u4e00-\u9fff_.-]+")
 
 # ---------------------------------------------------------------- 命名与解析
 
+# 生效条件：name 为 None/空串或 strip 后为空时返回空串，否则把 `/`、`\`、`..` 及 _ILLEGAL_RE 命中字符折叠为 `-`、压缩连续 `-` 并去首尾 `-.` 后取前 64 字符再去首尾 `-.` 返回；
 def slugify(name: str) -> str:
     """任务名 → 语义 slug（稳定标识；同 slug 即同任务）。
 
@@ -91,6 +92,7 @@ def slugify(name: str) -> str:
     return s[:64].strip("-.")
 
 
+# 生效条件：name（`name or ""` 后 strip）先剥掉已有的 TASK_PREFIX 再 slugify，结果非空且被 _SLUG_RE.match 命中时返回 TASK_PREFIX + slug；name 为假值或归一化后为空、不匹配时返回 ""。
 def task_node_id(name: str) -> str:
     """任务名或节点 id → 规范节点 id（`task_<slug>`）。非法名返回空串。"""
     s = (name or "").strip()
@@ -102,15 +104,18 @@ def task_node_id(name: str) -> str:
     return TASK_PREFIX + slug
 
 
+# 生效条件：v 为 None 或 str(v).strip() 为 "" 时返回 False，否则返回 True。
 def _has(v) -> bool:
     """「本次调用是否提供了该字段」——空串/None 一律视为未提供（不静默清空）。"""
     return v is not None and str(v).strip() != ""
 
 
+# 生效条件：无必需形参且无模块级常量约束，恒返回 time.strftime("%Y-%m-%d %H:%M") 的当前时间文本。
 def _today() -> str:
     return time.strftime("%Y-%m-%d %H:%M")
 
 
+# 生效条件：content（`content or ""` 后 splitlines）中有某行 strip 后以 `# ` + field + `：` 开头时，返回该行该前缀之后的去空白内容；content 为假值或无此匹配行时返回 ""。
 def _field_line(content: str, field: str) -> str:
     """从正文抽 `# <字段>：` 行的值（与 `mdcos._ccg_field` 同源口径，
     本模块不反向 import mdcos，避免包内循环依赖）。"""
@@ -122,6 +127,7 @@ def _field_line(content: str, field: str) -> str:
     return ""
 
 
+# 生效条件：(content or "") 的行中 strip 后以 "## " 开头者成为节名 s[3:].strip() 并切换当前节，其余行累入当前节，返回各节内容以 "\n" join 后 strip 的字典；无任何标题行时仅返回 {"__body__": 全篇 strip}；content 为 None/空串时返回 {"__body__": ""}。
 def sections(content: str) -> dict:
     """正文 → `{节名: 节内容}`；无标题部分归入 `__body__`。"""
     out: dict = {"__body__": []}
@@ -136,6 +142,7 @@ def sections(content: str) -> dict:
     return {k: "\n".join(v).strip() for k, v in out.items()}
 
 
+# 生效条件：t = (text or "").strip()，t 为 ""/"（无）"/"（未填）" 时返回 ""，否则 len(t) <= n（默认 200）时返回 t，超出时返回 t[:n].rstrip() + "…"。
 def _brief(text: str, n: int = 200) -> str:
     t = (text or "").strip()
     if t in ("", "（无）", "（未填）"):
@@ -143,6 +150,7 @@ def _brief(text: str, n: int = 200) -> str:
     return t if len(t) <= n else t[:n].rstrip() + "…"
 
 
+# 生效条件：以 (old_text or "").strip() 为 base（base 为「（无）」或「（未填）」时置空），_has(change) 判定为假时返回 base or "（无）"，为真时拼出 `- [今日] change.strip()`，base 非空返回 base+"\n"+该行再 strip，base 为空只返回该行；
 def _append_change(old_text: str, change: str) -> str:
     """「计划变更」节追加一行（累积式，不覆盖历史）。"""
     base = (old_text or "").strip()
@@ -154,6 +162,7 @@ def _append_change(old_text: str, change: str) -> str:
     return (base + "\n" + line).strip() if base else line
 
 
+# 生效条件：name 为必需形参（`name or ""` 后 strip 填 `# 功能名：` 行）；condition、goal、acceptance、boundary、plan、changes、result 各经 _has 判定，未提供时分别落「无条件」「（未填：任务目标待补）」「other」「任务转 done/dropped 终态后不再作为进行中任务参与装配」「（未填）」「（无）」与空串；status 经 STATUS_ZH.get(status, status) 映射、未命中时原样输出，note 经 _has 为真时以 `｜` 拼在执行行后。
 def render(name: str, *, condition: str = "", goal: str = "", status: str = "active",
            note: str = "", acceptance: str = "", boundary: str = "",
            plan: str = "", changes: str = "", result: str = "") -> str:
@@ -184,6 +193,7 @@ def render(name: str, *, condition: str = "", goal: str = "", status: str = "act
 
 # ---------------------------------------------------------------- 读写
 
+# 生效条件：nid 为假值（None/空串）时返回 None；否则 cg.get(nid) 命中且其 frontmatter.layer == "structural"、TASK_TAG 在 frontmatter.tags（`or []`）中时，返回 {id, fm, content, path, sec}（sec 为 sections(content)）；记录缺失或层/标签不符时返回 None。
 def _read_task(cg, nid: str):
     """读回任务卡；层或标签不符一律视为不存在（防串号：别的节点占用了同 id）。"""
     if not nid:
@@ -199,6 +209,7 @@ def _read_task(cg, nid: str):
             "path": rec.get("path"), "sec": sections(content)}
 
 
+# 生效条件：以 layer="structural"、tags=list(tags)、importance=float(importance)、override=True、task_name=name、task_status=status、task_updated_at=time.time()、actor=actor or "task" 等构成 kw，extra 为真值时经 kw.update(extra) 追加覆盖，随后调用 cg.add(nid, content, **kw) 并返回其结果；
 def _write(cg, nid: str, name: str, content: str, status: str, tags,
            importance: float, actor, extra: dict = None):
     """唯一写盘点——走 `cg.add`（权限闸 / 归属注入全部复用既有链路）。
@@ -217,6 +228,7 @@ def _write(cg, nid: str, name: str, content: str, status: str, tags,
     return cg.add(nid, content, **kw)
 
 
+# 生效条件：cg 具有 _audit 属性（getattr(cg, "_audit", None) 非 None）时以 (op, nid, **meta) 调用它，且其中抛出的任何异常被吞掉；cg 无该属性时不调用，两种路径均不返回内容。
 def _audit(cg, op: str, nid: str, **meta) -> None:
     """生命周期留痕；审计失败绝不阻断主流程（与 branches._audit 同哲学）。"""
     a = getattr(cg, "_audit", None)
@@ -228,6 +240,7 @@ def _audit(cg, op: str, nid: str, **meta) -> None:
         pass
 
 
+# 生效条件：_read_task(cg, nid) 命中任务卡时返回摘要条目——id 取 rec['id']，name 取 fm.task_name 或（缺失/假值时）rec['id']，status 取 fm.task_status 或 "active"，plan/changes/result 取对应节的 _brief 摘要（缺节回落 ""），并带 created_at/updated_at/path；未命中时返回 None。
 def _entry(cg, nid: str):
     """节点 id → 对外任务条目（摘要形态；全字段查 `get_task`）。"""
     rec = _read_task(cg, nid)
@@ -247,6 +260,7 @@ def _entry(cg, nid: str):
 
 # ---------------------------------------------------------------- 写操作
 
+# 生效条件：slugify(name) 为空串或不匹配 _SLUG_RE 时返回 {'ok': False, 含 slug 的非法名 error}；否则 st = str(status if _has(status) else (旧卡 task_status or "active")).strip().lower()，st 不在 TASK_STATUSES 时返回未知状态错误，st == "done" 且合并后结果节 _has(new_res) 为假时返回「转 done 必须填结果」拒收，其余情况渲染写入并返回按 old 是否为 None 区分新建/更新的 out。
 def upsert(cg, name: str, *, plan: str = None, status: str = None,
            result: str = None, condition: str = None, goal: str = None,
            acceptance: str = None, boundary: str = None, change: str = None,
@@ -313,12 +327,14 @@ def upsert(cg, name: str, *, plan: str = None, status: str = None,
     return out
 
 
+# 生效条件：content 中 `# 执行：` 行的值含 "｜" 时返回第一个 "｜" 之后去空白的内容；content 为假值、无该行或该行值不含 "｜" 时返回 ""。
 def _exec_note(content: str) -> str:
     """从 `# 执行：` 行取 `｜` 之后的进度说明。"""
     val = _field_line(content, "执行")
     return val.split("｜", 1)[1].strip() if "｜" in val else ""
 
 
+# 生效条件：node_id 经 task_node_id 得到非空 nid 且 _read_task 命中该卡时，以旧卡 task_name（缺失/假值回落 nid）、status、result、note、actor 转调 upsert 并返回其结果；node_id 非法时返回 ok=False「非法任务标识」，卡不存在时返回 ok=False「任务不存在」。
 def set_status(cg, node_id: str, status: str, *, result: str = None,
                note: str = None, actor: str = None) -> dict:
     """任务状态迁移（进行中/受阻/完成/放弃）。迁 done 且无结果 → 拒收。"""
@@ -332,6 +348,7 @@ def set_status(cg, node_id: str, status: str, *, result: str = None,
                   result=result, note=note, actor=actor)
 
 
+# 生效条件：change 经 _has 判定为已提供、且 node_id 经 task_node_id 非空、_read_task 命中该卡时，以旧卡 task_name（缺失/假值回落 nid）与 change、actor 转调 upsert；change 为 None/空串/纯空白时返回 ok=False「计划变更内容为空」，node_id 非法或卡不存在时返回 ok=False 对应错误。
 def plan_add(cg, node_id: str, change: str, *, actor: str = None) -> dict:
     """计划变更追加——执行中发现的错误/新问题/偏差，累积进「计划变更」节。"""
     if not _has(change):
@@ -347,6 +364,7 @@ def plan_add(cg, node_id: str, change: str, *, actor: str = None) -> dict:
 
 # ---------------------------------------------------------------- 读操作
 
+# 生效条件：node_id 经 task_node_id 得到的 nid 对应一张 _read_task 命中的任务卡时返回 ok=True 的全字段（condition/goal/acceptance/boundary 由 _field_line 抽取、note 由 _exec_note 抽取、plan/changes/result 取节原文不截断、tags 取 fm.tags 或 []）；否则返回 ok=False，error 中的标识取 nid 或原 node_id。
 def get_task(cg, node_id: str) -> dict:
     """单卡全字段读回（计划/变更/结果不截断）。"""
     nid = task_node_id(node_id)
@@ -370,6 +388,7 @@ def get_task(cg, node_id: str) -> dict:
             "path": rec["path"]}
 
 
+# 生效条件：status 经 `str(status or "").strip().lower()` 为非空且不在 TASK_STATUSES 时返回 ok=False 未知状态；否则收集 cg.index["nodes"] 中各 _entry 可读任务、按 updated_at 倒序，status 非空时再按该状态过滤，total 为过滤后截断前的条数，limit 为真值时取前 max(int(limit), 1) 条——limit 为 None、0 或空串（假值）时不截断而返回全量 filtered 列表。
 def list_tasks(cg, status: str = None, limit: int = None) -> dict:
     """任务清单（按 updated_at 倒序）；status 可选 active/blocked/done/dropped。"""
     st = str(status or "").strip().lower() or None
@@ -389,6 +408,7 @@ def list_tasks(cg, status: str = None, limit: int = None) -> dict:
     return {"ok": True, "count": len(items), "total": total, "tasks": items}
 
 
+# 生效条件：遍历 cg.index["nodes"]，把 _entry 可读且 status 为 active/blocked 的归入 active、status 为 done 的归入 done，各自按 updated_at 倒序；返回 active[:max(int(active_limit), 0)] 与 done[:max(int(done_limit), 0)]（active_limit/done_limit 传 0 或负数时对应列表为空）以及两组截断前的 active_total/done_total。
 def session_tasks(cg, active_limit: int = 5, done_limit: int = 5) -> dict:
     """会话装配用：进行中（active/blocked）+ 近期完成（done，按 updated_at 倒序）。
 
@@ -404,7 +424,10 @@ def session_tasks(cg, active_limit: int = 5, done_limit: int = 5) -> dict:
             active.append(t)
         elif t["status"] == "done":
             done.append(t)
-    key = lambda x: -(x.get("updated_at") or 0)          # noqa: E731
+    # 终键 id：同 updated_at 并列时定序，否则顺序回落到 cg.index["nodes"]
+    # 的物理序（增量路径=写入序，重建路径=nid 序）。
+    key = lambda x: (-(x.get("updated_at") or 0),         # noqa: E731
+                     str(x.get("id") or ""))
     active.sort(key=key)
     done.sort(key=key)
     return {"ok": True,
@@ -413,6 +436,7 @@ def session_tasks(cg, active_limit: int = 5, done_limit: int = 5) -> dict:
             "active_total": len(active), "done_total": len(done)}
 
 
+# 生效条件：name 经 task_node_id 得 nid，exists 为同 id 任务卡是否被 _read_task 命中；k 经 `int(k or 5)` 再 max(…, 1)（k 为 None/0/空串回落 5，负数取 1）得到 kk，cg.search 抛异常时按无结果处理，只保留元素长度 ≥3、frontmatter.tags 含 TASK_TAG 且 node.id != nid 的条目，返回 out[:kk] 与 note。
 def find_similar(cg, name: str, k: int = 5) -> dict:
     """同族任务提示（**只提示，不自动合并**——是否同一任务由调用方裁决）。
 

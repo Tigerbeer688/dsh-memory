@@ -100,6 +100,7 @@ CONDITION_MARK = "〔来源限定〕"
 
 # ---- 赛道与来源执照 ------------------------------------------------------
 
+# 生效条件：给定 fm，若显式 track/discipline_type 命中枚举则返回对应赛道；否则用相关元数据与正文 CCG 字段匹配提示词，返回 humanities/science/undetermined。
 def classify_track(fm: dict, content: str = "") -> str:
     """判定节点赛道：`humanities` / `science` / `undetermined`。
 
@@ -133,11 +134,13 @@ def classify_track(fm: dict, content: str = "") -> str:
     return "undetermined"
 
 
+# 生效条件：给定 track，返回 SOURCE_POLICY 中映射的策略名；未知 track 返回空串。
 def source_policy(track: str) -> str:
     """赛道 → 来源策略名（空串表示不可判定，应 DEFER）。"""
     return SOURCE_POLICY.get(track or "", "")
 
 
+# 生效条件：给定 track，若为 science 返回 REPRODUCIBLE_BASIS，若为 humanities 返回 CONSISTENCY_BASIS，否则返回 ()。
 def allowed_basis(track: str) -> tuple:
     if track == "science":
         return tuple(nodefile.REPRODUCIBLE_BASIS)
@@ -146,15 +149,18 @@ def allowed_basis(track: str) -> tuple:
     return ()
 
 
+# 生效条件：给定 track 与 basis，当 basis 非空且其字符串形式属于 allowed_basis(track) 时返回 True，否则 False。
 def basis_licensed(track: str, basis) -> bool:
     """来源执照：理科要可复现证据，文科要来源一致性；赛道未定一律不发放。"""
     return bool(basis) and str(basis) in allowed_basis(track)
 
 
+# 生效条件：给定 field，返回 FIELD_NORMALIZE 映射值；未知字段返回空串。
 def normalize_field(field) -> str:
     return FIELD_NORMALIZE.get(str(field or "").strip(), "")
 
 
+# 生效条件：给定 v，若为 None 返回 []；否则将单值或列表转为去除空白后非空字符串的列表。
 def _as_source(v) -> list:
     if v is None:
         return []
@@ -164,6 +170,7 @@ def _as_source(v) -> list:
 
 # ---- B 型识别与条件化改写 ------------------------------------------------
 
+# 生效条件：给定 text，若含 VALUATION_MARKERS 或匹配 VALUATION_PATTERNS 则返回 B_CLAIM，否则 A_CLAIM。
 def claim_type(text) -> str:
     """`A_fact`（事实性）或 `B_valuation`（评价性断言）。"""
     s = str(text or "")
@@ -176,10 +183,12 @@ def claim_type(text) -> str:
     return A_CLAIM
 
 
+# 生效条件：给定 text，返回其去除首尾空白后是否以 CONDITION_MARK 开头。
 def is_conditioned(text) -> bool:
     return str(text or "").strip().startswith(CONDITION_MARK)
 
 
+# 生效条件：给定 text、label、source，若 text 非空且 label 非空且 source 解析后非空，则返回带 CONDITION_MARK 的来源限定表述；已条件化原样返回；否则 None。
 def conditioned_claim(text, label, source):
     """把评价性断言改写为**带来源限定的条件表述**；缺来源/标签则返回 `None`（不写）。
 
@@ -198,6 +207,7 @@ def conditioned_claim(text, label, source):
     return f"{CONDITION_MARK}据{label}（{src}）的表述：{body}"
 
 
+# 生效条件：给定 fm 与 content，提取 CCG 声明字段、comment 值与正文长句，返回断言列表，每项含 text/type/where/field。
 def extract_claims(fm: dict, content: str) -> list:
     """提取可核对断言：CCG 声明字段 + comment 值 + 正文长句。
 
@@ -206,6 +216,7 @@ def extract_claims(fm: dict, content: str) -> list:
     """
     out, seen = [], set()
 
+# 生效条件：仅当 str(text or "").strip() 得到的 s 长度 >= 4、s 不在 seen 中、且 nodefile.is_placeholder_text(s) 为假时，把 {text: s, type: claim_type(s), where, field} 追加进 out 并把 s 加入 seen，否则直接返回（field 默认 ""）。
     def _push(text, where, field=""):
         s = str(text or "").strip()
         if len(s) < 4 or s in seen or nodefile.is_placeholder_text(s):
@@ -240,6 +251,7 @@ def extract_claims(fm: dict, content: str) -> list:
     return out
 
 
+# 生效条件：给定 fm、content、claim、new_text，按 claim.where 定位并在唯一匹配时替换断言返回 (content, True)，否则返回 (content, False)。
 def _rewrite_claim(fm: dict, content: str, claim: dict, new_text: str):
     """节点内定位并替换一条断言 → `(content, ok)`；定位不唯一则 fail-closed 不动。"""
     where, field = claim.get("where"), claim.get("field")
@@ -269,6 +281,7 @@ def _rewrite_claim(fm: dict, content: str, claim: dict, new_text: str):
 
 # ---- 工单 ----------------------------------------------------------------
 
+# 生效条件：给定 fm 与 content，返回缺失项列表：verification_basis 无效则加入该名，正文无 "# 验证方式" 行则加入该名。
 def _need(fm: dict, content: str) -> list:
     need = []
     if not nodefile.verification_basis_valid(fm):
@@ -278,6 +291,7 @@ def _need(fm: dict, content: str) -> list:
     return need
 
 
+# 生效条件：给定 nid、e、fm、content，返回含 id、layer、track、claims、need、source_policy 的工单行字典。
 def _worklist_row(nid: str, e: dict, fm: dict, content: str) -> dict:
     track = classify_track(fm, content)
     return {
@@ -290,6 +304,7 @@ def _worklist_row(nid: str, e: dict, fm: dict, content: str) -> dict:
     }
 
 
+# 生效条件：给定 fm 与 content，若正文或 comment 中声明的执行字段为占位文本则返回 True；未声明执行时以正文整体占位判定。
 def _is_placeholder_shell(fm: dict, content: str) -> bool:
     """空壳判定：核心可执行内容未被填充 → 禁止接线（不得把「待填充」固化成事实）。
 
@@ -305,6 +320,7 @@ def _is_placeholder_shell(fm: dict, content: str) -> bool:
     return nodefile.is_placeholder_text(content)
 
 
+# 生效条件：给定 cg，逐节点按 layer/ids/prefix 过滤后产出状态为 skip（internal/denied/locked/derived/present/placeholder/unreadable 等）或 row 的扫描结果。
 def _scan(cg, layer=None, ids=None, prefix=None):
     """逐节点产出扫描结果：`{"status", "reason"?, "id", "row"?}`。
 
@@ -355,6 +371,7 @@ _SKIP_KEY = {"locked": "skipped_locked", "derived": "skipped_derived",
              "unreadable": "skipped_unreadable", "internal": "skipped_internal"}
 
 
+# 生效条件：给定 x（路径或 MdCGOS），只读扫描并生成缺 verification_basis 或 "# 验证方式" 的节点工单，返回统计 rep。
 def build_worklist(x, layer=None, limit=None, ids=None, prefix=None) -> dict:
     """生成核对工单（只读）：缺 `verification_basis`/`验证方式` 的节点入列。
 
@@ -418,6 +435,7 @@ _VERIFY_TEMPLATE = """你是独立**验证单元**（verify）。对下列候选
 硬约束：你只能否决（drop）或存疑（defer），**不得新增候选、不得改写 value**。"""
 
 
+# 生效条件：给定 row、fm、content，用 row 的 track/source_policy/need/claims 与 fm 标题、content 前 1200 字符填充反思模板并返回字符串。
 def reflect_prompt(row: dict, fm: dict, content: str) -> str:
     claims = "\n".join(f"- [{c['type']}] {c['text']}" for c in (row.get("claims") or []))
     return _REFLECT_TEMPLATE.format(
@@ -428,6 +446,7 @@ def reflect_prompt(row: dict, fm: dict, content: str) -> str:
         body=(content or "")[:1200])
 
 
+# 生效条件：给定 row 与 rows，把候选字段、值、依据、来源序列化为 JSON 并填充验证模板返回字符串。
 def verify_prompt(row: dict, rows: list) -> str:
     cands = [{"field": r.get("field"), "value": r.get("value"),
               "basis": r.get("basis"), "source": r.get("source")} for r in rows]
@@ -436,6 +455,7 @@ def verify_prompt(row: dict, rows: list) -> str:
         candidates=json.dumps(cands, ensure_ascii=False))
 
 
+# 生效条件：raw 经 str(raw or "") 得 s 后，want_list 为真时先试 s 首个 "[" 至末个 "]"、再试首个 "{" 至末个 "}"（want_list 假值时只试花括号），区间可被 json.loads 解析且结果为 list 时原样返回该 list；结果为 dict 时按 rows/items/verdicts/candidates/data 顺序取首个 obj.get(key) 为 list 的 obj[key]，都不满足则返回 [obj]，非 list/dict 或区间缺失、解析抛 ValueError 时继续下一组括号，全部落空（含 raw 为假值使 s 为空串）返回 []。
 def _extract_json(raw, want_list=True):
     """从模型输出里抽取 JSON（容忍代码围栏与前后废话）。"""
     s = str(raw or "")
@@ -458,6 +478,7 @@ def _extract_json(raw, want_list=True):
     return []
 
 
+# 生效条件：给定 item，若为 dict 则规范化 field/value/basis/source/verdict/reason 后返回字典，否则返回 {}。
 def _norm_row(item) -> dict:
     if not isinstance(item, dict):
         return {}
@@ -471,6 +492,7 @@ def _norm_row(item) -> dict:
     }
 
 
+# 生效条件：给定 raw，解析 JSON 行并保留 field 为“验证方式”或“verification_basis”（统一为“验证方式”）的行，返回列表。
 def parse_reflect_rows(raw) -> list:
     out = []
     for item in _extract_json(raw, want_list=True):
@@ -482,6 +504,7 @@ def parse_reflect_rows(raw) -> list:
     return out
 
 
+# 生效条件：遍历 _extract_json(raw, want_list=False)（只认花括号 JSON）的结果，仅当 item 经 _norm_row 后为真且 r["field"] 非空时产出 {field,value,verdict,reason} 四键行，否则跳过（raw 无可解析花括号对象时 out 为空列表）。
 def parse_verify_rows(raw) -> list:
     out = []
     for item in _extract_json(raw, want_list=False):
@@ -494,6 +517,7 @@ def parse_verify_rows(raw) -> list:
 
 # ---- 白箱闸门与双单元折叠 ------------------------------------------------
 
+# 生效条件：逐行处理 rows，仅当 normalize_field(r.get("field")) 落在 WRITABLE_FIELDS、basis_licensed(track, r.get("basis")) 为真、r.get("source") 为真、且 r.get("value") or BASIS_TEXT.get(str(r.get("basis")), "") 非空时进入 kept（附 verdict="accept"），否则该行带对应 reason 进入 gated。
 def gate_rows(rows: list, track: str) -> tuple:
     """零模型白箱闸门：字段越界 / 来源执照不通过 / 无来源 → 一律降级为 defer。
 
@@ -520,6 +544,7 @@ def gate_rows(rows: list, track: str) -> tuple:
     return kept, gated
 
 
+# 生效条件：按 (r.get("id"), normalize_field(r.get("field")) or r.get("field"), r.get("value")) 分组后，组内缺 unit==REFLECT_UNIT 或 unit==VERIFY_UNIT 的行时进 deferred，否则 verify 侧出现 verdict=="drop" 即进 dropped（veto 优先），再否则仅当 reflect 与 verify 各存在 verdict=="accept" 时才进 accepted（附 units），其余进 deferred。
 def fold_verdicts(rows: list) -> tuple:
     """把两单元裁决折叠为可落库结论 → `(accepted, deferred, dropped)`。
 
@@ -562,6 +587,7 @@ def fold_verdicts(rows: list) -> tuple:
     return accepted, deferred, dropped
 
 
+# 生效条件：当 rows 中 unit==REFLECT_UNIT 与 unit==VERIFY_UNIT 的执行者经 str(x.get("actor") or "") 后存在相同的非空值（空串被 discard）时返回 True，否则返回 False。
 def detect_self_verify(rows: list) -> bool:
     """同一执行者同时充当反思与验证 = 自证（禁止）。"""
     r = {str(x.get("actor") or "") for x in rows if x.get("unit") == REFLECT_UNIT}
@@ -573,6 +599,7 @@ def detect_self_verify(rows: list) -> bool:
 
 # ---- 落库写入 ------------------------------------------------------------
 
+# 生效条件：verdicts 为 None 时返回 None；verdicts 为 dict 时对每个键值把 (rs or []) 中的 dict 元素收为 {str(nid): [...]}；否则遍历 verdicts or []，仅当元素为 dict 且 str(r.get("id") or "") 非空时按该 id 追加到对应列表。
 def _norm_verdicts(verdicts):
     """外部裁决（子代理落盘）→ `{id: [rows]}`。"""
     if verdicts is None:
@@ -591,6 +618,7 @@ def _norm_verdicts(verdicts):
     return out
 
 
+# 生效条件：accepted 非空（取 accepted[0]）时，先以 basis=str(a.get("basis") or BASIS_ENUM_DEFAULT) 与 value=str(a.get("value") or BASIS_TEXT.get(basis, "")).strip() 写「验证方式」行与 comment，之后才在 nodefile.verification_basis_valid(fm) 为真时把 basis 换成 fm.get("verification_basis")、否则把该 basis 写入 fm["verification_basis"]；condition_claims 为真时仅对 row.get("claims") 中 type==B_CLAIM 且未被 is_conditioned 的条目做条件化改写，返回含 fm_before、content_hash_before 等留痕的 dict。
 def _apply_node(cg, nid, e, fm, content, accepted, row, batch, actor,
                 condition_claims=True):
     """把一个节点的已接受结论写入 md，返回留痕记录（含回滚所需现场）。"""
@@ -664,6 +692,7 @@ def _apply_node(cg, nid, e, fm, content, accepted, row, batch, actor,
 
 # ---- 主流程 --------------------------------------------------------------
 
+# 生效条件：reflect_fn(reflect_prompt(scan_row, fm, content)) 经 parse_reflect_rows 得到非空候选时返回 (rrows, vrows)，rrows 为空则返回 ([], [])；verify_fn 为 None 时 vrows 为空列表，非 None 时由 parse_verify_rows(verify_fn(verify_prompt(scan_row, rrows))) 生成、每行 value 为 c.get("value") or rrows 中同 field 的 value、再回落 ""。
 def _rows_for(scan_row, fm, content, reflect_fn, verify_fn, r_actor, v_actor):
     """调用两单元子代理，返回合并后的裁决行（reflect + verify）。"""
     prompt = reflect_prompt(scan_row, fm, content)
@@ -684,6 +713,7 @@ def _rows_for(scan_row, fm, content, reflect_fn, verify_fn, r_actor, v_actor):
     return rrows, vrows
 
 
+# 生效条件：对 pre 中每个 r，str(r.get("unit") or REFLECT_UNIT).strip().lower() 等于 VERIFY_UNIT 时进 vrows，否则（含 unit 缺失回落到 REFLECT_UNIT 及任何其他取值）进 rrows，两组行均覆盖 id=nid、unit、track=track。
 def _rows_from_verdicts(nid, track, pre):
     """从外部裁决中拆出 (reflect, verify) 两组行。"""
     rrows, vrows = [], []
@@ -694,6 +724,7 @@ def _rows_from_verdicts(nid, track, pre):
     return rrows, vrows
 
 
+# 生效条件：x 经 _as_cg 解析且 batch = batch or CROSSCHECK_BATCH 后逐节点扫描，裁决来源按 vmap（verdicts 归一化后非 None）→ reflect_fn 非 None → 二者皆无记 no_reflect 三条分支取行；allow_self_verify=False 时同执行者自证记 self_verify_disallowed，再经 gate_rows 闸门与 require_verify 后 fold_verdicts，仅 apply=True 才 _apply_node 写盘并在有写入时 cg.rebuild_index；limit 非 None 且已达标数 >= limit 时用 continue 跳过（非终止）。
 def crosscheck(x, layer=None, limit=None, ids=None, reflect_fn=None,
                verify_fn=None, verdicts=None, apply=False,
                batch=CROSSCHECK_BATCH, actor=None, require_verify=True,
@@ -721,9 +752,11 @@ def crosscheck(x, layer=None, limit=None, ids=None, reflect_fn=None,
            "placeholder_ids": [], "undetermined": 0,
            "reasons": {}, "samples": [], "entry_ids": []}
 
+# 生效条件：无条件执行 rep["reasons"][reason] = rep["reasons"].get(reason, 0) + 1（reason 缺键时按 .get 的第二参数 0 起算），返回 None。
     def _bump(reason):
         rep["reasons"][reason] = rep["reasons"].get(reason, 0) + 1
 
+# 生效条件：仅当外层 verbose 为真且 len(rep["samples"]) < 20 时把 {kind, id: nid, detail} 追加进 rep["samples"]，否则不追加（已达 20 条即停止采样）。
     def _sample(kind, nid, detail=""):
         if verbose and len(rep["samples"]) < 20:
             rep["samples"].append({"kind": kind, "id": nid, "detail": detail})
@@ -828,10 +861,12 @@ def crosscheck(x, layer=None, limit=None, ids=None, reflect_fn=None,
 
 # ---- 留痕查询 / 回滚 -----------------------------------------------------
 
+# 生效条件：无条件返回 os.path.join(cg.root, CROSSCHECK_LOG)（以 cg.root 与常量 CROSSCHECK_LOG 拼接，无分支）。
 def _log_path(cg) -> str:
     return os.path.join(cg.root, CROSSCHECK_LOG)
 
 
+# 生效条件：box 非 dict 时返回 False；box 为 dict 且 key=="comment_verification" 时按 box.get("had") 为真则把 comment 的「验证方式」设为 box.get("value")、否则删除该键并返回 True；其他 key 时 had 为真赋 fm[key]=value、否则 fm.pop(key, None) 并返回 True。
 def _reattach(fm: dict, content: str, box: dict, key: str):
     """把 `fm_before[key]` 现场还原到 fm，返回是否发生还原。"""
     if not isinstance(box, dict):
@@ -851,6 +886,7 @@ def _reattach(fm: dict, content: str, box: dict, key: str):
     return True
 
 
+# 生效条件：仅当 str(c.get("after") or "") 非空，且分别满足 where=="ccg" 且 field 真值且 _ccg_field(content, field).strip()==after.strip()（用 before 覆盖该行）、where=="comment" 且 field 真值且 comment 该 field 为含 after 的 list 或 str(v or "").strip()==after.strip()（改为 before）、where=="body" 且 after 出现在 content 中（替换首个匹配）时返回 (content, True)；其余情形（含 where 为其他值、字段缺失、当前值不等于写入值）返回 (content, False)。
 def _rewind_claim(fm: dict, content: str, c: dict):
     """撤销一条条件化改写（仅当前值 == 写入值时才动）→ `(content, ok)`。"""
     where, field = c.get("where"), c.get("field")
@@ -880,6 +916,7 @@ def _rewind_claim(fm: dict, content: str, c: dict):
     return content, False
 
 
+# 生效条件：x 经 _as_cg 后，对 read_jsonl(_log_path(cg)) 中 action=="crosscheck"、batch 为 None 或等于参数 batch、且 entry_ids 为假值不做 id 过滤（为真值时仅取 entry_id 在集合中的）的记录逐条处理：node 缺失或已处理则跳过，索引无该 node 或 cg._read 得 fm 为 None 或 crypto.is_encrypted(content) 为真时 skipped_drift 加一，write_id 双方非空且不等时 conflict 加一，否则撤销 claims_conditioned、在当前「验证方式」行非空且等于 rec 的 verification_value 时撤销该行、再按 fm_before 还原，reverted 为空则 conflict 加一，非空则写回节点、追加 crosscheck_rollback 日志、reverted 与 entry_ids 加一，最终 reverted 非零时 cg.rebuild_index()，返回 rep；
 def rollback(x, batch=None, entry_ids=None, actor=None) -> dict:
     """按留痕反向应用：撤销核对写入（当前值 ≠ 写入值时跳过，计入 conflict）。"""
     cg = _as_cg(x)
@@ -945,6 +982,7 @@ def rollback(x, batch=None, entry_ids=None, actor=None) -> dict:
     return rep
 
 
+# 生效条件：遍历 _log_path(cg) 的记录时，action 为真值只留 rec.get("action")==action 的行、batch 为真值只留 rec.get("batch")==batch 的行；limit 非 None 且 limit>=0 时按 recs[-limit:] 截取（limit 为 0 时 [-0:] 即整表不被削减），否则保留全部；返回 {'root','total','returned','records'}。
 def history(x, limit=100, action=None, batch=None) -> dict:
     cg = _as_cg(x)
     recs = []
@@ -963,6 +1001,7 @@ def history(x, limit=100, action=None, batch=None) -> dict:
 
 # ---- 权限与 CLI ----------------------------------------------------------
 
+# 生效条件：principal 为 None 时返回 False；否则仅当 principal.expired() 为假、principal.can_write 为真、且 principal.allows_layer("knowledge") 为真时返回 True，期间任一步抛 Exception 亦返回 False。
 def can_write_knowledge(principal) -> bool:
     """落 knowledge 层必须持有可写该层的令牌（designer 派生）；否则 fail-closed。"""
     if principal is None:
@@ -975,6 +1014,7 @@ def can_write_knowledge(principal) -> bool:
         return False
 
 
+# 生效条件：path 为假值（空串/None）返回 None；path 不存在则 raise SystemExit；已存在且读取文本 strip 后为空串返回 []，非空时整段 json.loads 成功即返回该值，抛 ValueError 时按行解析（跳过空行与 "//" 开头行）返回行列表。
 def _load_verdicts(path: str):
     if not path:
         return None
@@ -996,6 +1036,7 @@ def _load_verdicts(path: str):
         return rows
 
 
+# 生效条件：argv（为 None 时由 argparse 读 sys.argv）解析后按 --action 分派——worklist 调 build_worklist，history 调 history（--limit 默认 None，为 None 时传 100），rollback 在 can_write_knowledge(principal) 为假时抛 SystemExit 否则调 rollback，crosscheck 在 --apply 为真且 can_write_knowledge(principal) 为假时抛 SystemExit 否则调 crosscheck；--token（默认 os.environ.get("MDCG_TOKEN") or ""）为真值时先 tokens.verify_token 校验、失败抛 SystemExit；最后打印 rep 并返回 0；
 def _cli(argv=None) -> int:
     ap = argparse.ArgumentParser(
         prog="python -m md_cg.crosscheck",
@@ -1055,4 +1096,3 @@ def _cli(argv=None) -> int:
 
 if __name__ == "__main__":                              # pragma: no cover
     sys.exit(_cli())
-

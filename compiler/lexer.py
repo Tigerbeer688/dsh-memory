@@ -111,6 +111,7 @@ class Token:
     line: int = 1
     column: int = 1
     
+# 生效条件：在 Token 实例上调用时读取 self.type.name、self.value、self.line、self.column，str(self.value) 长度超过 30 时取前 30 字符并追加 "..."，否则原样使用。
     def __repr__(self) -> str:
         v = str(self.value)[:30]
         if len(str(self.value)) > 30:
@@ -202,11 +203,13 @@ PUNCTUATION_MAP = {
 # 工具函数
 # =============================================================================
 
+# 生效条件：传入单个字符 ch 后取 ord(ch) 得码点，码点落在 0x4E00–0x9FFF（19968–40959）时返回 True，否则返回 False。
 def _is_cjk(ch: str) -> bool:
     """是否为 CJK 统一汉字"""
     code = ord(ch)
     return 0x4E00 <= code <= 0x9FFF
 
+# 生效条件：传入字符 ch，当 _is_cjk(ch) 为真、或 ch.isalpha() 为真、或 ch == "_" 时返回 True，三者皆不满足时返回 False。
 def _is_cjk_or_alpha(ch: str) -> bool:
     """是否为中文、字母、下划线"""
     return _is_cjk(ch) or ch.isalpha() or ch == "_"
@@ -216,6 +219,7 @@ def _is_cjk_or_alpha(ch: str) -> bool:
 # 词法分析器
 # =============================================================================
 
+# 生效条件：以 source 为必填实参构造，实例化即置 self.source=source，并将 pos 置 0、line 置 1、column 置 1、tokens 与 errors 置空列表；
 class Lexer:
     """
     词法分析器 v2.0
@@ -225,6 +229,7 @@ class Lexer:
     阶段二：精分（对中文/字母串做关键字切分）
     """
     
+# 生效条件：source 原样存入 self.source（不做类型与空值校验），同时把 pos 置 0、line 与 column 置 1、tokens 与 errors 置为空列表。
     def __init__(self, source: str):
         self.source = source
         self.pos = 0
@@ -233,6 +238,7 @@ class Lexer:
         self.tokens: List[Token] = []
         self.errors: List[str] = []
     
+# 生效条件：以 self.source 与初始 self.pos=0、line=1、column=1 逐字符扫描——换行分支推进 self.line、空白分支推进 self.column、`//` 交 _skip_comment、`"` 或 `“` 交 _read_string、isdigit/`.`/`-` 且 _peek_isdigit 交 _read_number、PUNCTUATION_MAP 中字符与 `=`、`＝` 直接 _emit、CJK/字母/下划线交 _read_and_segment，其余字符追加到 self.errors，循环结束后 _emit(EOF) 并返回 (self.tokens, self.errors)。
     def tokenize(self) -> Tuple[List[Token], List[str]]:
         """执行词法分析"""
         self.tokens = []
@@ -301,6 +307,7 @@ class Lexer:
     
     # ---- 阶段一：粗分 ----
     
+# 生效条件：从 self.pos（__init__ 的 source 上的游标）起贪婪吞并 _is_cjk_or_alpha 或 isdigit 的字符（一个都不满足则 text 为空串且游标不动），再以 (text, 起始列) 调用 self._segment。
     def _read_and_segment(self):
         """
         读取连续的中文/字母/数字/下划线，然后做关键字精分
@@ -328,6 +335,7 @@ class Lexer:
     
     # ---- 阶段二：精分 ----
     
+# 生效条件：text 为空串时 while 不执行、不发任何 token；否则从 i 起在 SORTED_KW 中取最长匹配关键字发出 KEYWORD_MAP[kw]，无匹配时 text[i] 为 CJK 则取连续 CJK 整段、否则取到下一个关键字起点前的字符段作为 IDENTIFIER 发出（切出的段为空串则不发出）。
     def _segment(self, text: str, start_col: int):
         """
         正向最大匹配（Forward Maximum Matching）
@@ -371,6 +379,35 @@ class Lexer:
                 
                 if _is_cjk(text[i]):
                     while i < len(text) and _is_cjk(text[i]):
+                        # 「于」是参数介词（止 X 于 Y），从不构成操作数名的
+                        # 一部分：内嵌时必须在此断开，与 ASCII 分支的关键词
+                        # 前瞻（has_kw_ahead）行为对称——否则整段 CJK run
+                        # 连同「于」被吞作一个 IDENTIFIER，「止情感权重于0.15」
+                        # 的数值操作数 0.15 经 parser 合并后凭空消失（缺陷）。
+                        # 前瞻集合含以「于」结尾的比较词（大于/等于/小于），
+                        # 断点须落在多字词起点——主循环的最长匹配不能跨越
+                        # 断点，若在词内「于」处才断，「大于」会碎成 ID 尾字
+                        # + 孤立 YU。其余关键词（乘/加/为/且…）不在此断开：
+                        # 运算词内嵌于名词是合法标识符（「阶乘」「加权」），
+                        # 全量前瞻会把它们切碎（见上 docstring 的整段保护规则）。
+                        if any(text.startswith(k, i) for k in
+                               ("大于", "等于", "小于", "于")):
+                            break
+                        # 定向断开（安全修复）：「条件空间为X」的无空格
+                        # 写法。仅当「为/不为」紧接在名词「条件空间」之后
+                        # 才断开——「为」此处是比较操作符（WEI，==），与
+                        # 带空格写法「条件空间 为 X」语义相同。若不断开，
+                        # 整串吞作单 IDENTIFIER，parser 不生成 COMPARISON，
+                        # 名实校验的条件空间切换检测（依赖
+                        # left=="条件空间" 的比较节点）永不触发，「伴侣」
+                        # 空间情感权重上限等约束对无空格源码整体失效。
+                        # 不能把「为」全局加入断开集合：「作为/成为/行为/
+                        # 认为」等含「为」名词会被切碎，故仅此序列定向断
+                        # 开；断点落在关键字（为/不为）起点，主循环的最长
+                        # 匹配随后正常发出 WEI/BUWEI。
+                        if (text[i - 4:i] == "条件空间" and
+                                text.startswith(("为", "不为"), i)):
+                            break
                         i += 1
                         col += 1
                 else:
@@ -388,9 +425,11 @@ class Lexer:
     
     # ---- 数字读取 ----
     
+# 生效条件：self.pos + 1 小于 len(self.source) 且 self.source[self.pos + 1].isdigit() 为真时返回 True，否则（越界或非数字）返回 False。
     def _peek_isdigit(self) -> bool:
         return self.pos + 1 < len(self.source) and self.source[self.pos + 1].isdigit()
     
+# 生效条件：从 self.source[self.pos] 起按可选 '-'、整数位、可选 '.' 加小数位拼成字符串，float() 成功即发出 NUMBER，抛 ValueError 时先追加一条「非法数值」到 self.errors 但仍发出同一个 NUMBER token。
     def _read_number(self):
         """读取数值（支持整数、小数、负数）"""
         start_col = self.column
@@ -428,6 +467,7 @@ class Lexer:
     
     # ---- 字符串读取 ----
     
+# 生效条件：self.source[self.pos] 为 `"` 时 end_quote 取 `"`、为 `“` 时取 `”`，随后逐字符累积进 result 直到遇 end_quote；遇 `\n` 时向 self.errors 记 "字符串未闭合" 并 break（此时 self.pos 仍在串长内，仍会 pos+=1、column+=1 跳过该换行），最后 _emit(TokenType.STRING, 累积内容)。
     def _read_string(self):
         """读取字符串"""
         quote_char = self.source[self.pos]
@@ -454,12 +494,14 @@ class Lexer:
     
     # ---- 注释跳过 ----
     
+# 生效条件：从 self.pos 起自增扫描，直到 self.pos >= len(self.source) 或 self.source[self.pos] == "\n" 时停止；只推进 self.pos，不改 self.line、self.column，也不追加 token。
     def _skip_comment(self):
         while self.pos < len(self.source) and self.source[self.pos] != "\n":
             self.pos += 1
     
     # ---- Token 输出 ----
     
+# 生效条件：col 不为 None（含 0）时用 col、col 为 None 时才回落 self.column，向 self.tokens 追加 Token(token_type, value, self.line, 该列)。
     def _emit(self, token_type: TokenType, value: str, col: int = None):
         """输出一个 Token"""
         c = col if col is not None else self.column
@@ -470,6 +512,7 @@ class Lexer:
 # 便捷函数
 # =============================================================================
 
+# 生效条件：source 交给新建的 Lexer(source)，返回其 tokenize() 给出的 (tokens, errors) 二元组。
 def tokenize(source: str) -> Tuple[List[Token], List[str]]:
     """便捷函数"""
     lexer = Lexer(source)

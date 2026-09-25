@@ -42,8 +42,10 @@ DEFAULT_ROOT = os.path.join(
 AUDIT_TAIL = 20000
 
 
+# 生效条件：无入参，datapath.mdcg_root() 返回真值时返回该值，导入或调用抛异常、或返回假值（如空串）时返回模块常量 DEFAULT_ROOT；
 def _default_root() -> str:
-    """根解析沿用本仓约定：env `MDCG_ROOT` > `data/paths.json` > 插件仓 `data/mdcg`。
+    """根解析沿用本仓约定：env `MDCG_ROOT` > `paths.json`（用户级，旧包内兼容读）
+    > 用户级状态根 `data/mdcg`。
 
     走 `datapath.mdcg_root()`（兜底纪律：与其它工具同源解析，不另立一套）。
     """
@@ -115,6 +117,7 @@ NEW_TYPE_TOUCHPOINTS = {
 }
 
 
+# 生效条件：root 下 INDEX_FILE 可读且 JSON 顶层为 dict 并含 nodes 字典时返回该 nodes；不可读抛 OSError、JSON 非法抛 JSONDecodeError、nodes 非 dict 抛 ValueError；
 def load_index(root: str) -> dict:
     """读索引快照（唯一必需数据源）；损坏即抛——断言集不建立在猜测上。"""
     with open(os.path.join(root, INDEX_FILE), encoding="utf-8") as f:
@@ -125,6 +128,7 @@ def load_index(root: str) -> dict:
     return nodes
 
 
+# 生效条件：path 不存在（os.path.exists 为假）时返回 []；存在时逐行解析，空行与 JSONDecodeError 行被跳过，返回可解析记录的列表（可能为 []）；
 def _read_jsonl(path: str) -> list:
     if not os.path.exists(path):
         return []
@@ -141,10 +145,12 @@ def _read_jsonl(path: str) -> list:
     return out
 
 
+# 生效条件：rec 的 tags 缺失或为假值时按空列表处理，仅对含 ":" 的 tag 取首个冒号前的前缀构成集合并返回；无此类 tag 时返回空集合；
 def _tag_prefixes(rec: dict) -> set:
     return {str(t).split(":", 1)[0] for t in (rec.get("tags") or []) if ":" in str(t)}
 
 
+# 生效条件：r 的 verification_basis 为 list/tuple 时返回其真值元素的 str 列表；否则该值真值时返回 [str(b)]，缺失或为假值（None/空串/空容器）时返回 []；
 def _basis_of(r: dict):
     b = r.get("verification_basis")
     if isinstance(b, (list, tuple)):
@@ -152,11 +158,13 @@ def _basis_of(r: dict):
     return [str(b)] if b else []
 
 
+# 生效条件：无入参，返回 layer（取自导入的模块常量 LAYERS 的排序值）+ edge_type/derived_relation/verification_basis/lifecycle_state 五键声明值映射，后四键对应模块导入或属性取值失败、属性值为假值（空容器/None）时该键 declared=None；
 def enum_spaces() -> dict:
     """各类型空间的声明值（模块真源取不到 → declared=None，报告标 BLINDSPOT）。"""
     from .mdcg import LAYERS
     spaces = {"layer": {"declared": sorted(LAYERS), "source": "mdcg.LAYERS"}}
 
+# 生效条件：以 md_cg.<mod> 导入并 getattr(attr)（导入或取值抛异常则 val=None），把 {"declared": sorted(val) if val else None, "source": "<mod>.<attr>"} 写入片段外闭包变量 spaces 的 key 键（val 为假值时 declared=None），无返回值；
     def _grab(mod: str, attr: str, key: str):
         try:
             m = __import__(f"md_cg.{mod}", fromlist=[attr])
@@ -175,6 +183,7 @@ def enum_spaces() -> dict:
 
 # ---------------------------- 指标 ----------------------------
 
+# 生效条件：对 nodes 各记录按 str(content_hash) 计数，content_hash 缺失被折成 "None"，返回出现次数 >1 且哈希不为 "None"/"" 的组数、涉及节点数与前 5 大组大小；
 def _dup_metrics(nodes: dict) -> dict:
     ch = Counter(str(r.get("content_hash")) for r in nodes.values())
     groups = {h: c for h, c in ch.items() if c > 1 and h not in ("None", "")}
@@ -182,6 +191,7 @@ def _dup_metrics(nodes: dict) -> dict:
             "largest": sorted(groups.values(), reverse=True)[:5]}
 
 
+# 生效条件：对 nodes 中每个节点的 "edges" 真值且为 list/tuple 的边列表，仅遍历其中 dict 边；依据 CANONICAL_EDGE_KEYS 与 "type" 统计键组合、关系类型、总边数、非规范键样本（最多 5）和悬空边，返回汇总字典。
 def _edge_metrics(nodes: dict) -> dict:
     types, key_mix = Counter(), Counter()
     total = dangling = with_edges = non_canonical = 0
@@ -210,6 +220,7 @@ def _edge_metrics(nodes: dict) -> dict:
             "non_canonical": non_canonical, "dangling": dangling, "samples": samples}
 
 
+# 生效条件：遍历 nodes 的值作为记录，path 经 str(r.get("path") or "") 为空即 missing++ 并 continue，不以记录含 layer/path 为前置；仅对非空 path 执行 layer 与 head 检查（layer 非空且 head != layer 且 head in LAYER_DIRS 时 layer_mismatch++），且 check_exists 为 True 时才对非空 path 以 os.path.join(root, rel) 判断不存在并计入 missing，最终返回 missing/layer_mismatch/samples 统计；。
 def _path_metrics(root: str, nodes: dict, check_exists: bool) -> dict:
     missing = mismatch = 0
     samples = []
@@ -233,6 +244,7 @@ def _path_metrics(root: str, nodes: dict, check_exists: bool) -> dict:
     return {"missing": missing, "layer_mismatch": mismatch, "samples": samples}
 
 
+# 生效条件：root 下 DECISION_LOG/INBOX_LOG 不存在时按空列表计，返回 decisions（decision 或 status 回落 "?" 的前 10 项）、decisions_total、inbox_pending=max(0, 收件数−决策数)、以及 _audit.jsonl 末尾 AUDIT_TAIL 行内 op 计数的前 6 项与尾窗元信息；
 def _gate_metrics(root: str) -> dict:
     dec = _read_jsonl(os.path.join(root, DECISION_LOG))
     inbox = _read_jsonl(os.path.join(root, INBOX_LOG))
@@ -259,6 +271,7 @@ def _gate_metrics(root: str) -> dict:
             "audit_tail_window": AUDIT_TAIL}
 
 
+# 生效条件：对 root 与 nodes，若 root/ACCESS_LOG 路径不存在则返回 {"distinct": None, "ratio": None, "lines": None}；否则逐行解析 JSON，当 "ids" 为 list 或 tuple 时把其中真值元素 str 后加入 seen，且当 "id"/"node_id"/"nid" 任一真值时把其 str 加入 seen，返回 distinct 为 seen 与 nodes 键交集数量、ratio 为 distinct/max(len(nodes),1)、lines 为非空行数。
 def _reach_metrics(root: str, nodes: dict) -> dict:
     p = os.path.join(root, ACCESS_LOG)
     if not os.path.exists(p):
@@ -285,6 +298,7 @@ def _reach_metrics(root: str, nodes: dict) -> dict:
     return {"distinct": hit, "ratio": hit / max(len(nodes), 1), "lines": lines}
 
 
+# 生效条件：对 nodes，筛出 layer 字符串为 "knowledge" 的 kn；mixed 为 kn 中标签前缀含 doc 或 code 的数量；返回全库 nodes 数与 knowledge 层数、mixed、mixed_ratio=mixed/max(len(kn),1)，以及全库口径 role_ratio/basis_ratio/evidence_ratio/state_ratio 和 knowledge 层口径 role_ratio_kn/basis_ratio_kn/evidence_ratio_kn。
 def _coverage_metrics(nodes: dict) -> dict:
     """混层口径 + 字段覆盖率（9-15 审计基线口径，逐项可复现）。
 
@@ -311,6 +325,7 @@ def _coverage_metrics(nodes: dict) -> dict:
                                      if _as_int(r.get("evidence_count")) > 0) / nk}
 
 
+# 生效条件：int(v) 转换成功时返回该整数；抛 TypeError/ValueError（如 None、非数字串）时返回 0；
 def _as_int(v) -> int:
     try:
         return int(v)
@@ -320,6 +335,7 @@ def _as_int(v) -> int:
 
 # ---------------------------- G3 · unanalyzed 派生集合 ----------------------------
 
+# 生效条件：仅当记录 _as_int(evidence_count)==0 且 verification_basis 为空且 lifecycle_state 为假值时计入 ids，返回 count、ratio=count/max(len(nodes),1) 与前 5 个 id 样本；
 def unanalyzed(nodes: dict) -> dict:
     """G3：unanalyzed **派生**判据（不新增字段、零写入）。
 
@@ -342,6 +358,7 @@ def unanalyzed(nodes: dict) -> dict:
 
 # ---------------------------- G1 · 类型空间正交性审计 ----------------------------
 
+# 生效条件：调用 _usage(nodes, edges) 时 edges 形参未被源码引用，对 nodes.values() 中每个节点 r，仅当 r.get("layer")、r.get("role")、r.get("derived_relation")、r.get("lifecycle_state") 为真值时分别以 str 值计入对应 Counter，_basis_of(r) 与 _tag_prefixes(r) 展开的元素分别计入 verification_basis 与 tag_prefix，再遍历各 r 的 r.get("edges") or [] 中 isinstance(e, dict) 的项按 edge_rel(e) 计数，最终 edge_type 仅保留键为真值的计数，返回 used 字典；
 def _usage(nodes: dict, edges: dict) -> dict:
     """各类型空间的**实测**取值（与 enum_spaces 的声明值对照）。"""
     from .chain import edge_rel
@@ -364,6 +381,7 @@ def _usage(nodes: dict, edges: dict) -> dict:
     return used
 
 
+# 生效条件：以 enum_spaces 的声明集与 _usage 的实测集逐空间对照（closed 仅在 declared 非 None 且无未声明已用时为 True），role 与 tag_prefix 两空间的 declared/closed 恒为 None，另附 _cross_space_overlap（字面量出现在 ≥2 空间或 layer∩tag_prefix）及 KNOWN_DIRECTION_CONFLICTS/VERIFIED_CONSISTENT/DOC_CODE_DRIFT/NEW_TYPE_TOUCHPOINTS 四个常量；
 def _g1_audit(nodes: dict, edges: dict) -> dict:
     """G1：声明值 / 实测值 / 未声明已用 / 声明未用 / 跨空间重叠 / 方向口径分歧。"""
     spaces = enum_spaces()
@@ -401,10 +419,12 @@ def _g1_audit(nodes: dict, edges: dict) -> dict:
 
 # ---------------------------- 断言集 ----------------------------
 
+# 生效条件：四参齐备时返回 {"id": cid, "level": level, "ok": bool(ok), "detail": detail}，ok 经 bool() 归一为布尔；
 def _ck(cid: str, level: str, ok: bool, detail: str) -> dict:
     return {"id": cid, "level": level, "ok": bool(ok), "detail": detail}
 
 
+# 生效条件：调用 check(root, check_paths, baseline, strict) 时，root 原样传入 load_index 得 nodes，check_paths 原样传入 _path_metrics 并在 index.path.present 检查消息中当其为假时追加“（--no-path-check 未查盘）”，baseline 为真时追加 _regression 基线不劣化检查、为假（None 或空 dict）时跳过，n=len(nodes) 小于 THRESHOLDS["min_nodes"] 时 small 为真且使 _ratio 各项及 reach.ratio、stratum.mixed_ratio 在 val 为 None 或 small 为真时记 BLINDSPOT、否则记 WARN，最终 verdict 为 FAIL（存在 level="FAIL" 且 ok 为假）、否则 WARN（存在 level="WARN" 且 ok 为假，或 strict 为真且存在 level="BLINDSPOT"）、否则 PASS，返回含 REPORT_VERSION、t、elapsed_s、root 绝对路径、verdict、nodes、checks、counts、coverage、dup、edges、paths、gate、reach、unanalyzed、g1、protocol（=protocol.audit() 静态对账，恒追加四条 FAIL 级断言：op.declared 无未登记分支 / verb.implemented live 动词均有实现分支 / verb.reserved_clean 预留动词未被静默实现 / shape.declared 形状声明完备）、thresholds 的 dict；
 def check(root: str, *, check_paths: bool = True,
           baseline: dict = None, strict: bool = False) -> dict:
     """跑一遍全部断言，返回报告 dict（零写入：不修任何数据、不落任何文件）。"""
@@ -452,6 +472,7 @@ def check(root: str, *, check_paths: bool = True,
                       f" / 最大组 {dup['largest'][:3]}（最大组上限 {DUP_GROUP_MAX}）"))
 
     # ---- 健康指标（只告警）----
+# 生效条件：val 为 None 或片段外闭包布尔 small 为真（small、n、T 均未在本片段定义）时追加 level="BLINDSPOT" 项；否则追加 level="WARN"、ok=(val>=low) 的项；两分支均无返回值；
     def _ratio(cid, val, low, name):
         if small or val is None:
             checks.append(_ck(cid, "BLINDSPOT", True,
@@ -478,6 +499,33 @@ def check(root: str, *, check_paths: bool = True,
                       f"闸门裁决样本 {gate['decisions_total']} 条 {gate['decisions']}"
                       f"（下限 {T['gate_sample_min']}）"))
 
+    # ---- 记忆动词协议 v1 静态对账（声明 ↔ MCP 面实现，纯源码事实、不连库）----
+    # 与 G1 的分工：G1 对账**数据值域**，这里对账**动词面**——两者都是
+    # 「声明了没做 / 做了没说」的前置红灯，属结构性不变量（FAIL 级，fail-closed）。
+    from . import protocol as _proto
+    pa = _proto.audit()
+    checks.append(_ck("protocol.op.extension_surface", "WARN", True,
+                      f"协议 v{pa['protocol_version']} 冻结面={pa['declared']}"
+                      f"（live {len(pa['live'])} / reserved {len(pa['reserved'])}）；"
+                      f"MCP 面另有 {len(pa['extension_ops'])} 个扩展 op 不属协议面"
+                      f"（文档一致性由 cogmap 门禁承担）"))
+    checks.append(_ck("protocol.verb.implemented", "FAIL",
+                      not pa["missing_impl"],
+                      f"声明为 live 的动词 {pa['live']} 均有实现分支"
+                      if not pa["missing_impl"] else
+                      f"声明为 live 却无实现分支：{pa['missing_impl']}"))
+    checks.append(_ck("protocol.verb.reserved_clean", "FAIL",
+                      not pa["reserved_leaked"],
+                      f"reserved 动词 {pa['reserved']} 未出现实现分支"
+                      if not pa["reserved_leaked"] else
+                      f"reserved 动词被静默实现（须先改 status=live）："
+                      f"{pa['reserved_leaked']}"))
+    checks.append(_ck("protocol.shape.declared", "FAIL",
+                      not pa["shape_errors"],
+                      f"{len(pa['declared'])} 个动词形状声明完备"
+                      if not pa["shape_errors"] else
+                      f"形状声明不完整：{pa['shape_errors']}"))
+
     # ---- 基线不劣化（有 baseline 时才可判）----
     if baseline:
         checks += _regression({"mixed_ratio": cov["mixed_ratio"],
@@ -497,9 +545,10 @@ def check(root: str, *, check_paths: bool = True,
                        "total": len(checks)},
             "coverage": cov, "dup": dup, "edges": edges, "paths": paths,
             "gate": gate, "reach": reach, "unanalyzed": un, "g1": g1,
-            "thresholds": T}
+            "protocol": pa, "thresholds": T}
 
 
+# 生效条件：对 cur 各键，baseline（或其 metrics）缺失、该键在基线为 None 或 cur 值为 None 时跳过；否则以 val > b+1e-9 判劣化，产出 level 恒为 "FAIL"、ok=not worse 的检查项；
 def _regression(cur: dict, baseline: dict) -> list:
     """与基线比对：单调量只准不变或改善（重复度/悬空/非规范键/混层/unanalyzed）。
 
@@ -519,6 +568,7 @@ def _regression(cur: dict, baseline: dict) -> list:
     return out
 
 
+# 生效条件：rep 含 coverage/edges/dup/unanalyzed/gate/reach 子字典与 nodes 键时（全部按下标取值，缺键即抛 KeyError）返回扁平指标映射；
 def metrics_of(rep: dict) -> dict:
     """抽成可比对的扁平指标（--baseline 的写入面）。"""
     return {"mixed_ratio": rep["coverage"]["mixed_ratio"],
@@ -538,6 +588,7 @@ def metrics_of(rep: dict) -> dict:
 
 # ---------------------------- 报告 ----------------------------
 
+# 生效条件：rep 各键齐备（按下标取值，任一键缺失抛 KeyError）时拼接为多行文本，reach.ratio 为 None 时渲染 "N/A"，g1 中以 "_" 开头的键在遍历中被跳过；
 def render(rep: dict) -> str:
     L = []
     a = L.append
@@ -573,6 +624,17 @@ def render(rep: dict) -> str:
       f"/{rep['gate']['audit_tail_window']} 行）={rep['gate']['audit_ops']}")
     a(f"  G3 unanalyzed 派生={rep['unanalyzed']['count']}"
       f" ({rep['unanalyzed']['ratio'] * 100:.1f}%)")
+    pr = rep.get("protocol") or {}
+    if pr:
+        a("\n-- 记忆动词协议 v1 静态对账 --")
+        a(f"  {pr['doc']}  frozen={pr['frozen']}  ok={pr['ok']}")
+        a(f"  声明={pr['declared']}")
+        a(f"  live={pr['live']}  reserved={pr['reserved']}（未实现即如实登记，不冒充）")
+        a(f"  MCP 面 op 分支={len(pr['actual'])} 个，其中扩展能力面"
+          f"（不属协议 v1）{len(pr['extension_ops'])} 个")
+        if pr["errors"]:
+            for e in pr["errors"]:
+                a(f"  !! {e}")
     a("\n-- G1 类型空间正交性 --")
     for name, spec in rep["g1"].items():
         if name.startswith("_"):
@@ -591,6 +653,7 @@ def render(rep: dict) -> str:
     return "\n".join(L)
 
 
+# 生效条件：传入对象可写属性时执行赋值 sustain_module.conformance_summary = report_summary，无返回值（None）；
 def register_sustain(sustain_module) -> None:               # pragma: no cover
     """挂点说明（供 sustain 侧最小侵入调用）。
 
@@ -601,6 +664,7 @@ def register_sustain(sustain_module) -> None:               # pragma: no cover
     sustain_module.conformance_summary = report_summary
 
 
+# 生效条件：root 依次取 cg_or_root.root 属性、cg_or_root 本身、_default_root()（前者为假值即回落，故 0/空串会继续回落）；check 抛异常时返回 ok=False、verdict="BLINDSPOT"、error，否则返回 ok=(verdict!="FAIL") 与 fail/warn/blindspot/failed_ids/t；
 def report_summary(cg_or_root) -> dict:
     """给常驻循环用的**轻量**结论（不渲染全文、不写盘）：verdict + 计数。"""
     root = getattr(cg_or_root, "root", None) or cg_or_root or _default_root()
@@ -616,11 +680,12 @@ def report_summary(cg_or_root) -> dict:
             "t": rep["t"]}
 
 
+# 生效条件：argv 为 None 时 argparse 从 sys.argv 取值，--root 缺失或为假值回落 _default_root()；check 抛 OSError/ValueError（如索引不可读）时打印 BLINDSPOT 并返回 2，否则按 --write-baseline/--json 写盘后返回 0（verdict≠"FAIL"）或 1（"FAIL"）；
 def main(argv=None) -> int:
     p = argparse.ArgumentParser(prog="python -m md_cg.conformance",
                                 description="数据健康不变量断言集（只读，零写入）")
     p.add_argument("--root", default=None,
-                   help="认知图根（默认 MDCG_ROOT > data/paths.json > 插件仓 data/mdcg）")
+                   help="认知图根（默认 MDCG_ROOT > paths.json > 用户级状态根 data/mdcg）")
     p.add_argument("--json", dest="json_out", default=None)
     p.add_argument("--baseline", default=None, help="基线报告 json（比对不劣化）")
     p.add_argument("--write-baseline", default=None, help="把本次指标写成新基线")

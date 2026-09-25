@@ -2,8 +2,10 @@ node_modules/
 /lib/
 *.tsbuildinfo
 
-# CodeBuddy 本地配置与计划（不入库）
-/.codebuddy/
+# CodeBuddy 本地配置与计划（不入库）；rules/ 例外：宿主纪律注入面（RULE.mdc 渲染落点），
+# 必须入库分发——否则 clone 后宿主无规则可注入，「入口写好了 AI 却不知道」即此断点（2026-09-23）
+/.codebuddy/*
+!/.codebuddy/rules/
 
 # AGENTS.md 本地使用（CodeBuddy 会话起始注入，不共享）
 /AGENTS.md
@@ -101,8 +103,20 @@ llm-adapter-poc/
 /hive/plans/naming_gov/specs/
 # 蜂巢 serve 本地环境配置（引用系统变量/个人数据文件路径，不入公开仓）
 /hive/config.local.json
+# 蜂巢互验**迭代交割面**（hive/interop/iter-*）：每轮投放/认领的中间产物目录
+# （request / proposals / replay / 回执副本），随轮次线性增长——v14 报告 I：
+# 2159 文件 / 8.7MB 入库且未忽略，属「迭代中间产物进仓」。协议**真源**仍是
+# 顶层台账与索引（_receipts_ledger.tsv / _dispatch_ledger.tsv /
+# _offers_index.md / note-*.md），据其可从对应 commit 重放再生交割面，
+# 故迭代目录不入库、仅本地留存。
+/hive/interop/iter-*/
 
 # 实验工作区（docs/experiments）：实验脚本 / result_*.json / _store 数据目录
 # 均为本地实验产物，不入库（_store 含 _index.json 与 *.lock，可由同目录
 # run_*.py 重跑再生；实验结论沉淀在 docs/ 的评测报告 md 中）
 docs/experiments/
+.env
+# ZCode 桌面端自动同步的本地忽略文件（工具维护，非仓库内容）；nul 为
+# Git Bash 下 `> nul` 重定向误建的意外产物，均不入库
+.zcodeignore
+nul

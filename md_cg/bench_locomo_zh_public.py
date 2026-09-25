@@ -55,6 +55,7 @@ CONFIGS = (
 REFERENCE = {"lexical": 0.936, "lexical,fuzzy": 0.976}
 
 
+# 生效条件：c 含 zh_fields（identity、time、summary、terms、condition）与 text 时，返回按身份/时间/摘要/词/条件/原始陈述拼接的正文。
 def body_of(c):
     """正文：与 bench_axis_domain.body_of / bench_zh_mad 的 a0 臂**逐字一致**。
 
@@ -74,6 +75,7 @@ def body_of(c):
     ])
 
 
+# 生效条件：传入 corpus 时，若 rebuild 为真且 ROOT 是目录则先删除 ROOT；随后以 MdCGOS(ROOT, autoflush=500) 打开，若已有节点数 >= len(corpus)（corpus 为空列表时该式恒真）则直接返回 cg，否则逐条 cg.add(c["id"], body_of(c), layer="knowledge", eval_src="public:locomo-zh-500", verification_basis="data") 并 cg.flush() 后返回 cg；
 def build_pool(corpus, rebuild=False):
     """把 567 条灌成灵枢记忆库（layer=knowledge，无 tags）。
 
@@ -99,6 +101,7 @@ def build_pool(corpus, rebuild=False):
     return cg
 
 
+# 生效条件：无参数；仅当 CORPUS567 与 QUESTIONS500 的 os.path.exists 均为真时才继续执行，否则立即 raise SystemExit；
 def main():
     if not os.path.exists(CORPUS567) or not os.path.exists(QUESTIONS500):
         raise SystemExit(

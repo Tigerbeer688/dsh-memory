@@ -42,6 +42,7 @@ MAX_CHECK = 2000          # 巡检节点上限（超出报 truncated，不静默
 STATUSES = ("ok", "stale", "dangling", "unresolved", "error")
 
 
+# 生效条件：给定 fp 时返回 os.path.abspath(fp or '')（fp 为空/None 则返回当前目录的绝对路径），作为水位键以绝对路径保证不同 root 下同名文件不互相覆盖。
 def _src_key(fp: str) -> str:
     """水位的键 = 源文件绝对路径。
 
@@ -51,6 +52,7 @@ def _src_key(fp: str) -> str:
     return os.path.abspath(fp or "")
 
 
+# 生效条件：无 required 形参，任何调用都返回 round(time.time(), 1)，把时间戳压到 1 位小数以稳定 `_refindex.json` 字节数。
 def _now() -> float:
     """时间戳压到 1 位小数：让 `_refindex.json` 字节数稳定（重跑不涨），
     同时保留足够的「多久以前」信息（float 的最短 repr 保证小数位固定为 1）。"""
@@ -61,6 +63,7 @@ def _now() -> float:
 # 提取器注册表（统一调度：调用方只说 kind，不说「用哪个模块」）
 # --------------------------------------------------------------------------
 
+# 生效条件：kind == 'code_ref' 返回 codeindex、kind == 'doc_ref' 返回 docindex，其他 kind 抛 ValueError（提示支持 REF_KEYS）。
 def _mod(kind: str):
     from . import codeindex, docindex
     if kind == "code_ref":
@@ -70,6 +73,7 @@ def _mod(kind: str):
     raise ValueError(f"未知 ref kind：{kind!r}（支持 {REF_KEYS}）")
 
 
+# 生效条件：无 required 形参，调用即返回 {'code_ref': {'suffixes': tuple(codeindex.SUFFIX)}, 'doc_ref': {'suffixes': tuple(docindex.SUFFIX)}}。
 def registry() -> dict:
     """后缀 → kind 的注册表（code / doc 各一份提取器）。"""
     from . import codeindex, docindex
@@ -79,6 +83,7 @@ def registry() -> dict:
     }
 
 
+# 生效条件：path 的小写后缀在 codeindex.EXTRACTORS 中返回 'code_ref'，在 docindex.SUFFIX 中返回 'doc_ref'，无后缀或均不匹配返回 ''。
 def kind_of_path(path: str) -> str:
     """按后缀判 kind；无提取器返回 ''（由调用方决定是报错还是跳过）。"""
     from . import codeindex, docindex
@@ -92,6 +97,7 @@ def kind_of_path(path: str) -> str:
     return ""
 
 
+# 生效条件：source 为待提取文本，kind 非空或 path 后缀能推出 kind 时返回 _mod(k).extract(source, path)，推不出 kind 时抛 ValueError。
 def extract(source: str, path: str = "", kind: str = ""):
     """统一提取入口：按 kind（或从 path 推断）分发到对应 extractor。"""
     k = kind or kind_of_path(path)
@@ -101,20 +107,24 @@ def extract(source: str, path: str = "", kind: str = ""):
     return _mod(k).extract(source, path)
 
 
+# 生效条件：kind 为 'code_ref'/'doc_ref' 时返回 _mod(kind).node_id(item)，其他 kind 由 _mod 抛 ValueError。
 def node_id_of(item: dict, kind: str) -> str:
     return _mod(kind).node_id(item)
 
 
+# 生效条件：kind 为 'code_ref'/'doc_ref' 时返回 _mod(kind).render(item)，其他 kind 由 _mod 抛 ValueError。
 def render_of(item: dict, kind: str) -> str:
     return _mod(kind).render(item)
 
 
+# 生效条件：node 的 frontmatter 中 REF_KEYS 命中且值为非空 dict 时返回 {'ref': ref, 'ref_kind': kind}，否则返回 {'ref': None, 'ref_kind': ''}。
 def ref_fields(node) -> dict:
     """节点 → 检索结果要带的两字段（读侧只加字段，不改召回逻辑）。"""
     kind, ref = ref_of(node)
     return {"ref": ref, "ref_kind": kind} if ref else {"ref": None, "ref_kind": ""}
 
 
+# 生效条件：node 的 frontmatter 按 REF_KEYS 顺序取到第一个非空 dict 时返回 (k, r)，否则返回 ('', None)。
 def ref_of(node) -> tuple:
     """从节点 frontmatter 取 ref：返回 (kind, ref) 或 ('', None)。"""
     fm = (node or {}).get("frontmatter") or {}
@@ -129,14 +139,17 @@ def ref_of(node) -> tuple:
 # 索引水位（_refindex.json）：增量 + 截断留痕
 # --------------------------------------------------------------------------
 
+# 生效条件：以 root 为必填实参构造，实例化即置 self.root=root、self.path=os.path.join(root, LEDGER_FILE)、self._d=None；
 class Ledger:
     """`<root>/_refindex.json`：每个源文件的 (size, mtime) 水位 + 节点区间。"""
 
+# 生效条件：当传入 root 时，self.root 取该 root，self.path 为 os.path.join(root, LEDGER_FILE)，self._d 置为 None；
     def __init__(self, root: str):
         self.root = root
         self.path = os.path.join(root, LEDGER_FILE)
         self._d = None
 
+# 生效条件：当 self._d is not None 时直接返回 self._d；否则读取 self.path 的 JSON，仅当 obj 是 dict 且 obj.get("schema") == SCHEMA 且 obj.get("files") 是 dict 时用 obj，否则（含 OSError/ValueError、结构不符）回落为 {"schema": SCHEMA, "updated_at": 0.0, "files": {}} 并缓存返回；
     def load(self) -> dict:
         if self._d is not None:
             return self._d
@@ -152,6 +165,7 @@ class Ledger:
         self._d = d or {"schema": SCHEMA, "updated_at": 0.0, "files": {}}
         return self._d
 
+# 生效条件：传入 rel、fp 时，若 self.load()["files"].get(_src_key(fp)) 缺失或为假值、或 os.stat(fp) 抛 OSError、或条目 e.get("size") != st.st_size，则返回 False；否则返回 abs(float(e.get("mtime") or 0.0) - st.st_mtime) < 1e-6（mtime 缺失或假值时按 0.0）；
     def is_fresh(self, rel: str, fp: str) -> bool:
         """源文件自上次索引后未变（size + mtime 双等）→ 可跳过不重切。"""
         e = self.load()["files"].get(_src_key(fp))
@@ -165,6 +179,7 @@ class Ledger:
             return False
         return abs(float(e.get("mtime") or 0.0) - st.st_mtime) < 1e-6
 
+# 生效条件：当 rel、fp、kind、nodes 传入且 os.stat(fp) 成功时，向 self.load()["files"][_src_key(fp)] 写条目，其中 root 为 root if root else os.path.dirname(key)、path 为 rel、kind 为 kind、size/mtime 取 st、nodes 为每项 n.get("id")/n.get("lineno")/n.get("end")/n.get("hash")；os.stat(fp) 抛 OSError 时不写入；
     def record(self, rel: str, fp: str, kind: str, nodes,
                root: str = None) -> None:
         """记一个源文件的水位（节点区间用于判 stale）。
@@ -190,9 +205,11 @@ class Ledger:
             ],
         }
 
+# 生效条件：当传入 fp 时，self.load()["files"].pop(_src_key(fp), None)，即删除对应键（不存在也静默）；
     def drop(self, fp: str) -> None:
         self.load()["files"].pop(_src_key(fp), None)
 
+# 生效条件：当传入 root、kind、seen 时，对 self.load()["files"] 中满足 os.path.abspath(e.get("root") or "") == os.path.abspath(root) 且 e.get("kind") == kind 且键 k 不在 seen 的条目删除，返回删除数量；
     def reconcile(self, root: str, kind: str, seen) -> int:
         """一次**完整**索引后对账：本 (root, kind) 下没被扫到的旧条目剪掉。
 
@@ -209,6 +226,7 @@ class Ledger:
             files.pop(k, None)
         return len(dead)
 
+# 生效条件：对 load()["files"] 中「条目 root（为假值时用 os.path.dirname(键) 兜底）不是目录」的条目逐一 pop 并返回删除条数，无匹配时返回 0。
     def prune(self) -> int:
         """剪掉「源大域已不存在」的条目（整个目录被搬走/删除）。
 
@@ -222,6 +240,7 @@ class Ledger:
             files.pop(k, None)
         return len(dead)
 
+# 生效条件：当 kind、root、files、indexed、truncated 传入时，self.load()["last_index"] 被设为含 ts=_now()、kind、root、files、indexed、truncated=bool(truncated)、truncated_reason=reason or "" 的字典；reason 为假值（默认 ""/None）时 truncated_reason 回落 ""；
     def note_index(self, *, kind: str, root: str, files: int, indexed: int,
                    truncated: bool, reason: str = "") -> None:
         """记「最近一次索引」结果——截断在这里留痕，供 diagnose 看见。"""
@@ -231,12 +250,14 @@ class Ledger:
             "truncated_reason": reason or "",
         }
 
+# 生效条件：无参数调用即生效，取 self.load() 结果把 updated_at 置为 _now()，再以 atomic_write 把 json.dumps(..., ensure_ascii=False, indent=1, sort_keys=True) 写入 self.path，无返回值。
     def save(self) -> None:
         d = self.load()
         d["updated_at"] = _now()
         atomic_write(self.path, json.dumps(d, ensure_ascii=False,
                                            indent=1, sort_keys=True))
 
+# 生效条件：无参数调用即生效，返回含 path、schema、load()["files"] 条目数、nodes 总数（各条目 nodes 列表长度之和）、updated_at、exists=os.path.isfile(self.path) 的 out；age_s 在 updated_at 为假值（0.0）时为 None，否则为 max(0.0, time.time()-up)；仅当 load() 的 last_index 为 dict 时才并入 out["last_index"]。
     def summary(self) -> dict:
         d = self.load()
         files = d.get("files") or {}
@@ -260,6 +281,7 @@ class Ledger:
 # 统一 index_dir：调度 + 水位 + 落盘（供 op=index_code / op=index_doc / heal 共用）
 # --------------------------------------------------------------------------
 
+# 生效条件：root 为源大域根、kind 为 'code_ref'/'doc_ref' 时经 _mod(kind) 调度底层 index_dir 并返回 (items, errors, stats)；ledger 非空时逐文件 record，incremental 为真时跳过 ledger.is_fresh 为真的文件，且 stats 未截断时执行 reconcile。
 def index_dir(root: str, *, kind: str, patterns=None, max_files: int = 500,
               max_items: int = 2000, incremental: bool = False,
               ledger: "Ledger" = None, skip_dirs=None):
@@ -279,12 +301,14 @@ def index_dir(root: str, *, kind: str, patterns=None, max_files: int = 500,
     seen = set()                       # 本次真正走过的源文件（用于对账）
     if ledger is not None:
         if incremental:
+# 生效条件：当 rel、fp 传入时，ok = ledger.is_fresh(rel, fp)；若 ok 为真则将 _src_key(fp) 加入 seen 并返回 ok，若 ok 为假则直接返回 False；
             def fresh(rel, fp):                         # noqa: E306
                 ok = ledger.is_fresh(rel, fp)
                 if ok:
                     seen.add(_src_key(fp))
                 return ok
 
+# 生效条件：当 rel、fp、got 传入时，将 _src_key(fp) 加入 seen，并以 root=root 调用 ledger.record(rel, fp, kind, [{"id": node_id_of(it, kind), "lineno": it.get("lineno"), "end": it.get("end"), "hash": it.get("hash")} for it in got])；
         def on_file(rel, fp, got):                      # noqa: E306
             seen.add(_src_key(fp))
             ledger.record(rel, fp, kind,
@@ -308,6 +332,7 @@ def index_dir(root: str, *, kind: str, patterns=None, max_files: int = 500,
     return items, errors, stats
 
 
+# 生效条件：it['path'] 非空时返回其首段 path.split('/')[0] 作为 domain 键，path 为空返回 'orphan'。
 def _domain_of(it: dict) -> str:
     """条目 → 路由域键（供 `tags` 的 `domain:` 显式声明）。
 
@@ -323,6 +348,7 @@ def _domain_of(it: dict) -> str:
     return path.split("/")[0] or "orphan"
 
 
+# 生效条件：kind == 'code_ref' 时按 codeindex.node_id/render 写入 cg（tags 含 'code'、code_ref=_code_ref(it, root)），kind == 'doc_ref' 时按 docindex 写入（tags 含 'doc'、doc_ref=_doc_ref(it, root)、密级取自 docindex.sensitivity_for(it['path'], sensitivity)），其他 kind 抛 ValueError，返回 (ids, sens)。
 def add_items(cg, items, *, kind: str, root: str, layer=None, sensitivity=None,
               layer_of=None):
     """把索引条目写进认知图（code / doc 的落盘细节收在这里，唯一实现）。
@@ -370,15 +396,21 @@ def add_items(cg, items, *, kind: str, root: str, layer=None, sensitivity=None,
     return ids, sens
 
 
-def _code_ref(it: dict, root: str) -> dict:
+# 生效条件：把入参 root 原样写入返回 dict 的 'root'，path/name/kind/lineno/end/lang/hash 按 it.get 取值（缺省 None），precise 取 bool(it.get('precise', True))，render_version 取传入值（传入 None 时延迟 import codeindex 取 codeindex.RENDER_VERSION，保证与 render 契约**同源**、无第二处硬编码）。
+def _code_ref(it: dict, root: str, render_version=None) -> dict:
+    if render_version is None:            # 直接调用点的兜底：与 render 产物同源
+        from . import codeindex
+        render_version = codeindex.RENDER_VERSION
     return {
         "path": it.get("path"), "name": it.get("name"),
         "kind": it.get("kind"), "lineno": it.get("lineno"), "end": it.get("end"),
         "lang": it.get("lang"), "precise": bool(it.get("precise", True)),
         "hash": it.get("hash"), "root": root,
+        "render_version": render_version,
     }
 
 
+# 生效条件：把入参 root 原样写入返回 dict 的 'root'，path/heading/heading_path/level/lineno/end/anchor/hash/lang 按 it.get 取值（缺省 None），precise 取 bool(it.get('precise', True))。
 def _doc_ref(it: dict, root: str) -> dict:
     return {
         "path": it.get("path"), "heading": it.get("heading"),
@@ -393,6 +425,7 @@ def _doc_ref(it: dict, root: str) -> dict:
 # 回读（唯一实现：op=ref 与 check_refs 共用）
 # --------------------------------------------------------------------------
 
+# 生效条件：传入 ref 为假值（如 None/{}）时按 {} 处理，rel 取 ref.get("path") or ""；root 与 ref.get("root") 均为假值时返回含 ref/path/status:"unresolved"/ok:False/error:"ref 未记录 root..." 的 out；否则用 root or ref.get("root") 与 rel 拼 fp，os.path.isfile(fp) 为假时返回 status:"dangling"、stale:True，读取抛 OSError/UnicodeDecodeError 时返回 status:"error"；读取成功时 lineno 取 int(ref.get("lineno") or 1)（假值回落 1）、end 取 int(ref.get("end") or lineno)（假值回落 lineno），ref.get("hash") 为 None 时 match=None、ok=True、status:"ok"，ref.get("hash") 为真值且等于 region_hash 时 ok=True/status:"ok"、不等时 ok=False/status:"stale"，ref.get("hash") 为假值但非 None（如 ""/0/False）时 ok=False/status:"stale"；with_text 为真时 out["text"] 取 lines[max(0,lineno-1):max(max(0,lineno-1),end)] 的 join；
 def probe_ref(ref: dict, *, root: str = None, with_text: bool = False) -> dict:
     """只读探测单个 ref 的状态（不回读整篇，除非 with_text）。"""
     from . import codeindex
@@ -433,6 +466,7 @@ def probe_ref(ref: dict, *, root: str = None, with_text: bool = False) -> dict:
     return out
 
 
+# 生效条件：ref 经 probe_ref(root=root, with_text=True) 后 status 为 'ok'/'stale' 时返回 ok=True 及 text/total_lines/hash/hash_match/stale/precise，status 为 'unresolved'/'error'/'dangling' 时返回 ok=False 与 error。
 def read_ref(ref: dict, *, root: str = None, ref_kind: str = "ref") -> dict:
     """按 ref 回读源区间——`op=ref` 与 `check_refs` 的唯一实现。"""
     p = probe_ref(ref, root=root, with_text=True)
@@ -452,6 +486,7 @@ def read_ref(ref: dict, *, root: str = None, ref_kind: str = "ref") -> dict:
     }
 
 
+# 生效条件：cg 的 index['nodes'] 非空时汇总 stale/dangling/unresolved/errors 并返回 ok =（无 stale 且无 dangling）；only_tagged 为真时只探测 tags 含 'code'/'doc' 的节点，ledger 非空时先走 (size, mtime) 快路径。
 def check_refs(cg, *, ledger: "Ledger" = None, max_nodes: int = MAX_CHECK,
                only_tagged: bool = True) -> dict:
     """漂移 / 悬空巡检（只读、不抛）。
@@ -468,6 +503,7 @@ def check_refs(cg, *, ledger: "Ledger" = None, max_nodes: int = MAX_CHECK,
     stale, dangling, unresolved, errors = [], [], [], []
     covered = set()
 
+# 生效条件：当 nid、ref、kind、rel 传入时，p = probe_ref(ref) 后按 p["status"] 分派：为 "dangling" 时把含 node_id/ref_kind/path/lineno/end/error 的 row 加入 dangling，为 "stale" 时补 hash_expected/hash 加入 stale，为 "unresolved" 时加入 unresolved，为 "error" 时加入 errors；其他状态不加入；
     def _probe_one(nid, ref, kind, rel):
         p = probe_ref(ref)
         row = {"node_id": nid, "ref_kind": kind, "path": rel,
@@ -509,6 +545,7 @@ def check_refs(cg, *, ledger: "Ledger" = None, max_nodes: int = MAX_CHECK,
                                kind, rel)
 
     # 回退：ledger 未覆盖的索引节点
+# 生效条件：当 nid 传入时，若 only_tagged 为假值立即返回 True；否则取 (nodes.get(nid) or {}).get("tags") or []，仅当其中存在 "code" 或 "doc" 返回 True，否则返回 False；
     def _candidate(nid):
         if not only_tagged:
             return True
@@ -556,11 +593,13 @@ def check_refs(cg, *, ledger: "Ledger" = None, max_nodes: int = MAX_CHECK,
 # `op=ref action=prune`（悬空）使用，避免两处各写一套口径。
 # --------------------------------------------------------------------------
 
+# 生效条件：返回 os.path.normcase(os.path.abspath(str(p or '')))，即 p 为 None/空串时返回当前目录的归一绝对路径。
 def _norm_root(p) -> str:
     """root 归一：同一目录的大小写/分隔符差异不得影响「同一大域」判定。"""
     return os.path.normcase(os.path.abspath(str(p or "")))
 
 
+# 生效条件：a 与 b 都非空且 _norm_root(a) == _norm_root(b) 时返回 True，否则（含 TypeError/ValueError）返回 False。
 def _same_root(a, b) -> bool:
     try:
         return bool(a) and bool(b) and _norm_root(a) == _norm_root(b)
@@ -568,10 +607,12 @@ def _same_root(a, b) -> bool:
         return False
 
 
+# 生效条件：返回 str(p or '').replace('\\', '/').lstrip('./')，即 p 为 None/空串时返回 ''。
 def _norm_rel(p) -> str:
     return str(p or "").replace("\\", "/").lstrip("./")
 
 
+# 生效条件：cg 具备可调用的 forget 方法时对 plan 中每个 nid 调 cg.forget(nid, why)，返回 (成功 id 列表, 被拦下/失败的 {node_id, error} 列表)；cg 无 forget 时返回 ([], plan 中每 nid 一条错误)。
 def _forget_many(cg, plan, why: str) -> tuple:
     """逐条软删（进 trash/、写删除清单、可 restore）；受保护节点拦下不删。
 
@@ -598,6 +639,7 @@ def _forget_many(cg, plan, why: str) -> tuple:
     return done, blocked
 
 
+# 生效条件：cg 具备可调用的 _unstage 时对 ghosts 逐个调用并收集成功 id（单条异常跳过），cg 无该能力时返回 []（不假装成功）。
 def _drop_ghosts(cg, ghosts) -> list:
     """摘除幽灵条目的索引记录（节点文件已不存在，没有可软删的实体）。
 
@@ -617,6 +659,7 @@ def _drop_ghosts(cg, ghosts) -> list:
     return out
 
 
+# 生效条件：items 中同 kind 的节点若其 ref['path'] 命中本次 items 的文件、id 不在本次产出内且 ref['root'] 与入参 root 同一（_same_root），则列入清退计划；dry_run 为真只返回计划，否则经 _forget_many 软删；items 为空时返回 count 0。
 def prune_orphans(cg, *, kind: str, root: str, items, dry_run: bool = False,
                   reason: str = "") -> dict:
     """清退「同 root + 同 path，但已不在本次产出里」的**过期代**节点。
@@ -675,6 +718,7 @@ def prune_orphans(cg, *, kind: str, root: str, items, dry_run: bool = False,
             "skipped_protected": blocked[:20], "reason": why}
 
 
+# 生效条件：cg 中带 'code'/'doc' 标签且 ref 带 root 的节点经 probe_ref 判为 'dangling' 时列入清退计划；only_roots 为空时另收集 cg.root 下取不到对应节点 .md 的幽灵条目经 _drop_ghosts 摘除；dry_run 为真只返回计划。
 def prune_dangling(cg, *, only_roots=None, dry_run: bool = False,
                    max_nodes: int = MAX_CHECK, reason: str = "") -> dict:
     """清退**悬空**节点：ref 指向的源文件已删除，回读必然失败。
@@ -745,6 +789,7 @@ def prune_dangling(cg, *, only_roots=None, dry_run: bool = False,
             "skipped_protected": blocked[:20], "reason": why}
 
 
+# 生效条件：cg 节点按 ref['root'] 与 kind 分组后逐组以 index_dir(incremental=False, ledger=ledger) 重切、再以 add_items(layer_of=原 layer) 重建，返回 {'ok','roots','groups','indexed','errors','truncated'}；only_roots 非 None 时只处理其中列出的 root。
 def rebuild(cg, *, ledger: "Ledger" = None, only_roots=None, max_files: int = 500,
             max_items: int = 2000) -> dict:
     """按 ref 记录的 root 重建索引（sustain.heal 的修复动作）。

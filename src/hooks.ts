@@ -21,6 +21,9 @@
  * 模型请求组装 system prompt 时自动注入灵枢最近记忆
  * （`stg(op=timeline)`，最近记忆节点时间线），让记忆"自动可用"而不只依赖
  * Agent 主动调用 recall/think 工具。失败静默（不影响请求）。
+ * ⚠️ 该注入块的**稳定性**决定宿主是否新追加快照：内容没变时也必须照旧 push
+ * （宿主按渲染后的整段文本去重）；跳过 push 反而会各追加一份「有块/无块」的快照
+ * —— 详见 installMemoryHooks 里的长注释。
  *
  * ⚠️ 注入文本**必经** escapePromptBraces（src/lib/prompt_safety.ts，issue #16）：
  * 宿主对 context 文本做严格 `{{variable}}` 插值，裸 `{{` 会让每轮 assemble 抛错
@@ -126,8 +129,6 @@ const RECALL_MIN_CHARS = 24
 const RECALL_MAX_CHARS = 1400
 /** 永久层不自动注入（按需用 mdcg_recall / lingshu_stg 取）。 */
 const RECALL_SKIP_LAYERS = new Set(['anchor', 'self'])
-/** 连续跳过多少步后强制补一次（内容未变也刷新，防止压缩归档后块消失）。 */
-const RECALL_REPUSH_EVERY = 8
 
 /** 分级递减渲染：按距当前的次序逐档收窄，早期条目信息量更大。
  *
@@ -159,15 +160,18 @@ function formatTimelineDecayed(payload: unknown): string {
   return out.join('\n').slice(0, RECALL_MAX_CHARS)
 }
 
-/** 去重：内容与上次相同就不再 push 新副本。
+/** 取宿主会话标识（只用于**归因/隔离**，不参与任何权限判断）。
  *
- *  背景：本钩子挂在 `system-prompt/assemble` 上，每个 step 都会 push 一份，而每份
- *  都会留成独立的 surface 节点 → 同一块累积 N 份（实测 11 份 ≈2700 tok/请求），
- *  随步数线性增长。去重后同一块只占 1 份，外加每 RECALL_REPUSH_EVERY 步一次自愈刷新。 */
-function shouldPushRecall(text: string, lastText: string, skippedSincePush: number): boolean {
-  if (!text) return false
-  if (text !== lastText) return true
-  return skippedSincePush >= RECALL_REPUSH_EVERY
+ *  动机：记忆写入必须带会话身份才能区分不同会话；读取默认只看本会话（防串台），
+ *  而「所有会话做了什么」用显式 session="*" 取。两侧都依赖这个标识。
+ *
+ *  字段名按 DSH 既有形态（`id` / `sessionId`）防御式读取，取不到就返回空串——
+ *  空串在上游一律等同「不分会话」（退回旧行为），故宿主改字段名最坏只是失去
+ *  隔离能力，不会注入错块、不会抛错。 */
+function sessionIdOf(raw: unknown): string {
+  const s = raw as { id?: unknown; sessionId?: unknown } | null | undefined
+  const v = s?.id ?? s?.sessionId
+  return typeof v === 'string' ? v.trim() : ''
 }
 
 /** 安装自动记忆钩子（effect 作用域内，随插件卸载自动移除）。
@@ -180,6 +184,9 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     return
   }
   const graph = mdcg
+
+  /** 最近一次观测到的宿主会话标识（见 sessionIdOf；空串 = 未知/无会话）。 */
+  let lastSession = ''
 
   /** 记忆沉淀（fire-and-forget）。认知图未就绪则跳过并告警（不退回 AEIS）。 */
   const memorize = (label: string, run: (g: MdcgClient) => Promise<unknown>): void => {
@@ -200,6 +207,19 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
 
   // P1 完善（自动 recall 注入）：每次模型请求组装 system prompt 时，注入灵枢最近记忆。
   // 用 system-prompt/assemble 事件（waterfall）而非 llm/stream——后者请求 deep-frozen 不可改写。
+  //
+  // ⚠️ 必须**每步都 push**，哪怕内容与上一步逐字节相同。原因在宿主侧（dsh-agent-loop 的
+  // RuntimeContextProjection）：assembly.contexts 会被渲染成一段「运行时上下文快照」，
+  // 每个 step 拿渲染后的**整段文本**与上一份已提交的快照比对，**只有不同才**在会话里
+  // append 一条新的 user/message（append 语义，旧的不会被替换或移除）。于是：
+  //   · 内容不变 + 照旧 push → 渲染文本不变 → 宿主不追加任何东西（零开销、零增长）；
+  //   · 内容不变 + 跳过 push → 渲染文本**变了**（少了本块）→ 宿主追加一份「没有本块」的
+  //     快照；下一步再 push 又把本块加回来 → **再**追加一份。跳过一次反而多花两份快照
+  //     （实测每份 ~250 tok），这正是 v0.4.8「每 8 步强制补一次」的自愈刷新会把长会话的
+  //     inject 推到 30k+ tok 的原因。
+  // 因此本实现把「要不要补」交还给宿主：压缩归档后宿主会把 retained 置空并重新投影快照
+  // （RuntimeContextProjection 的 retained === null 分支），本块自然跟着回来——
+  // 不需要插件自己数步数做自愈。
   if (opts.autoRecall) {
     const recallLimit = Math.max(1, Math.min(10, opts.autoRecallLimit || 4))
     // 去重状态：同一块内容只保留一份 surface 节点，避免随步数线性增长。
@@ -211,10 +231,19 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       try {
         // 异步取最近记忆节点（失败静默——不阻塞模型请求）
         if (graph.isReady()) {
-          const text = formatTimelineDecayed(await graph.timeline(recallLimit))
-          if (shouldPushRecall(text, lastRecallText, skippedSincePush)) {
-            lastRecallText = text
-            skippedSincePush = 0
+          // 会话隔离（P45）：自动召回只注入**本会话**的记忆，防多会话串台；
+          // 取不到会话标识则退回旧行为（不加过滤），不做半吊子猜测。
+          // ⚠️ 取值必须**每步稳定**：本块按 v0.4.8 契约每步都 push，内容一旦与上
+          // 一步不同宿主就 append 一份新快照——会话标识若中途才出现，会让「无过滤
+          // → 有过滤」翻转一次，白付两份快照。故优先取 ctx 上的会话（首步即在），
+          // 退回「最近一次 session/event 的会话」。
+          // 想读**所有**会话做了什么：别走自动召回（它会串台），显式调
+          // `stg(op=timeline, session="*")`，返回项带 session 归属。
+          const hostCtx = (_ctx as unknown) as { agent?: { session?: unknown } } | undefined
+          const sid = sessionIdOf(hostCtx?.agent?.session) || lastSession
+          const text = formatTimelineDecayed(
+            await graph.timeline(recallLimit, sid ? { session: sid } : {}))
+          if (text) {
             // 注入边界转义（issue #16）：宿主 system-prompt 对 context 文本做严格
             // `{{variable}}` 插值，裸 `{{` 会 throw → 该轮请求整体失败。记忆原文
             // （含用户命令里的 `{{.X}}`）必须保真落库，故只在注入副本上打断 `{{`。
@@ -222,8 +251,6 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
               name: 'lingshu:auto-recall',
               text: escapePromptBraces(`【灵枢最近记忆】\n${text.slice(0, RECALL_MAX_CHARS)}`),
             })
-          } else {
-            skippedSincePush += 1
           }
           // 2) knowledge 层：基于当前对话上下文召回高相关度教训
           if (lastUserMsg) {
@@ -261,7 +288,12 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     })
   }
 
-  ctx.on('session/event', (_session, event: SessionEvent) => {
+  ctx.on('session/event', (session, event: SessionEvent) => {
+    // 会话归属（P45）：记忆写入必须带会话身份，用来区分不同会话的记忆。
+    // 空串 = 宿主未给出会话标识 → 不声明，交给内核回落到进程身份（不编造）。
+    const sid = sessionIdOf(session)
+    if (sid) lastSession = sid
+    const sessionTag = sid ? { session: sid } : {}
     if (event.type === 'user/message' && opts.userMessage) {
       // 只记真实用户输入（kind='user'），跳过插件注入/系统上下文
       if (event.data.source?.kind !== 'user') {
@@ -277,6 +309,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       lastUserMsg = safe.slice(0, 300) // 缓存最近用户消息供 knowledge 召回使用
       memorize('user', (g) => g.remember(safe, {
         role: 'user', tags: ['dsh', 'user'], importance: opts.importance,
+        ...sessionTag,
       }))
       // T4：用用户消息做一次语义召回——md_cg 的读取会记 access log（复用观测，
       // 供 importance / scrub 陈旧度使用），同时预热检索路径。
@@ -289,6 +322,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       if (safe === null) return
       memorize('assistant', (g) => g.remember(safe, {
         role: 'assistant', tags: ['dsh', 'assistant'], importance: opts.importance * 0.8,
+        ...sessionTag,
       }))
     } else if (event.type === 'tool/result' && opts.toolResult) {
       if (event.data.error) return
@@ -298,6 +332,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       if (safe === null) return
       memorize('tool', (g) => g.remember(safe, {
         role: 'tool-output', tags: ['dsh', 'tool'], importance: opts.importance * 0.6,
+        ...sessionTag,
       }))
     }
   })

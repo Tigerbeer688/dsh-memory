@@ -63,6 +63,7 @@ DEFAULT_KNOWLEDGE_PROBES = [
 # 启动命令
 # --------------------------------------------------------------------------
 
+# 生效条件：无必需形参；exe 取 MDCG_WHITEBOX_CMD，该值为假时取 sys.executable、再为假时取 "python"，args 取 MDCG_WHITEBOX_ARGS.split()（该值为真时）否则 ["-m","aeis.mcp.server"]，返回 [exe]+args。
 def _launch_cmd():
     """外部白箱 MCP server 启动命令（legacy 路径，需显式配置）。
 
@@ -79,6 +80,7 @@ def _launch_cmd():
 # 白箱 MCP stdio 客户端（零第三方依赖）
 # --------------------------------------------------------------------------
 
+# 生效条件：类无自定义 __init__（无必需构造形参）；实例化后仅当子类覆写 call 时 ask/remember 才走通，否则 call 抛 NotImplementedError。
 class _WhiteboxApi:
     """白箱业务接口（`ask` / `remember`）。
 
@@ -87,10 +89,12 @@ class _WhiteboxApi:
       · `_SubprocessWhiteboxClient` —— MCP stdio 子进程（legacy，显式配置时）
     """
 
+# 生效条件：以 required 形参 name 与 args 调用该抽象方法时无条件抛出 NotImplementedError，不产生任何返回。
     def call(self, name, args):
         """调用白箱工具，返回 {isError, text, data}。"""
         raise NotImplementedError
 
+# 生效条件：给定 required 形参 message（session_id 省略时取默认 "md_cg-whitebox-verify"）即转调 self.call("wisdom_chat", {...})，按返回 r 组装 {ok: not r["isError"], route: _extract_route(data), reply: _extract_reply(data, r.get("text")), raw}，其中 data 由 r.get("data") or {} 得到（data 缺失或为假值时为 {}），故 raw 恒取该 data、不回落到 r.get("text")。
     def ask(self, message, session_id="md_cg-whitebox-verify"):
         """白箱问答（wisdom_chat）。返回归一化的 {ok, route, reply, raw}。"""
         r = self.call("wisdom_chat", {"message": message, "session_id": session_id})
@@ -100,6 +104,7 @@ class _WhiteboxApi:
                 "reply": _extract_reply(data, r.get("text")),
                 "raw": data if data is not None else r.get("text")}
 
+# 生效条件：给定 required 形参 content（importance 省略时取 0.9 并 float() 转换；tags 为 None/[]/"" 等假值时按 tags or ["md_cg","whitebox-probe"] 回落为 list(["md_cg","whitebox-probe"])）即转调 self.call("remember", {...})，返回 {ok: not r["isError"], raw: r.get("data") or r.get("text")}。
     def remember(self, content, importance=0.9, tags=None):
         """白箱编码（remember）：把一条知识交给白箱写入其记忆库。"""
         r = self.call("remember", {"content": content,
@@ -108,6 +113,7 @@ class _WhiteboxApi:
         return {"ok": not r["isError"], "raw": r.get("data") or r.get("text")}
 
 
+# 生效条件：以假值 cmd（None/空序列）构造时 self.cmd 取 _launch_cmd()，真值 cmd 时取 list(cmd)；timeout 与 MDCG_WHITEBOX_TIMEOUT 环境变量都取假值时 self.timeout 为 float(60.0)，否则取其中首个真值；env 为真值时按 str(v) 合并进 os.environ 副本，假值时 self.env 仅为 os.environ 副本。
 class _SubprocessWhiteboxClient(_WhiteboxApi):
     """外部白箱 MCP stdio 客户端（legacy 路径，需显式配置才启用）。
 
@@ -115,6 +121,7 @@ class _SubprocessWhiteboxClient(_WhiteboxApi):
     进程懒启动、调用串行化、超时即杀（下次调用自动重启）。
     """
 
+# 生效条件：cmd 为真值时 self.cmd=list(cmd)，否则回落 _launch_cmd()；timeout 为真值则直接用，否则回落 os.environ.get("MDCG_WHITEBOX_TIMEOUT")，再否则 60.0；env 为真值时其键值经 str() 合并进 os.environ 副本。
     def __init__(self, cmd=None, env=None, timeout=None):
         self.cmd = list(cmd) if cmd else _launch_cmd()
         self.timeout = float(timeout or os.environ.get("MDCG_WHITEBOX_TIMEOUT") or 60.0)
@@ -127,6 +134,7 @@ class _SubprocessWhiteboxClient(_WhiteboxApi):
         self._lock = threading.Lock()
 
     # -- 生命周期 ---------------------------------------------------------
+# 生效条件：当 self.proc 非 None 且 self.proc.poll() 为 None 时直接返回 self；否则启动 self.cmd 子进程并以模块级常量 PROTOCOL_VERSION 与 CLIENT_NAME 发 initialize 请求和 notifications/initialized 通知后返回 self。
     def start(self):
         if self.proc is not None and self.proc.poll() is None:
             return self
@@ -143,6 +151,7 @@ class _SubprocessWhiteboxClient(_WhiteboxApi):
         self._notify("notifications/initialized", {})
         return self
 
+# 生效条件：幂等、可重复调用；self.proc 为 None 时直接返回；否则先关 stdin 再 terminate 并 wait(timeout=3)，超时或异常则 kill 兜底；无返回值、不抛异常；
     def close(self):
         proc, self.proc = self.proc, None
         if proc is None:
@@ -162,6 +171,7 @@ class _SubprocessWhiteboxClient(_WhiteboxApi):
                 pass
 
     # -- 内部 IO ----------------------------------------------------------
+# 生效条件：self.proc 为 None 或 proc.stdout 为 None 时直接返回；否则逐行 strip 后跳过空行，非空行 json.loads 成功则放入 self._q，抛 ValueError 则跳过该行。
     def _reader(self):
         stream = self.proc.stdout if self.proc else None
         if stream is None:
@@ -175,15 +185,18 @@ class _SubprocessWhiteboxClient(_WhiteboxApi):
             except ValueError:
                 continue
 
+# 生效条件：给定 required 形参 payload 时，若 self.proc is None 或 self.proc.poll() is not None 则抛 RuntimeError("白箱进程未运行（启动失败或已退出）")，否则把 json.dumps(payload, ensure_ascii=False) + "\n" 写入 self.proc.stdin 并 flush，无返回。
     def _write(self, payload):
         if self.proc is None or self.proc.poll() is not None:
             raise RuntimeError("白箱进程未运行（启动失败或已退出）")
         self.proc.stdin.write(json.dumps(payload, ensure_ascii=False) + "\n")
         self.proc.stdin.flush()
 
+# 生效条件：给定 required 形参 method 与 params 时，以 {"jsonrpc": "2.0", "method": method, "params": params}（无 id）调用 self._write，自身无返回。
     def _notify(self, method, params):
         self._write({"jsonrpc": "2.0", "method": method, "params": params})
 
+# 生效条件：给定 required 形参 method 与 params 时在 self._lock 内取自增 id 并写入请求，随后循环取 self._q：remain <= 0 或 queue.Empty 时先 self.close() 再抛 TimeoutError，msg.get("id") 不等于 rid 时 continue，msg.get("error") 为真时抛 RuntimeError，id 匹配且无 error 时返回 msg.get("result")（缺 "result" 键返回 None）。
     def _request(self, method, params):
         with self._lock:
             rid = self._next_id
@@ -208,6 +221,7 @@ class _SubprocessWhiteboxClient(_WhiteboxApi):
                 return msg.get("result")
 
     # -- 业务接口 ---------------------------------------------------------
+# 生效条件：给定 required 形参 name 与 args（args 为假值时按 {"name": name, "arguments": args or {}} 发空字典）即以 "tools/call" 发请求，把结果 content 中 type=="text" 的块文本拼接后 json.loads，失败（ValueError/TypeError）则 data=None，返回 {"isError": bool((result or {}).get("isError")), "text": text, "data": data}。
     def call(self, name, args):
         """调用白箱 MCP 工具，返回 {isError, text, data}。"""
         result = self._request("tools/call", {"name": name, "arguments": args or {}})
@@ -234,32 +248,38 @@ class LocalWhiteboxClient(_WhiteboxApi):
     故 `ask / remember / ping / verify_*` 及其留痕逻辑无需任何改动。
     """
 
+# 生效条件：db_path 为 None 时由引擎按默认路径取库；_ignored 吞掉子进程版遗留形参以保持接口同形；构造只记录路径、不加载引擎（延迟到 self.engine 首次访问）；
     def __init__(self, db_path=None, **_ignored):
         self.db_path = db_path
         self._engine = None
 
     @property
+# 生效条件：self._engine 为 None 时调用 _load_get_engine()(db_path=self.db_path) 创建并缓存后返回它，非 None 时直接返回缓存实例。
     def engine(self):
         if self._engine is None:
             self._engine = _load_get_engine()(db_path=self.db_path)
         return self._engine
 
     # -- 生命周期（与子进程版语义对齐：start 即确保可用，失败即抛） --------
+# 生效条件：先取 self.engine（首次访问才真正加载知识库）并调 service_info() 以确认可服务，不可用即抛；成功后返回 self，可重复调用；
     def start(self):
         _ = self.engine.service_info()
         return self
 
+# 生效条件：幂等；self._engine 为 None 时直接返回，否则关闭引擎并置 None（只释放句柄，不删除落盘数据）；
     def close(self):
         if self._engine is not None:
             self._engine.close()
             self._engine = None
 
     # -- 业务接口 ---------------------------------------------------------
+# 生效条件：给定 required 形参 name 与 args 时直接转调 self.engine.call_tool(name, args) 并返回其结果，不做任何形参改写或校验。
     def call(self, name, args):
         """调用白箱工具，返回 {isError, text, data}（形状对齐 MCP）。"""
         return self.engine.call_tool(name, args)
 
 
+# 生效条件：无必需形参；包内 from .whitebox_kb.engine import get_engine 成功时返回它，ImportError 时改为 from whitebox_kb.engine import get_engine 并返回。
 def _load_get_engine():
     """兼容两种导入方式（包内 / 平铺）。"""
     try:
@@ -269,6 +289,7 @@ def _load_get_engine():
     return get_engine
 
 
+# 生效条件：cmd 或 env 为真，或 MDCG_WHITEBOX_CMD / MDCG_WHITEBOX_ARGS 为真时返回 _SubprocessWhiteboxClient(cmd=cmd, env=env, timeout=timeout)，否则返回 LocalWhiteboxClient(db_path=db_path)。
 def WhiteboxClient(cmd=None, env=None, timeout=None, db_path=None):
     """白箱客户端工厂。
 
@@ -286,6 +307,7 @@ def WhiteboxClient(cmd=None, env=None, timeout=None, db_path=None):
 # 结果归一化
 # --------------------------------------------------------------------------
 
+# 生效条件：data 为 dict 时按 route、mode、path 顺序取首个非空 str 值返回，否则（含 data 非 dict、三键均无或均为空/非 str）返回 ""。
 def _extract_route(data):
     if isinstance(data, dict):
         for key in ("route", "mode", "path"):
@@ -295,6 +317,7 @@ def _extract_route(data):
     return ""
 
 
+# 生效条件：data 为 dict 时先按 reply/answer/text/response/content/message 取首个 strip 后非空的 str 返回，再对 result、data 两键的 dict 值递归取非空结果，均无则返回 fallback or ""。
 def _extract_reply(data, fallback=""):
     if isinstance(data, dict):
         for key in ("reply", "answer", "text", "response", "content", "message"):
@@ -314,6 +337,7 @@ def _extract_reply(data, fallback=""):
 # 验证：编码能力 / 已有知识回答能力
 # --------------------------------------------------------------------------
 
+# 生效条件：client 为 None 时自建 WhiteboxClient() 并在 finally 关闭；marker、fact、question 为假值时分别用带毫秒时间戳的默认口令、默认事实、默认追问，cg 仅传给 _record（cg 为 None 则 node_id 为 None，不自建 client），异常时返回 ok=False 并同样 _record。
 def verify_encoding(cg=None, client=None, marker=None, fact=None,
                     question=None, session_id="md_cg-whitebox-verify"):
     """验证白箱「编码能力」。
@@ -346,6 +370,7 @@ def verify_encoding(cg=None, client=None, marker=None, fact=None,
             cli.close()
 
 
+# 生效条件：client 为 None 时自建 WhiteboxClient() 并在 finally 关闭；questions 为假值（None 或空）时用 DEFAULT_KNOWLEDGE_PROBES，逐问后仅当至少一问 reply 非空且 route 为 self 或 self_fallback 时 ok=True，异常返回 ok=False。
 def verify_existing(cg=None, client=None, questions=None,
                     session_id="md_cg-whitebox-verify"):
     """验证白箱「已有知识回答能力」。
@@ -380,6 +405,7 @@ def verify_existing(cg=None, client=None, questions=None,
             cli.close()
 
 
+# 生效条件：client 为 None 时自建 WhiteboxClient() 并在 finally 关闭；依次对 service_info、mdcg_service_info、info 调用 call，首个 isError 为假即返回 ok=True 与该 tool/info，全部不可用返回 ok=False，start 或整体异常返回 ok=False。
 def ping(client=None, session_id="md_cg-whitebox-ping"):
     """白箱连通性探测：调 service_info（或 info）判断能力库是否在线。"""
     own = client is None
@@ -402,6 +428,7 @@ def ping(client=None, session_id="md_cg-whitebox-ping"):
             cli.close()
 
 
+# 生效条件：client 为 None 时以 WhiteboxClient(timeout=kw.get("timeout")) 自建并在 finally 关闭；随后 cli.start() 并返回 cli.ask(message, session_id=session_id)。
 def ask(message, session_id="md_cg-whitebox-verify", client=None, **kw):
     """显式调用白箱回答一个问题。"""
     own = client is None
@@ -414,6 +441,7 @@ def ask(message, session_id="md_cg-whitebox-verify", client=None, **kw):
             cli.close()
 
 
+# 生效条件：client 为 None 时以 WhiteboxClient(timeout=kw.get("timeout")) 自建并在 finally 关闭；随后 cli.start() 并返回 cli.remember(content, importance=importance, tags=tags)。
 def remember(content, importance=0.9, tags=None, client=None, **kw):
     """显式调用白箱编码一条知识。"""
     own = client is None
@@ -430,6 +458,7 @@ def remember(content, importance=0.9, tags=None, client=None, **kw):
 # 留痕与报告
 # --------------------------------------------------------------------------
 
+# 生效条件：cg 为 None 时返回 None；否则以 whitebox_verify_{kind}_{毫秒时间戳} 为 id 调 cg.add 写入 self 层，成功返回该 nid，cg.add 抛异常时返回 None。
 def _record(cg, kind, ok, payload):
     """把验证结论写入认知图（self 层）。失败不阻断验证本身。"""
     if cg is None:
@@ -446,6 +475,7 @@ def _record(cg, kind, ok, payload):
         return None
 
 
+# 生效条件：cg 为 None 时返回 {'ok': False, 'error': '需要 cg 实例'}；否则以 k=int(limit or 20)（limit 为 0/空串/None 时 k 变 20）调 cg.search("白箱能力验证", layer="self", record=False)，只保留 tags 中任一以 "whitebox:" 开头的项并返回 count 与 items。
 def report(cg=None, limit=20):
     """汇总最近的「白箱能力验证」留痕。"""
     if cg is None:
@@ -467,6 +497,7 @@ def report(cg=None, limit=20):
 # MCP 统一入口（由 mcp_server._whitebox_call 调用）
 # --------------------------------------------------------------------------
 
+# 生效条件：action=(args.action or "ping") 小写后，ask/chat/query 走 ask（question/message/query 均假则传 ""），remember/encode/write 走 remember 且 importance=float(a.get("importance", 0.9))，verify_encoding/encoding 走 verify_encoding，verify_existing/existing/knowledge 走 verify_existing（questions 取 a.questions 或 a.question 单元素列表），report/history 走 report(limit=int(a.get("limit") or 20))，ping/status/info 走 ping()，其余抛 ValueError。
 def dispatch(cg, args):
     """cg(op=whitebox) 的分发：action=ask|remember|verify_encoding|verify_existing|ping|report。"""
     a = args or {}

@@ -13,7 +13,11 @@ LLM 若参与，只能经 `parser=` 注入（能力外置，与 compiler 的 llm
 且其产物**必须**过名实门（E010/E011）：每个写入值都必须是对话记录的**字面子串**，
 幻觉在编译期即被机械检出，不进「看起来合理」的灰区。
 签章字段在候选结构里**没有位置**：`verifier` 只能由 attest 显式给出，
-且 E041 机械拒绝 `verifier == 编译执行者`——结构级阻断，不依赖 prompt 自觉。
+且 E041 机械拒绝 `verifier == 编译执行者`。阻断强度**如实分层**（issue #27
+纠正）：①身份归一比较（大小写/空白/括号注记归一）拦截同源字符串变体；
+②根本保障是 `verifier_token` 凭据通路——验证方身份经 mdcg 令牌 HMAC 验签
+（与 narrowed_principal 同一信任源），不依赖自报诚实度；无令牌时结果标
+`verifier_identity="self-reported"`（诚实降级，可被下游策略识别）。
 
 对齐既有实现（零发明）：
     · 验证能力外置 / 缺能力恒不通过  → md_cg/audit.py（CONTENT_KINDS + register_verifier）
@@ -60,6 +64,9 @@ E_CODES = {
     "E041": "自证拒绝：验证方标识 == 编译执行者（LLM 不得自己验证自己）",
     "E042": "验证未通过：签章判定 REJECT / BLINDSPOT",
     "E043": "修正非法：只允许修正 condition_space 四槽",
+    "E050": ("依赖声明缺失：正文以 `@<节点 id>` 声明了跨节点依赖（「# 子功能：」行），"
+             "但 depends_on 未给出可解析目标——依赖必须是可解析的字段，不能只是散文"),
+    "E051": "依赖目标不存在：depends_on 指向的节点不在库中（悬空依赖）",
 }
 
 # ---- 候选来源标识（写进留痕，可溯源到「谁说的」） ----
@@ -91,13 +98,16 @@ class CompileResult:
     verdict: Optional[Dict] = None                              # 验证单元终裁
 
     @property
+# 生效条件：BLINDSPOT：缺证据（无 required 形参与模块级常量，仅有未给出的 self.errors 来源）。
     def has_errors(self) -> bool:
         return len(self.errors) > 0
 
+# 生效条件：对任意 code，msg 取 E_CODES.get(code, code)（缺键回落 code 本身），向 self.errors 追加 "code 空格 msg"，extra 为真值时再追加 "（extra）"。
     def err(self, code: str, extra: str = "") -> None:
         msg = E_CODES.get(code, code)
         self.errors.append(code + " " + msg + (("（" + extra + "）") if extra else ""))
 
+# 生效条件：无入参，首行按 self.success 输出「编译成功」或「编译失败（len(self.errors) 个错误）」，要素行取 nodefile.CCG_MARKS 与 self.lines 的交集，errors 列前 10 条、warnings 列前 5 条，返回 "\n".join(out)。
     def summary(self) -> str:
         out = ["编译成功" if self.success else
                "编译失败（%d 个错误）" % len(self.errors)]
@@ -121,6 +131,10 @@ class AttestResult:
     evidence: str = ""
     error: str = ""
     token: str = ""                 # 签章令牌（留痕可查）
+    # issue #27：验证方身份来源——"token"（mdcg 令牌 HMAC 验签，不可伪造）
+    # 或 "self-reported"（调用方自报字符串：归一化比较拦截已知同源变体，
+    # 但根本保障需令牌通路）。审计与下游策略据此识别可信级别。
+    verifier_identity: str = "self-reported"
     slot_corrections: Dict[str, Any] = field(default_factory=dict)
     ts: float = 0.0
 
@@ -140,14 +154,17 @@ class LinkResult:
 # 工具（就地实现，避免跨模块 import 环——与 mdcg.py 复制 _ccg_line 的既有做法一致）
 # =============================================================================
 
+# 生效条件：对任意 s（含 None/空串，源码以 `(s or "")` 兜底为空串），返回 hashlib.sha1(该串 utf-8 编码).hexdigest()[:12]。
 def _sha(s: str) -> str:
     return hashlib.sha1((s or "").encode("utf-8")).hexdigest()[:12]
 
 
+# 生效条件：对任意 cg，返回 os.path.join(cg.root, LOG_NAME)（即 cg.root 与模块级常量 LOG_NAME 的拼接）。
 def _log_path(cg) -> str:
     return os.path.join(cg.root, LOG_NAME)
 
 
+# 生效条件：x 为 None 或非 str 时原样返回 x；x 为 str 时返回 MdCGOS(x) 构造出的 cg 实例。
 def _as_cg(x):
     """接受 root 路径或已构造的 cg 实例——保持密级隔离与密钥上下文。"""
     if x is None or not isinstance(x, str):
@@ -156,11 +173,13 @@ def _as_cg(x):
     return MdCGOS(x)
 
 
+# 生效条件：content 为字符串（None 视作空串）时，若其中含 "# " + field_name + "：" 或 "# " + field_name + ":" 则返回 True，否则 False。
 def _has_ccg_line(content: str, field_name: str) -> bool:
     text = content or ""
     return ("# " + field_name + "：") in text or ("# " + field_name + ":") in text
 
 
+# 生效条件：在 `(content or "").split("\n")` 中命中首个 strip 后以 "#" 开头、含 field_name、且去 "#" 后按全角或半角冒号切出的名字等于 field_name 的行→替换为 "# field_name：value" 并返回；否则若有行 strip 后以 "# 功能名" 开头→在该行后插入新行并返回；否则返回 `"# field_name：value\n" + (content or "")`。
 def _upsert_ccg_line(content: str, field_name: str, value: str) -> str:
     """写入/替换 `# <字段>：<值>`，优先插在「# 功能名」之后。
 
@@ -183,6 +202,7 @@ def _upsert_ccg_line(content: str, field_name: str, value: str) -> str:
     return newline + "\n" + (content or "")
 
 
+# 生效条件：对任意 path 与 rec，以追加模式写入 json.dumps(rec, ensure_ascii=False) + "\n"，仅 OSError 被吞掉且无返回值。
 def _append_jsonl(path: str, rec: dict) -> None:
     try:
         with open(path, "a", encoding="utf-8") as f:
@@ -191,6 +211,7 @@ def _append_jsonl(path: str, rec: dict) -> None:
         pass
 
 
+# 生效条件：path 为假值或 os.path.exists(path) 为假→返回 []；否则逐行 strip、跳过空行、json.loads 成功者追加、单行 json.loads 抛 ValueError 者跳过，中途 open/读取抛 OSError 时返回 []；全部读完返回 out。
 def _read_jsonl(path: str) -> List[dict]:
     out: List[dict] = []
     if not path or not os.path.exists(path):
@@ -218,6 +239,7 @@ def _read_jsonl(path: str) -> List[dict]:
 _FRAG_SPLIT = re.compile(r"[；;、，,]+")
 
 
+# 生效条件：value 经 `str(value).strip()`（None 记 ""）后为空→False；否则按 _FRAG_SPLIT 切分并去掉空分片，若分片列表为空→False；否则返回全部分片都在 dialog 中的 all 判定结果。
 def _value_grounded(dialog: str, value) -> bool:
     """值是否 grounded：按分片切分后，每个分片都是对话记录的字面子串。
 
@@ -233,6 +255,7 @@ def _value_grounded(dialog: str, value) -> bool:
     return all(f in dialog for f in frags)
 
 
+# 生效条件：span 经 `str(span).strip()`（None 记 ""）后须非空且作为连续子串出现在 dialog 中，否则返回 False。
 def _span_grounded(dialog: str, span) -> bool:
     """引用 span 是否 grounded：必须是对话记录的**连续**字面子串。"""
     s = "" if span is None else str(span).strip()
@@ -264,10 +287,12 @@ _SENT_SPLIT = re.compile(r"[。！？!?；;\n]+")
 _TS_PAT = re.compile(r"(20\d{2})[-/年](\d{1,2})[-/月](\d{1,2})")
 
 
+# 生效条件：dialog 为假值时按 "" 处理，按模块级 _SENT_SPLIT 切分后 strip 并过滤空串，返回句子列表。
 def _sentences(dialog: str) -> List[str]:
     return [s.strip() for s in _SENT_SPLIT.split(dialog or "") if s.strip()]
 
 
+# 生效条件：对 sents 逐句判 `any(c in s for c in cues)`，命中即 append，命中后 `len(out) >= limit` 即 break——limit 为 0 或负数时首个命中项仍被 append 后立刻 break（多返 1 项）；cues 为空容器时 any 恒假、返回空列表。
 def _pick_by_cues(sents: List[str], cues, limit: int = 1) -> List[str]:
     """按线索词命中挑句（命中即整句作为候选——整句天然是原文子串，不会捏造）。"""
     out: List[str] = []
@@ -279,6 +304,7 @@ def _pick_by_cues(sents: List[str], cues, limit: int = 1) -> List[str]:
     return out
 
 
+# 生效条件：类无 __init__ 形参，实例化即成立，类属性 name 恒为模块级常量 SRC_RULE，候选能力经 candidates(dialog, ctx=None) 以 dialog 为必需入参调用；
 class RuleParser:
     """内生规则解析器：**诚实下界能力**，不是主路径。
 
@@ -290,6 +316,7 @@ class RuleParser:
 
     name = SRC_RULE
 
+# 生效条件：sents（来自 _sentences(dialog)）非空时「功能名」取首句（超 30 字符截前 30）；pos/tool/cons 仅在 _pick_by_cues 用 _CUES 对应线索命中时写入对应槽；time_window 先按 _TS_PAT 在 dialog 中匹配，命中且 mktime 未抛 ValueError/OverflowError/OSError 才填 [当日0点, +86399]，否则回落 [nodefile.FULL_TIME_WINDOW_MIN, nodefile.FULL_TIME_WINDOW_MAX] 并标 synthetic="full_time_window"；「不适用条件/执行/子功能」按 _NEG_CUES/_EXEC_CUES/_SUB_CUES 命中首句写入；「验证方式」取 _BASIS_CUES 中首个出现在 dialog 中的线索。
     def candidates(self, dialog: str, ctx: Optional[dict] = None) -> Dict[str, Any]:
         sents = _sentences(dialog)
         out: Dict[str, Any] = {"marks": {}, "slots": {}}
@@ -337,6 +364,7 @@ class RuleParser:
         return out
 
 
+# 生效条件：对给定 parser、dialog、ctx，getattr(parser,"candidates",parser) 得到的 fn 被调用为 fn(dialog, ctx or {})，若该调用抛 Exception 或返回非 dict 则返回 {"marks": {}, "slots": {}}，否则返回该 dict 并 setdefault("marks",{}) 与 setdefault("slots",{}) 后的结果。
 def _invoke_parser(parser, dialog: str, ctx: Optional[dict]) -> Dict[str, Any]:
     """调用外部/内生解析器，统一形态；异常不视作通过（返回空候选）。"""
     fn = getattr(parser, "candidates", parser)
@@ -355,6 +383,7 @@ def _invoke_parser(parser, dialog: str, ctx: Optional[dict]) -> Dict[str, Any]:
 # 核心：compile_dialog（对话记录 → 六要素候选；只编译，不入库）
 # =============================================================================
 
+# 生效条件：dialog 空记 E001、node_id 空记 E002、actor 空记 E003，且 cg 转换后非 None 而 node_id 非空时该节点不存在再记 E002，存在任一 errors 即以 verdict{passed:False, reason:errors[0], authority:VERIFICATION_UNIT} 提前返回 res；否则按「marks/slots 任一为非空 dict → SRC_EXPLICIT；二者皆空且 parser 为 None → SRC_RULE（附下界告警）；二者皆空且 parser 非 None → SRC_PARSER」收集候选，四槽逐个校验（key 不在 cand_slots 即跳过；time_window 非长度 2 的 list/tuple 记 E021；其余槽空值/占位记 E021；仅当非「src_kind==SRC_EXPLICIT 且 strict_spans=False」豁免时，值非 dialog 子串记 E011、span 非空而定位失败记 E010），clean_slots 缺必需槽或 condition_space_text 为空记 E020；五要素按同样规则过滤后入 res.lines（生效条件行只由四槽 env_text 合成），验证基底按「候选 basis → 验证方式命中 _BASIS_CUES → 默认 other 并附告警」取值、不在 nodefile.VERIFICATION_BASIS 中记 E030；最终 res.success 与 verdict.passed 同取「无 errors」，verdict 恒带 requires_attestation=True，通过时再按 nodefile.CCG_REQUIRED 缺失项补 warning；
 def compile_dialog(dialog: str, node_id: str, actor: str, *,
                    marks: Optional[Dict[str, Any]] = None,
                    slots: Optional[Dict[str, Any]] = None,
@@ -429,6 +458,7 @@ def compile_dialog(dialog: str, node_id: str, actor: str, *,
         res.warnings.append(
             "strict_spans=False：显式入参豁免名实门，含未经对话原文支撑的声明（已留痕）。")
 
+# 生效条件：item 为 dict 时返回 (item.get("value"), item.get("span"), item.get("basis"), item.get("synthetic"))（各键缺失即回落 None）；item 非 dict 时返回 (item, None, None, None)。
     def _field(item):
         """候选项 → (value, span, basis, synthetic)；容忍裸值与 dict 两种形态。"""
         if isinstance(item, dict):
@@ -550,13 +580,37 @@ def compile_dialog(dialog: str, node_id: str, actor: str, *,
 # attest：认知图**外**的验证方签章（裁定 A 的落点）
 # =============================================================================
 
+# 生效条件：a/b 任一传入值归一化（strip→去尾部括号注记→去全部空白→casefold）后为空即返回 False；否则返回两归一化结果是否相等。归一口径：尾部括号注记（如 "agent-A(复核)"）视为修饰后缀剥离；中间空白全去（"agent A"=="agent-A" 变体不在此列——连字符不做等价，避免过度归一误合不同主体）；
+def _same_subject(a, b) -> bool:
+    """身份归一比较（issue #27，2026-09-23）。
+
+    原先三处 E041 判据是裸 `==`——`agent-A` vs `agent-a` / `AGENT-A` /
+    `agent-A(复核)` 全部绕过（外部报告实测 WRITTEN=6 落盘成功）。
+    归一化拦截**已知同源形态**；根本保障是 attest 的 verifier_token
+    凭据通路（身份经令牌 HMAC 验签，不依赖自报诚实度）。
+    """
+    def _norm(x):
+        x = str(x or "").strip()
+        x = re.sub(r"[（(][^（）()]*[)）]\s*$", "", x)   # 尾部括号注记
+        return re.sub(r"\s+", "", x).casefold()
+    a_n, b_n = _norm(a), _norm(b)
+    return bool(a_n) and a_n == b_n
+
+
+# 生效条件：verifier_token 非空时先经 tokens.verify_token 验签（失败→E041 前置错误 fail-closed），以令牌 actor 覆盖 res.verifier 并标 verifier_identity="token"，否则标 "self-reported"；随后依次判 strip 后的 node_id 为空→E002；verifier 为空→E003；_same_subject(verifier, compiled_by)→E041；state（verdict.strip()）不在模块级 STATES→非法裁决；state 非 ACCEPT→E042；全部通过才 res.ok=True；随后恒算 token=_sha(...)，仅当 ledger 为真且 _as_cg(cg) 非 None 时追加一条 ccgc_attest 审计 jsonl（含 verifier_identity）。
 def attest(node_id: str, verdict: str, verifier: str, compiled_by: str, *,
            slot_corrections: Optional[Dict[str, Any]] = None,
-           evidence: str = "", cg: Any = None, ledger: bool = True) -> AttestResult:
+           evidence: str = "", cg: Any = None, ledger: bool = True,
+           verifier_token: str = "") -> AttestResult:
     """验证方签章。**验证方必须是编译方之外的一方**（子代理 / 设计者 / 用户）。
 
-    E041 机械拒绝 `verifier == compiled_by`——LLM 不得自己验证自己。
-    这是结构性保证：不依赖 prompt 自觉，也不依赖验证方「愿意」自证。
+    E041 机械拒绝「验证方 == 编译执行者」——LLM 不得自己验证自己。
+    阻断强度如实分层（issue #27）：
+      · verifier_token 提供时：身份经 mdcg 令牌 HMAC 验签（不可伪造），
+        E041 比较令牌 principal.actor 与 compiled_by——结构性阻断；
+      · 未提供时：回退自报字符串 + 归一化比较（大小写/空白/括号注记
+        归一），拦截已知同源变体；verifier_identity="self-reported"
+        如实标注，下游策略可据此拒绝。
     DEFER 不构成签章（未定 = 未通过）。
     """
     res = AttestResult(node_id=str(node_id or "").strip(),
@@ -566,11 +620,34 @@ def attest(node_id: str, verdict: str, verifier: str, compiled_by: str, *,
                        evidence=str(evidence or ""),
                        slot_corrections=dict(slot_corrections or {}),
                        ts=time.time())
+    if str(verifier_token or "").strip():
+        try:
+            from . import tokens as _tokens
+            _p = _tokens.verify_token(str(verifier_token).strip())
+            res.verifier = str(getattr(_p, "actor", "") or "").strip()
+            res.verifier_identity = "token"
+        except Exception as exc:   # noqa: BLE001 —— fail-closed：验签失败即拒绝
+            res.error = ("E041 前置失败：verifier 令牌验证失败（"
+                         + type(exc).__name__ + "）——验证方身份必须可凭据化，"
+                         "伪造令牌与无令牌同样不予放行")
+            res.token = _sha("|".join([res.node_id, res.verifier, res.state,
+                                       str(res.ts), res.evidence]))
+            _cg = _as_cg(cg)
+            if ledger and _cg is not None:
+                _append_jsonl(_log_path(_cg), {
+                    "action": "ccgc_attest", "ts": res.ts, "node": res.node_id,
+                    "verifier": res.verifier, "compiled_by": res.compiled_by,
+                    "state": res.state, "ok": False, "token": res.token,
+                    "verifier_identity": res.verifier_identity,
+                    "evidence": res.evidence,
+                    "slot_corrections": res.slot_corrections,
+                    "error": res.error})
+            return res
     if not res.node_id:
         res.error = "E002 " + E_CODES["E002"]
     elif not res.verifier:
         res.error = "E003 缺少验证方标识（verifier）"
-    elif res.verifier == res.compiled_by:
+    elif _same_subject(res.verifier, res.compiled_by):
         res.error = "E041 " + E_CODES["E041"] + "（verifier=" + res.verifier + "）"
     elif res.state not in STATES:
         res.error = ("非法裁决：" + repr(res.state) + "（可选 " + ",".join(STATES) + "）")
@@ -587,6 +664,7 @@ def attest(node_id: str, verdict: str, verifier: str, compiled_by: str, *,
                 "action": "ccgc_attest", "ts": res.ts, "node": res.node_id,
                 "verifier": res.verifier, "compiled_by": res.compiled_by,
                 "state": res.state, "ok": res.ok, "token": res.token,
+                "verifier_identity": res.verifier_identity,
                 "evidence": res.evidence,
                 "slot_corrections": res.slot_corrections, "error": res.error})
     return res
@@ -596,6 +674,37 @@ def attest(node_id: str, verdict: str, verifier: str, compiled_by: str, *,
 # link：签章通过才写入（缺签章恒不写入）
 # =============================================================================
 
+# 生效条件：依次判 compiled.success 为假→返回带错误；attestation 为 None→E040；attestation.node_id 不等于 compiled.node_id 的取值→目标不一致拒绝；attestation.verifier 为真值且 == `(actor or compiled.actor)`→E041；attestation.ok 为假→E042；_as_cg(cg) 为 None→E002；节点不在 cg.index 的 nodes 中→E002；apply 为假→ok=True 的 dry-run 返回；否则 apply 为真时写入（fm 为 None 或 content 加密→E004），basis 为假值则回落 compiled.sources.get("verification_basis") 或 "other"，成功后 out.written=len(compiled.lines)。
+def _check_deps(_cg, node_id: str) -> List[str]:
+    """依赖声明硬闸门 → 错误列表（E050 / E051）。**读面失败不误杀**（返回空即放行）。
+
+    契约口径：CCG「子功能」行的契约角色是**依赖 dependency**（nodefile 术语真源），
+    但该槽同时承载**自述子功能**（描述本单元内部构成）——判据以 `@<节点 id>` 显式
+    引用为界（`nodefile.declares_dependency`，收窄裁定 b）：**显式声称依赖**才要求在
+    `depends_on` 给出可解析目标——否则「依赖」只剩散文，被依赖单元一旦变动，下游
+    无处可传（失效传播从源头断链）。自然语言自述不算声明（依赖不是必填元数据）。
+    二者齐全时目标必须真实存在：悬空依赖 = 声称依赖一个并不存在的地基。
+    """
+    errs: List[str] = []
+    try:
+        node = _cg.get(node_id)
+    except Exception:                       # noqa: BLE001 —— 读面异常按「无声明」放行
+        return errs
+    if not node:
+        return errs
+    from . import trust as _trust
+    fm = node.get("frontmatter") or {}
+    deps = _trust.as_deps(fm.get(nodefile.DEPENDS_ON_FIELD))
+    if nodefile.declares_dependency(node.get("content") or "") and not deps:
+        errs.append("E050 " + E_CODES["E050"])
+    known = set((getattr(_cg, "index", None) or {}).get("nodes") or {})
+    missing = [d for d in deps if d not in known]
+    if missing:
+        errs.append("E051 " + E_CODES["E051"] + "：" + ",".join(missing[:5]))
+    return errs
+
+
+# 生效条件：依次判 compiled.success 为假→返回带错误；attestation 为 None→E040；attestation.node_id 不等于 compiled.node_id 的取值→目标不一致拒绝；attestation.verifier 为真值且 == `(actor or compiled.actor)`→E041；attestation.ok 为假→E042；_as_cg(cg) 为 None→E002；节点不在 cg.index 的 nodes 中→E002；依赖声明闸门（E050/E051）不通过→拒绝写入；apply 为假→ok=True 的 dry-run 返回；否则 apply 为真时写入（fm 为 None 或 content 加密→E004），basis 为假值则回落 compiled.sources.get("verification_basis") 或 "other"，成功后 out.written=len(compiled.lines)。
 def link(compiled: CompileResult, attestation: Optional[AttestResult], *,
          cg: Any = None, apply: bool = False, actor: str = "",
          basis: str = "") -> LinkResult:
@@ -617,8 +726,10 @@ def link(compiled: CompileResult, attestation: Optional[AttestResult], *,
     if attestation.node_id != node_id:
         out.errors.append("签章与产物目标不一致：" + attestation.node_id + " != " + node_id)
         return out
-    if attestation.verifier and attestation.verifier == (actor or compiled.actor):
-        out.errors.append("E041 " + E_CODES["E041"])
+    if attestation.verifier and _same_subject(attestation.verifier,
+                                              actor or compiled.actor):
+        out.errors.append("E041 " + E_CODES["E041"]
+                          + "（身份归一比较命中）")
         return out
     if not attestation.ok:
         out.errors.append("E042 " + E_CODES["E042"] +
@@ -632,6 +743,10 @@ def link(compiled: CompileResult, attestation: Optional[AttestResult], *,
     entry = (_cg.index.get("nodes") or {}).get(node_id)
     if not entry:
         out.errors.append("E002 节点不存在：" + node_id)
+        return out
+    _dep_errs = _check_deps(_cg, node_id)
+    if _dep_errs:
+        out.errors.extend(_dep_errs)
         return out
     if not apply:
         out.ok = True
@@ -686,6 +801,7 @@ def link(compiled: CompileResult, attestation: Optional[AttestResult], *,
 # recalibrate：用后续验证修正生效条件（裁定 A 的闭环）
 # =============================================================================
 
+# 生效条件：node_id 空→E002；verifier 为真值且==compiled_by→E041；corrections 为假值（空 dict/None）→E043；corrections 含不在模块级 nodefile.CONDITION_SLOTS 的键→E043；_as_cg(cg) 为 None→E002；节点不在 cg.index 的 nodes 中→E002；fm 为 None 或内容加密→E004；旧槽合并 corrections 后 condition_space_text 为空→E020；apply 为假→ok=True 的 dry-run 返回；否则写入并按 1 计 written。
 def recalibrate(node_id: str, corrections: Dict[str, Any], verifier: str,
                 compiled_by: str, *, evidence: str = "", cg: Any = None,
                 apply: bool = False) -> LinkResult:
@@ -700,8 +816,8 @@ def recalibrate(node_id: str, corrections: Dict[str, Any], verifier: str,
     if not out.node_id:
         out.errors.append("E002 " + E_CODES["E002"])
         return out
-    if verifier and verifier == compiled_by:
-        out.errors.append("E041 " + E_CODES["E041"])
+    if verifier and _same_subject(verifier, compiled_by):
+        out.errors.append("E041 " + E_CODES["E041"] + "（身份归一比较命中）")
         return out
     if not corrections:
         out.errors.append("E043 " + E_CODES["E043"] + "（未给出任何修正）")
@@ -772,11 +888,13 @@ def recalibrate(node_id: str, corrections: Dict[str, Any], verifier: str,
 PENDING_DIR = "_ccgc_pending"
 
 
+# 生效条件：node_id 为 None 或空串时按 "" 处理，非 [0-9A-Za-z_.\-] 字符一律替换为 "-"，取前 80 个字符；结果为空串时返回 "unnamed"。
 def _safe_name(node_id: str) -> str:
     """node_id → 文件名安全形态（分支节点形如 mem_x@br1，须剥掉非 [A-Za-z0-9_.-]）。"""
     return re.sub(r"[^0-9A-Za-z_.\-]", "-", str(node_id or ""))[:80] or "unnamed"
 
 
+# 生效条件：_as_cg(cg) 的 root 属性为假值→返回 ""；否则返回 os.path.join(str(root), PENDING_DIR, _safe_name(node_id) + ".json")。
 def pending_path(cg, node_id: str) -> str:
     _cg = _as_cg(cg)
     root = getattr(_cg, "root", None)
@@ -785,12 +903,14 @@ def pending_path(cg, node_id: str) -> str:
     return os.path.join(str(root), PENDING_DIR, _safe_name(node_id) + ".json")
 
 
+# 生效条件：lines、slots 为假值时按 {} 处理，返回 `_sha(json.dumps({"lines":..., "slots":...}, ensure_ascii=False, sort_keys=True))`。
 def _payload_hash(lines, slots) -> str:
     """候选内容摘要（六行 + 四槽，键序无关）——签章与产物的绑定依据。"""
     return _sha(json.dumps({"lines": lines or {}, "slots": slots or {}},
                            ensure_ascii=False, sort_keys=True))
 
 
+# 生效条件：_as_cg(cg) 为 None→返回 {'ok': False, 'error': '未提供 cg'}；pending_path 为空→返回 {'ok': False, 'error': '无法定位 pending 目录'}；否则写 json（OSError 时返回 ok=False 且带 path 与异常名），成功返回 {'ok': True, 'path': p, 'hash': rec['hash']}，其中 attest 按 `attestation is not None` 决定是否落盘。
 def save_pending(cg, compiled: CompileResult,
                  attestation: Optional[AttestResult] = None) -> dict:
     """候选（+ 可选签章）落 pending；返回 {ok, path, hash}。"""
@@ -813,6 +933,7 @@ def save_pending(cg, compiled: CompileResult,
     return {"ok": True, "path": p, "hash": rec["hash"]}
 
 
+# 生效条件：_as_cg(cg) 为 None→error='未提供 cg'；pending_path 为空或 os.path.isfile(p) 为假→error=未找到 pending；open/json.load 抛 OSError 或 ValueError→error=pending 不可读；否则按 dataclasses.fields 过滤重建 CompileResult 与（rec['attest'] 为真值时的）AttestResult，hash_ok = `rec.get("hash") == _payload_hash(c.lines, c.slots)`，ok=True。
 def load_pending(cg, node_id: str) -> dict:
     """读回候选与签章，并校验 hash（内容被改即 hash_ok=False，调用方须拒绝写入）。"""
     _cg = _as_cg(cg)
@@ -845,6 +966,7 @@ def load_pending(cg, node_id: str) -> dict:
     return out
 
 
+# 生效条件：pending_path(cg, node_id) 为空→返回 False；否则 os.remove 成功→True，抛 OSError→False。
 def drop_pending(cg, node_id: str) -> bool:
     """删除 pending（link 成功后调用；失败静默——待办件不是事实，无需强保证）。"""
     p = pending_path(cg, node_id)
@@ -857,6 +979,7 @@ def drop_pending(cg, node_id: str) -> bool:
         return False
 
 
+# 生效条件：load_pending(cg, node_id) 的 ok 为假→带其 error 返回 LinkResult；hash_ok 为假→以「hash 不符」错误返回；否则转调 link(got["compiled"], got.get("attest"), cg=cg, apply=apply, actor=actor, basis=basis) 并返回其结果，且仅当 res.ok 与 apply 同时为真时调用 drop_pending。
 def link_pending(cg, node_id: str, *, apply: bool = False, actor: str = "",
                  basis: str = "") -> LinkResult:
     """从 pending 读回候选与签章后 link：hash 校验 → 签章准入 → 写入 → 清理 pending。"""
@@ -881,4 +1004,3 @@ __all__ = ["ACCEPT", "REJECT", "DEFER", "BLINDSPOT", "STATES", "CONTRACT_ROLES",
            "compile_dialog", "attest", "link", "recalibrate",
            "PENDING_DIR", "pending_path", "save_pending", "load_pending",
            "drop_pending", "link_pending"]
-

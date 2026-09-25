@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""蜂巢执行器工具面单测（agent loop + lingshu_cg + web_search）。
+"""蜂巢执行器工具面单测（agent loop + lingshu_cg + web_search + read_file）。
 
 不打真 API：LLM 侧以假 _post_chat 序列驱动 loop；搜索侧以假 urlopen 喂
 预置响应测解析；lingshu 侧用临时认知图 root 走真实 md_cg 库层（最小闭环）。
@@ -8,8 +8,10 @@
 import io
 import json
 import os
+import shutil
 import sys
 import tempfile
+import threading
 import urllib.error
 from unittest import mock
 
@@ -45,10 +47,12 @@ def check(name, cond, detail=""):
 
 # ---------------------------------------------------------------- A 工具注册
 print("[A] 工具注册表与参数面")
-check("A1 注册表仅两个工具", set(ex.TOOL_SCHEMAS) == {"lingshu_cg", "web_search"})
+check("A1 注册表仅三个工具",
+      set(ex.TOOL_SCHEMAS) == {"lingshu_cg", "web_search", "read_file"})
 check("A2 schema 名与键一致",
       ex.TOOL_SCHEMAS["lingshu_cg"]["function"]["name"] == "lingshu_cg"
-      and ex.TOOL_SCHEMAS["web_search"]["function"]["name"] == "web_search")
+      and ex.TOOL_SCHEMAS["web_search"]["function"]["name"] == "web_search"
+      and ex.TOOL_SCHEMAS["read_file"]["function"]["name"] == "read_file")
 check("A3 lingshu op 枚举=白名单",
       ex.TOOL_SCHEMAS["lingshu_cg"]["function"]["parameters"]["properties"]
       ["op"]["enum"] == list(ex.LINGSHU_OPS_ALLOW))
@@ -75,7 +79,8 @@ check("B2 非法验证基底前置拦截", not out["ok"]
 # 写路径：DEFER 入审核队列（无验收器恒 DEFER 是设计行为）
 out = ex.tool_lingshu_cg(
     {"op": "write", "content": "# 功能名：工具面冒烟\n# 【内容】测试节点",
-     "content_kind": "work_done", "verification_basis": "test"},
+     "content_kind": "work_done", "verification_basis": "test",
+     "layer": "contextual"},   # M3.2：worker 直写限 contextual（缺省被拒）
     "job_t")
 check("B3 write 过闸 DEFER 入队（op 成功+committed=false）",
       out.get("ok") is True and out.get("committed") is False
@@ -100,6 +105,33 @@ res = out.get("results") or []
 check("B5 read 返回 results 结构",
       isinstance(res, list) and len(res) >= 1
       and "node" in res[0], str(out)[:200])
+
+# M3.1 工具层写后回读（批次7）：committed=true 必须盘面真有节点文件
+print("[B6] _write_readback（9·12 工具层防线）")
+from types import SimpleNamespace as _NS
+# B6: DEFER 入队形态（committed=false）→ 原样放行（无落盘声称，不拦）
+out = ex._write_readback(tmp, cg_t, {"ok": True, "id": "mem_whatever",
+                                     "committed": False})
+check("B6 committed=false 原样放行（入队非落盘）",
+      out.get("readback") is None and out.get("committed") is False, str(out)[:120])
+# B7: committed=true 但盘面无文件 → 回读不一致 error（能红：旧实现冒充成功）
+fake_cg = _NS(index={"nodes": {"mem_ghost": {
+    "path": "nodes/knowledge/mem_ghost.md"}}})
+out = ex._write_readback(tmp, fake_cg,
+                         {"ok": True, "id": "mem_ghost", "committed": True})
+check("B7 盘面无文件 → 回读不一致拒绝冒充成功",
+      out.get("ok") is False and out.get("readback") == "missing"
+      and "回读不一致" in out["error"], str(out)[:160])
+# B8: committed=true 且文件真在盘 → 放行并附 readback=ok
+cg_t.add("mem_readback_probe", "# 功能名：回读探针\n# 正文：真实落盘",
+         layer="knowledge")
+e = cg_t.index["nodes"]["mem_readback_probe"]
+check("B8a 探针文件真在盘（前置）",
+      os.path.isfile(os.path.join(tmp, e["path"])))
+out = ex._write_readback(tmp, cg_t, {"ok": True, "id": "mem_readback_probe",
+                                     "committed": True})
+check("B8 盘面有文件 → 放行附 readback=ok",
+      out.get("ok") is True and out.get("readback") == "ok", str(out)[:120])
 
 # ---------------------------------------------------------------- C web_search
 print("[C] web_search（假 urlopen，不触网）")
@@ -278,6 +310,15 @@ check("D12b 回喂消息保尾 + 非静默省略提示",
       and tool_msg["content"].count("B") > 1000
       and "tool_0_0.json" in tool_msg["content"],
       str(len(tool_msg["content"])))
+
+# v15-3：落盘面同样封顶（超长输出不得无上限写盘）
+huge = "C" * (ex.TOOL_DUMP_MAX_CHARS + 5000)
+_, huge_name = ex._shrink_tool_text(huge, tmp_job, "9_9")
+huge_spill = open(os.path.join(tmp_job, huge_name), encoding="utf-8").read()
+check("D12c 落盘受 TOOL_DUMP_MAX_CHARS 上限约束（截断并标注）",
+      bool(huge_name) and len(huge_spill) <= ex.TOOL_DUMP_MAX_CHARS + 200
+      and "落盘截断" in huge_spill,
+      "%s -> %d" % (huge_name, len(huge_spill)))
 check("D12c 进展卡逐轮留痕（tool/final 两类条目）",
       os.path.isfile(os.path.join(tmp_job, ex.PROGRESS_FILE)))
 _pe = [json.loads(x) for x in open(os.path.join(tmp_job, ex.PROGRESS_FILE),
@@ -406,6 +447,253 @@ check("F8 真源缺失 fail-closed（不回落旧提示词）", _raised)
 _lit, src_lit = ex.resolve_system_prompt({"system_prompt": "字面量"}, tmp_job)
 check("F9 未声明 from 时行为逐位兼容（literal 标签）",
       _lit == "字面量" and src_lit == "literal")
+
+# ---------------------------------------------------------------- G read_file
+print("[G] read_file 只读工具（读放开 / 写严格）")
+
+rw = tempfile.mkdtemp(prefix="hive_exec_read_")
+os.makedirs(os.path.join(rw, "sub"))
+open(os.path.join(rw, "lines.txt"), "w", encoding="utf-8").write(
+    "".join(f"第{i}行\n" for i in range(1, 6)))
+open(os.path.join(rw, "sub", "inner.txt"), "w", encoding="utf-8").write("内层内容")
+open(os.path.join(rw, "big.png"), "wb").write(png)
+open(os.path.join(rw, "archive.bin"), "wb").write(binf)
+
+check("G1 schema 参数面只有只读键（无任何写参数）",
+      set(ex.TOOL_SCHEMAS["read_file"]["function"]["parameters"]["properties"])
+      == {"path", "offset", "limit", "max_chars"},
+      str(ex.TOOL_SCHEMAS["read_file"]["function"]["parameters"]["properties"]))
+
+_o = ex.tool_read_file({"path": "lines.txt"}, workdir=rw)
+check("G2 相对路径以 workdir 为基准 + 全文行窗元数据",
+      _o["ok"] and _o["kind"] == "text" and _o["lines_total"] == 5
+      and _o["lines_returned"] == 5 and _o["content"].startswith("第1行")
+      and _o["replacements"] == 0 and _o["encoding"] == "utf-8(replace)",
+      str(_o)[:200])
+
+_o = ex.tool_read_file({"path": "lines.txt", "offset": 2, "limit": 2}, workdir=rw)
+check("G3 offset/limit 分页续读（第2-3行，窗口满即 truncated）",
+      _o["ok"] and _o["offset"] == 2 and _o["lines_returned"] == 2
+      and _o["content"] == "第2行\n第3行\n" and _o["lines_total"] == 5
+      and _o["truncated"] is True, str(_o)[:200])
+
+_o = ex.tool_read_file({"path": "lines.txt", "max_chars": 3}, workdir=rw)
+check("G4 max_chars 截断（不把整文件灌进上下文）",
+      _o["ok"] and _o["lines_returned"] == 1 and _o["truncated"] is True,
+      str(_o)[:200])
+
+# v14 缺陷 A 回归（2026-09-20）：字符上限是**硬约束**——单行本身超过上限时
+# 必须截断该行，不得整行放行（旧实现 max_chars=100 会回吐 1,000,000 字符，
+# READ_HARD_CHARS 自称「硬上限」名实不符，足以撑爆宿主上下文）。
+# 独立目录：避免污染 G5 的 rw 目录条目计数。
+rwbig = tempfile.mkdtemp(prefix="hive_exec_readbig_")
+open(os.path.join(rwbig, "minified.js"), "w",
+     encoding="utf-8").write("y" * 1000000)
+_o = ex.tool_read_file({"path": "minified.js", "max_chars": 100}, workdir=rwbig)
+check("G4b 单行超长文件：max_chars 硬约束（不整行放行）",
+      _o["ok"] and len(_o["content"]) <= 100 and _o["truncated"] is True,
+      f"content_len={len(_o.get('content') or '')}")
+_o = ex.tool_read_file({"path": "minified.js", "limit": 1}, workdir=rwbig)
+check("G4c 单行超长文件：默认上限下亦不越界",
+      _o["ok"] and len(_o["content"]) <= ex.READ_MAX_CHARS,
+      f"content_len={len(_o.get('content') or '')}")
+_o = ex.tool_read_file({"path": "minified.js", "max_chars": 10 ** 9},
+                       workdir=rwbig)
+check("G4d max_chars 请求夹到 READ_HARD_CHARS 且真实生效",
+      _o["ok"] and len(_o["content"]) <= ex.READ_HARD_CHARS,
+      f"content_len={len(_o.get('content') or '')}")
+_o = ex.tool_read_file({"path": "lines.txt", "max_chars": 100}, workdir=rw)
+check("G4e 多行文件仍按整行收（行粒度软上限语义不变）",
+      _o["ok"] and _o["content"] == "".join(f"第{i}行\n" for i in range(1, 6)),
+      repr((_o.get("content") or "")[:40]))
+del _o
+
+_o = ex.tool_read_file({"path": "."}, workdir=rw)
+_names = {e["name"]: e for e in _o.get("entries") or []}
+check("G5 目录给清单（子目录优先、带类型与字节）",
+      _o["ok"] and _o["kind"] == "dir" and _o["total"] == 4
+      and _o["entries"][0]["name"] == "sub"
+      and _names["sub"]["type"] == "dir" and _names["sub"]["bytes"] is None
+      and _names["lines.txt"]["bytes"] > 0, str(_o)[:200])
+
+_o = ex.tool_read_file({"path": "big.png"}, workdir=rw)
+check("G6 图像只给元数据不给正文（尺寸另附）",
+      _o["ok"] and _o["kind"] == "image:png" and _o["content"] is None
+      and (_o["width"], _o["height"]) == (3000, 120), str(_o)[:200])
+
+_o = ex.tool_read_file({"path": "archive.bin"}, workdir=rw)
+check("G7 二进制只给类型+字节数（不猜内容）",
+      _o["ok"] and _o["kind"] == "binary" and _o["content"] is None
+      and _o["bytes"] > 0, str(_o)[:160])
+
+open(os.path.join(rw, "gbk.txt"), "wb").write("中文内容".encode("gbk"))
+_o = ex.tool_read_file({"path": "gbk.txt"}, workdir=rw)
+check("G8 非 UTF-8 按替换处标记存疑（不静默当正文）",
+      _o["ok"] and _o["replacements"] > 0 and "存疑" in (_o.get("note") or ""),
+      str(_o)[:160])
+
+_o = ex.tool_read_file({"path": "nope.txt"}, workdir=rw)
+check("G9 路径不存在诚实报错（不猜内容）",
+      _o["ok"] is False and "路径不存在" in _o["error"], str(_o)[:160])
+_o = ex.tool_read_file({"path": " "}, workdir=rw)
+check("G10 path 必填", _o["ok"] is False and "必填" in _o["error"])
+
+# 白名单：非空即收窄（越界拒读）；未设置 = 读放开（缺省）
+out_dir = tempfile.mkdtemp(prefix="hive_exec_outside_")
+open(os.path.join(out_dir, "secret.txt"), "w", encoding="utf-8").write("外部文件")
+os.environ["HIVE_READ_ROOTS"] = rw + os.pathsep + out_dir
+_o = ex.tool_read_file({"path": os.path.join(out_dir, "secret.txt")})
+check("G11 白名单内可读（多根按 os.pathsep 切分）", _o["ok"] is True,
+      str(_o)[:160])
+os.environ["HIVE_READ_ROOTS"] = out_dir
+_o = ex.tool_read_file({"path": os.path.join(rw, "lines.txt")})
+check("G12 越界拒读（越界即拒，不猜内容）",
+      _o["ok"] is False and "白名单" in _o["error"]
+      and _o.get("roots") == [os.path.realpath(out_dir)], str(_o)[:200])
+os.environ.pop("HIVE_READ_ROOTS", None)
+_o = ex.tool_read_file({"path": os.path.join(rw, "lines.txt")})
+check("G13 未设置环境变量 = 读放开（缺省全路径开放）", _o["ok"] is True)
+
+_o, _b = ex.execute_tool("read_file", json.dumps({"path": "lines.txt"}),
+                         "job_r", workdir=rw)
+check("G14 execute_tool 透传 workdir 并正常分发",
+      _o["ok"] is True and _b == "ok items=0", f"{_o!r}/{_b!r}")
+_o, _ = ex.execute_tool("nope", "{}", "job_r")
+check("G15 未知工具错误列出 read_file", "read_file" in _o["error"])
+
+# ------------------------------------------------ H model↔base 配对前置校验
+# 能红说明：删掉 model_base_mismatch 或 main() 的插桩调用时，H1–H5 语义即失去守卫；
+# 回归 2026-09-23 归因（jobs error 12 中 1 个 = glm 模型错配 deepseek base 烧到 API 才 400）。
+print("[H] model↔base 配对前置校验（子代理配置标准 v0.5 §1）")
+check("H1 deepseek base + glm 模型 → 错配",
+      ex.model_base_mismatch("glm-5.3-flash", "https://api.deepseek.com")
+      is not None and "deepseek base" in (ex.model_base_mismatch(
+          "glm-5.3-flash", "https://api.deepseek.com") or ""))
+check("H2 deepseek base + deepseek 模型 → 放行",
+      ex.model_base_mismatch("deepseek-flash", "https://api.deepseek.com") is None)
+check("H3 智谱 base + deepseek 模型 → 错配",
+      ex.model_base_mismatch("deepseek-flash",
+                             "https://open.bigmodel.cn/api/paas/v4") is not None)
+check("H4 智谱 base + glm 模型 → 放行",
+      ex.model_base_mismatch("glm-5.3-flash",
+                             "https://open.bigmodel.cn/api/paas/v4") is None)
+check("H5 未知网关放行（不误伤自定义 base）",
+      ex.model_base_mismatch("whatever-model", "https://my-gw.example/v1") is None)
+check("H6 空 model 放行（缺 model 由 rust 必填校验拦）",
+      ex.model_base_mismatch("", "https://api.deepseek.com") is None)
+
+# ------------------------------------------------ I M3.2 写通道双轨制（worker 拦截）
+# 能红说明：删 tool_lingshu_cg 的 M3.2 拦截段（layer 限 contextual / on_conflict=record
+# 覆写 / 来源行注入）时 I1–I4 即红；编排身份放行由 I5 守卫（误拦收口写同红）。
+print("[I] M3.2 双轨制：worker 过程性直写约束（D3 裁决）")
+_captured = {}
+
+
+def _fake_dispatch(cg, args, **kw):
+    _captured.update(args)
+    return {"ok": True, "written": 1, "node_id": "n_test"}
+
+
+from md_cg import mcp_server as _msrv
+from unittest import mock as _mock
+
+with _mock.patch.object(_msrv, "_cg_dispatch", _fake_dispatch):
+    # I1 worker 写 knowledge → 拦（收口写归编排者）
+    out = ex.tool_lingshu_cg(
+        {"op": "write", "content": "x", "layer": "knowledge"}, "job_i1")
+    check("I1 worker 写 knowledge 被拒（双轨制）",
+          out["ok"] is False and "contextual" in out["error"], str(out)[:150])
+    # I2 worker 写 contextual → 放行 + on_conflict 覆写 record + 来源行注入
+    _captured.clear()
+    out = ex.tool_lingshu_cg(
+        {"op": "write", "content": "过程记录", "layer": "contextual"}, "job_i2")
+    check("I2 worker contextual 放行", out["ok"] is True, str(out)[:120])
+    check("I3 on_conflict 强制覆写 record",
+          _captured.get("on_conflict") == "record", str(_captured.get("on_conflict")))
+    check("I4 来源行自动注入（job + 父任务=none）",
+          "来源 job=job_i2" in str(_captured.get("content"))
+          and "父任务=none" in str(_captured.get("content")),
+          str(_captured.get("content"))[-80:])
+    # I5 编排身份（注册工厂）写 knowledge → 放行且不被覆写
+    ex.set_principal_factory(
+        lambda a, j: __import__("md_cg.security", fromlist=["Principal"])
+        .Principal(actor="hive-orch", clearance="secret", can_write=True,
+                   can_admin=False, role="orchestrator", auth_mode="hive-exec"))
+    _captured.clear()
+    out = ex.tool_lingshu_cg(
+        {"op": "write", "content": "收口结论", "layer": "knowledge"},
+        "job_i5")
+    check("I5 编排者收口写 knowledge 放行且不被覆写",
+          out["ok"] is True and _captured.get("layer") == "knowledge"
+          and "on_conflict" not in _captured,
+          f"{out!r}/{_captured.get('layer')}")
+    ex.set_principal_factory(None)
+
+# ------------------------------------------------ J M4 效力轴透传（schema + args）
+# 能红说明：删 LINGSHU_TOOL_SCHEMA 的 valid_from/valid_until 声明时 J1/J2 红；
+# tool_lingshu_cg 若改动 args 白名单过滤导致效力轴丢失时 J3 红。
+print("[J] M4 效力轴：schema 声明 + args 原样透传（不做自动推导）")
+_props = ex.LINGSHU_TOOL_SCHEMA["function"]["parameters"]["properties"]
+check("J1 schema 声明 valid_from/valid_until",
+      "valid_from" in _props and "valid_until" in _props)
+check("J2 声明含「不填=现行为」默认规则（不自动推导）",
+      "不填=现行为" in _props["valid_from"]["description"]
+      and "不填" in _props["valid_until"]["description"])
+_captured.clear()
+with _mock.patch.object(_msrv, "_cg_dispatch", _fake_dispatch):
+    out = ex.tool_lingshu_cg(
+        {"op": "write", "content": "时效结论", "layer": "contextual",
+         "valid_from": "2026-09-23", "valid_until": "2026-12-31"}, "job_j")
+    check("J3 效力轴参数原样透传库层（exec 层不吞不猜）",
+          out["ok"] is True
+          and _captured.get("valid_from") == "2026-09-23"
+          and _captured.get("valid_until") == "2026-12-31",
+          str(_captured)[:150])
+
+# ------------------------------------------------ K result.json 原子写（v2 N6）
+# 能红说明：write_result 若退回 open("w") 裸写（无 tmp+fsync+os.replace），
+# K2 并发压测必现撕裂/空窗（旧码线程形态实测 torn=22+empty=11）；rust serve
+# 超时/kill 强杀落在写入窗口即留半截文件且先毁旧完整结果。
+print("[K] write_result 原子性（tmp+fsync+replace，N6 红守卫 2026-09-25）")
+_k_tmp = tempfile.mkdtemp(prefix="hive_exec_n6_")
+try:
+    ex.write_result(_k_tmp, {"ok": True, "content": "k1"})
+    _k_raw = open(os.path.join(_k_tmp, "result.json"), encoding="utf-8").read()
+    check("K1 写后 result.json 完整且无 .tmp 残留",
+          json.loads(_k_raw).get("ok") is True
+          and not os.path.exists(os.path.join(_k_tmp, "result.json.tmp")),
+          _k_raw[:80])
+    _k_stop = False
+    _k_stat = {"torn": 0, "empty": 0, "ok": 0}
+
+    def _k_reader():
+        p_ = os.path.join(_k_tmp, "result.json")
+        while not _k_stop:
+            try:
+                raw = open(p_, "rb").read()
+                if not raw:
+                    _k_stat["empty"] += 1
+                else:
+                    json.loads(raw.decode("utf-8", "replace"))
+                    _k_stat["ok"] += 1
+            except json.JSONDecodeError:
+                _k_stat["torn"] += 1
+            except OSError:
+                pass
+
+    _k_rs = [threading.Thread(target=_k_reader) for _ in range(2)]
+    for _t in _k_rs:
+        _t.start()
+    for _i in range(20):
+        ex.write_result(_k_tmp, {"ok": True, "content": "x" * 1024 * 1024})
+    _k_stop = True
+    for _t in _k_rs:
+        _t.join()
+    check("K2 并发写读压测 0 撕裂（半截/空窗均不许出现）",
+          _k_stat["torn"] == 0 and _k_stat["empty"] == 0,
+          str(_k_stat))
+finally:
+    shutil.rmtree(_k_tmp, ignore_errors=True)
 
 print(f"\n结果：{PASS} 通过 / {FAIL} 失败")
 sys.exit(1 if FAIL else 0)

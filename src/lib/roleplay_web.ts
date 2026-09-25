@@ -101,6 +101,7 @@ footer button:disabled { opacity:.5; cursor:wait; }
     <button onclick="showNewRole()">+ 新角色</button>
     <button onclick="openRoleDetail()">⚙ 详情</button>
     <button onclick="openTrans()">🌐 翻译</button>
+    <button onclick="setEditKey()" title="编辑密钥：服务端 ROLEPLAY_EDIT_KEY 的值（创建/保存角色与翻译需要；留空清除）">🔑</button>
   </div>
 </header>
 <main id="chat"><div class="hint">选择角色，开始对话。角色回应由灵枢角色扮演引擎生成（白箱优先，LLM 续答）。</div></main>
@@ -191,9 +192,27 @@ try {
     localStorage.setItem('lingshu_client_id', CLIENT_ID);
   }
 } catch (e) { /* localStorage 不可用（隐私模式）→ 空，服务端落 shared */ }
+// V22 修复（缺陷 src/lib/roleplay_web.ts:338）：编辑密钥携带途径——
+// 服务端写操作 fail-closed 要求 x-edit-key 头（P1-2），但此前页面既无输入
+// 密钥的途径、写 POST 又全用裸 headers → 全部编辑恒 403 不可用。现在
+// 🔑 按钮（setEditKey → prompt）把密钥存 localStorage，apiHeaders 统一注入。
+const EDIT_KEY_STORE = 'lingshu_edit_key';
+function editKey() {
+  try { return localStorage.getItem(EDIT_KEY_STORE) || ''; } catch (e) { return ''; }
+}
+function setEditKey() {
+  const k = prompt('编辑密钥（服务端环境变量 ROLEPLAY_EDIT_KEY 的值；留空清除）：', editKey());
+  if (k === null) return;                    // 取消不动
+  try {
+    if (k.trim()) localStorage.setItem(EDIT_KEY_STORE, k.trim());
+    else localStorage.removeItem(EDIT_KEY_STORE);
+  } catch (e) { /* localStorage 不可用 → 忽略 */ }
+}
 function apiHeaders(extra) {
   const h = { 'Content-Type': 'application/json' };
   if (CLIENT_ID) h['x-client-id'] = CLIENT_ID;
+  const ek = editKey();
+  if (ek) h['x-edit-key'] = ek;              // V22：写操作鉴权头（无则服务端 403）
   return Object.assign(h, extra || {});
 }
 // —— 内容分级：年龄门控 + NSFW 检测（法律与协议保护）——
@@ -334,11 +353,18 @@ async function saveRoleDetail() {
   const scenario = $('rd_scenario').value.trim();
   const first_mes = $('rd_first').value.trim();
   const nsfw = $('rd_nsfw_chk').checked;
-  // 基础 meta（name/scenario/first_mes + nsfw 标记）
-  await fetch('/roleplay/api/roles/' + encodeURIComponent(role) + '/meta', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ name, scenario, first_mes, nsfw }),
-  });
+  // V22 修复（缺陷 :338）：此前 meta POST ①裸 headers（无 x-edit-key → 恒 403）
+  // ②响应完全不检查（fetch 对 403 不 reject）→ 无条件「已保存」= 虚假成功
+  // （服务端 403 在写盘之前 return，数据从未落盘）。现在统一走 apiHeaders()
+  // 并逐段检查 ok：任一失败 alert 服务端原因并中止，绝不报「已保存」。
+  let m;
+  try {
+    m = await fetch('/roleplay/api/roles/' + encodeURIComponent(role) + '/meta', {
+      method: 'POST', headers: apiHeaders(),
+      body: JSON.stringify({ name, scenario, first_mes, nsfw }),
+    }).then(x => x.json());
+  } catch (e) { m = { ok: false, error: '网络错误：' + e }; }
+  if (!m || !m.ok) { alert((m && m.error) || '保存失败（角色信息）'); return; }
   // 当前页签的条目
   const items = [];
   document.querySelectorAll('#rd_items .rd-row').forEach(row => {
@@ -347,10 +373,14 @@ async function saveRoleDetail() {
     const tags = row.querySelector('.rd-tags').value.split(/[,，]/).map(s => s.trim()).filter(Boolean);
     if (content) items.push({ content, importance: imp, tags });
   });
-  const r = await fetch('/roleplay/api/roles/' + encodeURIComponent(role) + '/import', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
-    body: JSON.stringify({ kind: rdKind, items }),
-  }).then(x => x.json());
+  let r;
+  try {
+    r = await fetch('/roleplay/api/roles/' + encodeURIComponent(role) + '/import', {
+      method: 'POST', headers: apiHeaders(),
+      body: JSON.stringify({ kind: rdKind, items }),
+    }).then(x => x.json());
+  } catch (e) { r = { ok: false, error: '网络错误：' + e }; }
+  if (!r || !r.ok) { alert((r && r.error) || '保存失败（' + rdKind + '）'); return; }
   addMsg('角色「' + role + '」已保存：' + name + ' · ' + rdKind + ' ' + items.length + ' 条' + (nsfw ? ' · NSFW' : ''), 'bot');
   closeRoleDetail();
   await refreshRoles();
@@ -395,21 +425,21 @@ async function saveTrans() {
   });
   const mode = (document.querySelector('input[name="tpmode"]:checked') || {}).value || 'input_only';
   const r = await fetch('/roleplay/api/translate', {
-    method: 'POST', headers: { 'Content-Type': 'application/json' },
+    method: 'POST', headers: apiHeaders(),
     body: JSON.stringify({ role_id: role, pairs, mode }),
   }).then(x => x.json());
   if (r.ok) {
     transMode = r.mode;
     closeTrans();
     addMsg('翻译配置已保存：' + r.pairs.length + ' 组词对 · ' + (r.mode === 'bidirectional' ? '双向翻译' : '仅输入翻译'), 'bot');
-  } else alert(r.error || '保存失败');
+  } else alert((r.error || '保存失败') + (editKey() ? '' : '（可点右上角 🔑 输入编辑密钥）'));
 }
 async function createRole() {
   const body = { role_id: $('nr_id').value.trim(), name: $('nr_name').value.trim(), scenario: $('nr_scenario').value.trim(), first_mes: $('nr_first').value.trim() };
   if (!body.role_id) { alert('需要角色 ID'); return; }
-  const r = await fetch('/roleplay/api/roles', { method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify(body) }).then(x => x.json());
+  const r = await fetch('/roleplay/api/roles', { method:'POST', headers: apiHeaders(), body: JSON.stringify(body) }).then(x => x.json());
   if (r.ok) { closeNewRole(); await refreshRoles(); addMsg('角色「' + (body.name || body.role_id) + '」已创建，可以开始对话了', 'bot'); }
-  else alert(r.error || '创建失败');
+  else alert((r.error || '创建失败') + (editKey() ? '' : '（可点右上角 🔑 输入编辑密钥）'));
 }
 var input = document.getElementById('input');
 var chat = document.getElementById('chat');
@@ -476,7 +506,9 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
         // P1 修复（GPT 审查）：
         // ① 请求体大小限制（此前 for-await 无限累加，恶意请求可制造内存压力）
         const readBody = async (req, maxBytes = 1_000_000) => {
-            let body = '';
+            // P2-12（批次 30）：Buffer 收集后统一 utf-8 解码——旧写法
+            // body += chunk 在多字节字符跨 chunk 时产生替换符截断。
+            const chunks = [];
             let size = 0;
             for await (const chunk of req) {
                 size += chunk.length;
@@ -485,20 +517,28 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
                     err.status = 413;
                     throw err;
                 }
-                body += chunk;
+                chunks.push(chunk);
             }
-            return body;
+            return Buffer.concat(chunks).toString('utf8');
         };
-        // ② 编辑鉴权：README 声称「编辑需 ROLEPLAY_EDIT_KEY」——此前代码未实现。
-        // 配置了 ROLEPLAY_EDIT_KEY 环境变量则写操作（meta/import/translate/创建角色）
-        // 必须带 x-edit-key 头；未配置时保持本地开发默认开放（README 已如实说明）。
+        // ② 编辑鉴权（P1-2，批次 26 外部审查报告）：fail-closed——未配置
+        // ROLEPLAY_EDIT_KEY 时**拒绝全部写操作**（旧语义「未配置=开放」是
+        // 本地开发便利，但网页面板是唯一对浏览器开放的面，默认无鉴权 =
+        // 任意来源可改写角色数据）。403 文案引导配置：设 ROLEPLAY_EDIT_KEY
+        // 并在请求带 x-edit-key 头即可恢复编辑。
         const EDIT_KEY = process.env.ROLEPLAY_EDIT_KEY || '';
         const requireEditKey = (req) => {
             if (!EDIT_KEY)
-                return true;
+                return false;                    // P1-2：未配置 = 拒绝（fail-closed）
             const h = (req.headers && req.headers['x-edit-key']) || '';
             return h === EDIT_KEY;
         };
+        // V21-1（批次 34，外部报告）：真分支此前误写自调用（无限递归 → 配了
+        // key 反而 500 且泄露内部异常文本）。两分支都是终止文案：已配置 =
+        // 「缺 x-edit-key 头」；未配置 = 「服务端需配置」引导。
+        const editKeyHint = () => EDIT_KEY
+            ? '缺少编辑密钥（x-edit-key 头）'
+            : '编辑未开放：服务端需配置环境变量 ROLEPLAY_EDIT_KEY，请求需带 x-edit-key 头（P1-2 fail-closed）';
         const roleDataDir = join(dirname(config.dbPath), 'roleplay_data');
         try {
             mkdirSync(join(roleDataDir, 'roleplay'), { recursive: true });
@@ -512,6 +552,7 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
         }
         catch { /* 忽略 */ }
         const transcriptFile = (roleId, clientId) => join(transcriptsDir, `${roleId.replace(/[^\w.-]/g, '_')}__${clientId}.jsonl`);
+        const TRANSCRIPT_TAIL_MAX = 500;   // P2-9（批次 31）：返回最近 500 条
         const readTranscript = (roleId, clientId = 'shared') => {
             const f = transcriptFile(roleId, clientId);
             if (!existsSync(f))
@@ -525,7 +566,9 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
                 }
                 catch { /* 跳过坏行 */ }
             }
-            return out;
+            // P2-9：无上限返回会让响应体随会话长度线性增长——只回最近尾部。
+            return out.length > TRANSCRIPT_TAIL_MAX
+                ? out.slice(out.length - TRANSCRIPT_TAIL_MAX) : out;
         };
         const appendTranscript = (roleId, entry, clientId = 'shared') => {
             try {
@@ -551,16 +594,28 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
         // 「角色字典」视角；写入保持原顶层结构（嵌套则写回 meta 内），读写一致——
         // 此前读兼容嵌套但写永远写根，保存成功但列表读旧值。
         const roleMetaFile = join(roleDataDir, 'roleplay', '_roles.json');
+        // P1-3（批次 26 外部审查报告）：角色 id 白名单——role 从 URL 提取后
+        // 直接作 meta 对象键，`__proto__` 键会劫持 Object.prototype（污染插件
+        // 与 DSH 宿主共享的同进程对象）。白名单字符集 + 显式拒绝危险键。
+        const _BAD_ROLE_IDS = new Set(['__proto__', 'constructor', 'prototype']);
+        const validRoleId = (role) => typeof role === 'string'
+            && /^[A-Za-z0-9_.-]{1,64}$/.test(role)
+            && !_BAD_ROLE_IDS.has(role);
+        // meta 字典统一 null 原型——即使存量文件已被写入危险键，
+        // meta['__proto__'] 也只是普通 own 属性，不再劫持原型链。
+        const toNullProto = (o) => (o && typeof o === 'object')
+            ? Object.assign(Object.create(null), o)
+            : o;
         const readRoleMeta = () => {
             try {
                 const raw = JSON.parse(readFileSync(roleMetaFile, 'utf8'));
                 if (raw && typeof raw === 'object'
                     && raw.meta && typeof raw.meta === 'object')
-                    return raw.meta;  // 嵌套格式 → meta 内角色字典
-                return raw;
+                    return toNullProto(raw.meta);  // 嵌套格式 → meta 内角色字典
+                return toNullProto(raw);
             }
             catch {
-                return {};
+                return Object.create(null);
             }
         };
         const writeRoleMeta = (flat) => {
@@ -595,8 +650,12 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
             }
         };
         const writeTransSettings = (s) => {
+            // P2-10（批次 31）：tmp+rename 原子写（与 writeRoleMeta 同款）——
+            // 直接 writeFileSync 并发/中断会写坏 JSON，后续读静默丢配置。
             try {
-                writeFileSync(transSettingsFile, JSON.stringify(s, null, 2), 'utf8');
+                const tmp = transSettingsFile + '.tmp';
+                writeFileSync(tmp, JSON.stringify(s, null, 2), 'utf8');
+                renameSync(tmp, transSettingsFile);
             }
             catch { /* 忽略 */ }
         };
@@ -606,6 +665,8 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
             return Array.isArray(t) ? t : [];
         };
         const setTranslations = (roleId, pairs) => {
+            if (!validRoleId(roleId))
+                return;                          // P1-3：非法角色 id 拒写（防原型污染）
             const meta = readRoleMeta();
             if (!meta[roleId])
                 meta[roleId] = { created_at: Date.now() / 1000, name: roleId };
@@ -668,7 +729,7 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
                     // P1 修复（GPT 审查）：写操作鉴权（ROLEPLAY_EDIT_KEY）+ 请求体大小限制
                     if (!requireEditKey(req)) {
                         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-                        res.end(JSON.stringify({ ok: false, error: '缺少编辑密钥（x-edit-key 头）' }));
+                        res.end(JSON.stringify({ ok: false, error: editKeyHint() }));
                         return;
                     }
                     let body;
@@ -726,7 +787,7 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
                     // P1 修复（GPT 审查）：写操作鉴权（ROLEPLAY_EDIT_KEY）+ 请求体大小限制
                     if (!requireEditKey(req)) {
                         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-                        res.end(JSON.stringify({ ok: false, error: '缺少编辑密钥（x-edit-key 头）' }));
+                        res.end(JSON.stringify({ ok: false, error: editKeyHint() }));
                         return;
                     }
                     let body;
@@ -740,6 +801,15 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
                     }
                     const p = JSON.parse(body);
                     const role = decodeURIComponent(url.pathname.split('/')[4]);
+                    if (!validRoleId(role)) {
+                        // P1-3：__proto__/constructor/prototype 及越界字符拒绝
+                        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                        res.end(JSON.stringify({ ok: false, error: '非法角色 id（白名单 ^[A-Za-z0-9_.-]{1,64}$）' }));
+                        return;
+                    }
+                    // P2-11（批次 30 注记）：本读改写段为同步执行（中间无
+                    // await）——node 单 tick 内不会交错；若未来在此段引入
+                    // await，须先加写队列/文件锁（并发丢更新防线）。
                     const meta = readRoleMeta();
                     if (!meta[role])
                         meta[role] = { created_at: Date.now() / 1000 };
@@ -769,6 +839,14 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
                     }
                     const p = JSON.parse(body);
                     const role = p.role_id || 'protocol-guide';
+                    // P2-23（批次 30）：chat 的 role_id 进 node_id 模板——
+                    // 纵深防御：与 /meta 同款白名单（当前模板前缀使穿越
+                    // 不可达，但模板改动即破——入口统一卡死）
+                    if (!validRoleId(role)) {
+                        res.writeHead(400, { 'Content-Type': 'application/json; charset=utf-8' });
+                        res.end(JSON.stringify({ ok: false, error: '非法角色 id（白名单 ^[A-Za-z0-9_.-]{1,64}$）' }));
+                        return;
+                    }
                     // P1 完善（会话隔离）：按客户端实例隔离 session 与转录
                     const cid = clientIdOf(req);
                     // —— 服务端内容分级硬拦截（不依赖前端，法律与协议保护）——
@@ -823,7 +901,7 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
                     // P1 修复（GPT 审查）：写操作鉴权（ROLEPLAY_EDIT_KEY）+ 请求体大小限制
                     if (!requireEditKey(req)) {
                         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-                        res.end(JSON.stringify({ ok: false, error: '缺少编辑密钥（x-edit-key 头）' }));
+                        res.end(JSON.stringify({ ok: false, error: editKeyHint() }));
                         return;
                     }
                     let body;
@@ -859,7 +937,7 @@ export async function installRoleplayWeb(ctx, capability, config, disposers, mdc
                     // P1 修复（GPT 审查）：写操作鉴权（ROLEPLAY_EDIT_KEY）+ 请求体大小限制
                     if (!requireEditKey(req)) {
                         res.writeHead(403, { 'Content-Type': 'application/json; charset=utf-8' });
-                        res.end(JSON.stringify({ ok: false, error: '缺少编辑密钥（x-edit-key 头）' }));
+                        res.end(JSON.stringify({ ok: false, error: editKeyHint() }));
                         return;
                     }
                     let body;

@@ -75,7 +75,8 @@ _danger = [o for o in ("forget", "identity", "protect", "delegate", "maintain",
 check("A3 危险 op 确在 ALL_OPS（防空洞断言）", len(_danger) >= 1, str(_danger))
 check("A4 危险 op 均不在编排器清单", not (set(_danger) & set(tk.ORCH_OPS_ALLOW)),
       str(set(_danger) & set(tk.ORCH_OPS_ALLOW)))
-check("A5 编排器角色可派生", tk.ORCH_ROLE in tk.DELEGABLE_ROLES)
+check("A5 编排器角色不可再派生（安全收紧：防令牌链蔓延，designer 独占派生权）",
+      tk.ORCH_ROLE not in tk.DELEGABLE_ROLES)
 check("A6 派生 ops/layers 与真源逐位一致",
       list(ORCH_DERIVE["ops_allow"]) == list(tk.ORCH_OPS_ALLOW)
       and list(ORCH_DERIVE["layers_allow"]) == list(tk.ORCH_LAYERS_ALLOW))
@@ -92,8 +93,8 @@ P = tk.verify_token(ORCH_TOK, path=STORE)
 check("A9 校验后身份 ops 收窄一致", list(P.ops_allow or []) == list(tk.ORCH_OPS_ALLOW))
 check("A10 校验后身份 layers 收窄一致",
       list(P.layers_allow or []) == list(tk.ORCH_LAYERS_ALLOW))
-check("A11 can_admin=True（裁决子代理冲突的前提，如实标注残余面）",
-      P.can_admin is True)
+check("A11 can_admin=False（review 裁决权归设计者；编排器冲突只留痕上报）",
+      P.can_admin is False)
 
 
 def _op_ok(principal, op):
@@ -141,7 +142,8 @@ orc._CFG.update({"job_id": "orchjob", "job_dir": JOB_DIR, "jobs": JOBS,
                  "model": "m_test", "max_subtasks": 2, "children": []})
 
 _t, _added = orc.merge_tools({})
-check("B1 缺省 tools 注入 lingshu_cg + web_search", {"lingshu_cg", "web_search"} <= set(_t))
+check("B1 缺省 tools 注入 lingshu_cg + web_search + read_file",
+      {"lingshu_cg", "web_search", "read_file"} <= set(_t))
 check("B2 编排三工具为能力下限（强制并入）", set(orc.ORCH_TOOLS) <= set(_t))
 _t2, _ = orc.merge_tools({"tools": ["lingshu_cg"]})
 check("B3 显式 tools 仍补编排三工具且不重复",
@@ -167,6 +169,10 @@ _s1 = json.load(open(os.path.join(JOBS, C1, "spec.json"), encoding="utf-8"))
 check("B9 子 spec 无 orchestrate（结构性防递归）", "orchestrate" not in _s1)
 check("B10 子 spec tools ⊆ 子代理白名单",
       set(_s1["tools"]) <= set(orc.SUB_TOOLS_ALLOW), str(_s1["tools"]))
+check("B10b read_file 在子代理白名单内且工具描述同步（防漂移）",
+      "read_file" in orc.SUB_TOOLS_ALLOW
+      and "read_file" in orc._spawn_schema()["function"]["parameters"]
+      ["properties"]["tools"]["description"], str(list(orc.SUB_TOOLS_ALLOW)))
 check("B11 子任务默认注入与 MCP 面同源",
       _s1["timeout_s"] == orc._hm.DEFAULT_TIMEOUT_S
       and _s1["reasoning_effort"] == orc._hm.DEFAULT_REASONING_EFFORT
@@ -258,8 +264,8 @@ def _exec_call(name, args_json, job_id):
 
 
 _base = set(ex.all_schemas())
-check("C1 未注册时工具面 = 内置两工具（零变更）",
-      _base == {"lingshu_cg", "web_search"}, str(_base))
+check("C1 未注册时工具面 = 内置三工具（零变更）",
+      _base == {"lingshu_cg", "web_search", "read_file"}, str(_base))
 ex.register_tools({"spawn_subtask": {"type": "function",
                                      "function": {"name": "spawn_subtask"}}},
                   lambda n, a, j: {"ok": True, "echo": n})
@@ -366,7 +372,13 @@ with open(os.path.join(_JD, "spec.json"), encoding="utf-8") as f:
     _spec2 = json.load(f)
 check("E2 spec 补全编排三工具（写回磁盘可审计）",
       set(orc.ORCH_TOOLS) <= set(_spec2["tools"]), str(_spec2.get("tools")))
+check("E2b 编排轮次下限补全（迭代项6，删 setdefault 必红）",
+      (_spec2.get("max_tool_rounds") or 0) >= 12,
+      str(_spec2.get("max_tool_rounds")))
 check("E3 缺省注入编排 system_prompt", "编排者" in _spec2.get("system_prompt", ""))
+check("E3b 写后回读纪律在系统提示词（M3.1，删除该行必红）",
+      "写后回读" in _spec2.get("system_prompt", "")
+      and "不信返回的 written 计数" in _spec2.get("system_prompt", ""))
 check("E4 max_subtasks 从 spec.orchestrate 生效", orc._CFG["max_subtasks"] == 3,
       str(orc._CFG["max_subtasks"]))
 check("E5 已注册编排工具", set(orc.ORCH_TOOLS) <= set(orc._ex.all_schemas()))
@@ -403,6 +415,58 @@ with open(os.path.join(_JD2, "result.json"), encoding="utf-8") as f:
     _res2 = json.load(f)
 check("E10 result 诚实记 orch_token_unavailable",
       _res2.get("error_code") == "orch_token_unavailable" and _res2.get("ok") is False)
+
+# ------------------------------------------------------- L M5 纠正链侧车 + 同源标记
+# 能红说明：删 _record_adjudication 的字段校验时 L1-L3 红；删 _spawn/_card 的
+# source_group 时 L4/L5 红；同源组键变化时 L6（同组断言）红。
+print("[L] M5 纠正链侧车 + 同源标记")
+_JD_M5 = tempfile.mkdtemp(prefix="orch_m5_")
+orc._CFG["job_id"] = "orch_m5_probe"
+orc._CFG["job_dir"] = _JD_M5
+orc._CFG["max_subtasks"] = 99   # E 段 main 遗留 3 上限会挡本段两次 spawn
+
+_l0 = orc.orch_handler("record_adjudication", {"kind": "supersede"}, "orch_m5_probe")
+check("L1 缺 subject/evidence/note 诚实拒",
+      _l0["ok"] is False and "subject" in _l0["error"], str(_l0)[:120])
+_l0b = orc.orch_handler("record_adjudication",
+                        {"kind": "replace", "subject": "s1",
+                         "evidence": ["s2"], "verdict_note": "n"}, "orch_m5_probe")
+check("L2 非法 kind 诚实拒", _l0b["ok"] is False and "kind" in _l0b["error"])
+_l1 = orc.orch_handler("record_adjudication", {
+    "kind": "supersede", "subject": "job_child_a",
+    "evidence": ["job_child_a", "job_child_b"],
+    "verdict_note": "乙的结论覆盖甲（甲缺边界核对）"}, "orch_m5_probe")
+check("L3 合法裁决落台账（job 目录内）",
+      _l1["ok"] is True and os.path.isfile(os.path.join(_JD_M5, orc._ADJ_FILE)))
+_rec = [json.loads(l) for l in open(os.path.join(_JD_M5, orc._ADJ_FILE),
+                                    encoding="utf-8")][-1]
+check("L4 台账字段完整（ts/kind/subject/evidence/note/session）",
+      _rec.get("kind") == "supersede" and _rec.get("subject") == "job_child_a"
+      and "job_child_b" in (_rec.get("evidence") or [])
+      and str(_rec.get("session", "")).startswith("hive_orch_"), str(_rec)[:160])
+
+_g = orc._source_group("deepseek-flash", ["a.txt", "b.txt"])
+check("L5 同源组键：同 model+同 context_files 同组",
+      _g == orc._source_group("deepseek-flash", ["b.txt", "a.txt"]))
+check("L6 同源组键：异 model 异组",
+      _g != orc._source_group("deepseek-v4-pro", ["a.txt", "b.txt"]))
+check("L7 同源组键：异 context_files 异组",
+      _g != orc._source_group("deepseek-flash", ["a.txt"]))
+_ctx_a = os.path.join(TMP, "ctx_a.txt")
+with open(_ctx_a, "w", encoding="utf-8") as f:
+    f.write("ctx\n")
+_sga = orc._spawn({"user_prompt": "同源甲", "tools": ["lingshu_cg"],
+                   "context_files": [_ctx_a]})
+_sgb = orc._spawn({"user_prompt": "同源乙", "tools": ["lingshu_cg"],
+                   "context_files": [_ctx_a]})
+_sg = [c for c in orc._CFG["children"]
+       if c["job_id"] in (_sga.get("job_id"), _sgb.get("job_id"))]
+check("L8 卡片带 source_group 且孪生同组",
+      len(_sg) == 2 and _sg[0].get("source_group")
+      and _sg[0]["source_group"] == _sg[1]["source_group"],
+      str(_sg)[:160])
+_card_sg = orc._card(_sga["job_id"]).get("source_group")
+check("L9 卡片可读出 source_group", _card_sg == _sg[0]["source_group"], str(_card_sg))
 
 print(f"\n=== orchestration tests: {PASS} passed, {FAIL} failed ===")
 sys.exit(1 if FAIL else 0)

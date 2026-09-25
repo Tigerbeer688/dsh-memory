@@ -51,12 +51,14 @@ _RE_WS = re.compile(r"\s+")
 _RE_TITLE = re.compile(r"^\s*#\s*功能名[：:]\s*(.+?)\s*$", re.M)
 
 
+# 生效条件：读环境变量 MDCG_WRITELIMIT（缺省 "1"），strip 并 lower 后不在 ("0", "false", "no") 中即返回 True——默认开启，仅显式关闭值才停用；
 def enabled() -> bool:
     """总开关：env MDCG_WRITELIMIT=0/false/no 时关闭所有限流。"""
     return os.environ.get("MDCG_WRITELIMIT", "1").strip().lower() \
         not in ("0", "false", "no")
 
 
+# 生效条件：形参 content 为假值返回 None；否则 strip 后若 _RE_TITLE 命中且标题骨架 s 非空且 len(s)>=MIN_SKELETON 返回 "t:"+s，否则返回 None；无标题且 len(text)>=MAX_CONTENT 返回 None；无标题且 len(text)<MAX_CONTENT 时全文骨架 s 非空且 len(s)>=MIN_SKELETON 返回 s，否则返回 None；
 def template_signature(content: str):
     """同模板流水签名：标题模板优先，其次全文骨架。
 
@@ -80,6 +82,7 @@ def template_signature(content: str):
     return s if s and len(s) >= MIN_SKELETON else None
 
 
+# 生效条件：形参 text 为任意字符串时，依次清除 URL、长十六进制、长数字、数字与空白后返回 s（空串返回空串）；
 def _skeleton(text: str) -> str:
     s = _RE_URL.sub(" ", text)
     s = _RE_HEX.sub(" ", s)
@@ -91,10 +94,12 @@ def _skeleton(text: str) -> str:
 
 # ---------- 状态持久化 ----------
 
+# 生效条件：形参 cg 提供 root 时返回 os.path.join(cg.root, STATE_FILE)；
 def _state_path(cg) -> str:
     return os.path.join(cg.root, STATE_FILE)
 
 
+# 生效条件：形参 cg 使 _state_path(cg) 可读取且 json.load 得到 dict 且 st.get("sigs")/st.get("rate") 均为 dict 时返回 st；否则若读取或解析抛 OSError/ValueError 或该 dict 中 sigs/rate 任一非 dict 则返回 {"sigs": {}, "rate": {}}（顶层非 dict 会在 st.get 处抛 AttributeError）；
 def _load(cg) -> dict:
     try:
         with open(_state_path(cg), encoding="utf-8") as f:
@@ -106,12 +111,14 @@ def _load(cg) -> dict:
     return {"sigs": {}, "rate": {}}
 
 
+# 生效条件：调用方传入 cg 与 st，无任何早退守卫，一经调用即以 json.dumps(st, ensure_ascii=False, sort_keys=True) 在 _state_path(cg) 的 FileLock 内原子写入。
 def _save(cg, st: dict) -> None:
     p = _state_path(cg)
     with FileLock(p):
         atomic_write(p, json.dumps(st, ensure_ascii=False, sort_keys=True))
 
 
+# 生效条件：调用方传入 st、key、now，st 须含 "rate" 键（st["rate"].get(key, []) 缺该 key 时按空列表处理），按 now - t < RATE_WINDOW 过滤后追加 now，并只回写末尾 RATE_MAX*4 项。
 def _push_rate(st: dict, key: str, now: float) -> None:
     win = [t for t in st["rate"].get(key, []) if now - t < RATE_WINDOW]
     win.append(now)
@@ -120,6 +127,7 @@ def _push_rate(st: dict, key: str, now: float) -> None:
 
 # ---------- 写入侧：前置限流 + 同构聚合 ----------
 
+# 生效条件：仅当 layer=="contextual" 且 enabled() 为真、且 importance_hint 为 None 或 float(importance_hint)<0.7（转换抛 TypeError/ValueError 时同样继续）才进入限流，此时 now 为 None 取 time.time()，key 取 f"{layer}:{role or 'user'}"（role 为 None/空串等假值回落 'user'）：同 key 窗口内条数 ≥ RATE_MAX 返回 DEFER；否则 signature 非空且 st["sigs"] 中该签名记录在 CONVERGE_WINDOW 内、nid 有效且 cg.get(rec["nid"]) 存在时，正文 strip 后完全一致返回 DROP、不一致返回 CONVERGE；其余情形返回 None 放行。
 def check(cg, content, layer="contextual", role=None, node_id=None,
           importance_hint=None, now=None):
     """remember_gated 前置限流。None=放行；否则 {"verdict": DEFER|CONVERGE}。
@@ -184,6 +192,7 @@ def check(cg, content, layer="contextual", role=None, node_id=None,
     return None
 
 
+# 生效条件：形参 content 的 template_signature 非空，且 st["sigs"].get(sig) 为 None 或该记录 nid 为假值时，写入 {"nid": node_id, ...} 并保存；否则不写并返回 None；
 def record_accepted(cg, node_id, content, now=None) -> None:
     """ACCEPT 落盘后确保签名→节点映射存在（check 已预占位，此处兜底）。"""
     sig = template_signature(content)
@@ -198,6 +207,7 @@ def record_accepted(cg, node_id, content, now=None) -> None:
         _save(cg, st)
 
 
+# 生效条件：cg.get(target) 为假值返回 {"ok": False, "error": "target_missing"}；否则以 content 空白归一后截 80 字追加 "【聚合 stamp】" 行、fm["merge_count"]=int(fm.get("merge_count") or 0)+1 后 _write_node 落盘（重要性不变），并返回 {"ok": True, "merge_count": 新值}。
 def converge_into(cg, target: str, content: str) -> dict:
     """同构聚合落库：正文追加一行【聚合】摘要，merge_count+1。
 
@@ -225,6 +235,7 @@ def converge_into(cg, target: str, content: str) -> dict:
 
 # ---------- 读侧：已落盘同构组的周期整理（sustain 巡检入口）----------
 
+# 生效条件：形参 cg 的 index["nodes"] 中 layer=="contextual" 且 cg.get 可取的节点按 template_signature 非空分组，扫描到 scanned>=limit（limit=0 立即 break）为止，成员数≥min_group 的组按成员数降序进入 planned；apply 为真且 planned 非空时，逐组循环且累计 n_ap>=MAX_APPLY 后不再开新组（组内成员仍可继续 n_ap 累加超过），跳过 protected/immutable 成员，保留每组最早节点并追加整理聚合、成员降权，输出 out（out["planned"] 仅取 planned[:20]；apply 假或 planned 空直接返回 out）；
 def tidy_contextual(cg, apply=False, min_group=3, actor="sustain_tidy",
                     limit=2000) -> dict:
     """扫描 contextual 层已落盘节点，按模板签名分组并整理。
@@ -254,11 +265,12 @@ def tidy_contextual(cg, apply=False, min_group=3, actor="sustain_tidy",
     for sig, members in groups.items():
         if len(members) < min_group:
             continue
-        members.sort(key=lambda m: float((m.get("frontmatter") or {})
-                                         .get("created_at", 0) or 0))
+        members.sort(key=lambda m: (float((m.get("frontmatter") or {})
+                                          .get("created_at", 0) or 0),
+                                    str(m.get("id") or "")))
         planned.append({"sig": sig[:40], "keep": members[0]["id"],
                         "members": [m["id"] for m in members[1:]]})
-    planned.sort(key=lambda p: -len(p["members"]))
+    planned.sort(key=lambda p: (-len(p["members"]), str(p.get("sig") or "")))
     out = {"t": time.time(), "actor": actor, "scanned": scanned,
            "groups": len(planned),
            "members": sum(len(p["members"]) for p in planned),
@@ -301,6 +313,7 @@ def tidy_contextual(cg, apply=False, min_group=3, actor="sustain_tidy",
     return out
 
 
+# 生效条件：e 提供 "id"/"path"，对其 frontmatter 副本在 tags 不含 "tidy:converged" 时追加该 tag、importance 置 round(max(0.1, float(fm.get("importance",0.5) or 0)*0.5), 3)，经 lifecycle.stamp(fm,"converged",reason=...,actor=actor) 后 _ok 为真时 setdefault(lifecycle.STATE_FIELD,"converged")，随后 cg._write_node 落盘，且 cg.index["nodes"].get(e["id"]) 非 None 时同步 tags/importance/状态字段到索引。
 def _demote(cg, e: dict, actor: str = "sustain_tidy") -> None:
     """成员降权：tags += tidy:converged，importance×0.5（下限 0.1）。
 
@@ -333,6 +346,7 @@ def _demote(cg, e: dict, actor: str = "sustain_tidy") -> None:
         cg._dirty[e["id"]] = entry
 
 
+# 生效条件：形参 cg 使 _load(cg) 返回 dict 时，返回 enabled()、st["sigs"] 计数、nid 为真的 live_sigs、st["rate"] 键数与 STATE_FILE 组成的摘要；
 def stats(cg) -> dict:
     """限流状态摘要（诊断面）。"""
     st = _load(cg)

@@ -15,7 +15,10 @@ import { exec, spawn } from 'node:child_process'
 import * as fs from 'node:fs'
 import * as path from 'node:path'
 import * as os from 'node:os'
-import { pythonPathValue, repoRoot } from './datapath.js'
+import { pythonPathValue, runRoot } from './datapath.js'
+// issue #19：解释器默认值按平台解析（Windows: python / 其它: python3；
+// env MDCG_PYTHON 可覆盖）。此前写死 'python'，Linux/macOS 上 mutual 一开就撞 ENOENT。
+import { defaultPython } from './python_path.js'
 
 export interface MutualOptions {
   /** 心跳间隔（毫秒），默认 10min */
@@ -90,7 +93,10 @@ export function judgeStamp(stamp: { ageMs: number; task_running: boolean } | nul
 // 守护 A（检测 harness 进程 + 拉起）
 // ---------------------------------------------------------------------------
 
-const HARNESS_PROC = ['python', 'harness.guardian']  // wmic 特征
+// 进程探测特征 = 命令行含 'harness.guardian' / 'harness.main'（见 harnessRunning）。
+// issue #19 已知边界（未纳入本轮修复面）：Windows 分支按 name='python.exe' 过滤，
+// 用其它可执行名（conda 的 python3.exe 等）启动的 harness 可能漏检；该路径由
+// config.mutual.enabled 控制（默认关）。
 
 function execP(cmd: string): Promise<string> {
   return new Promise((resolve) => {
@@ -120,7 +126,7 @@ export async function harnessRunning(): Promise<boolean> {
 }
 
 /** detached 拉起 A 侧 harness.guardian（幂等：先确认不存在） */
-export async function ensureHarness(python = 'python',
+export async function ensureHarness(python = defaultPython(),
                                     opts: MutualOptions = DEFAULTS): Promise<'started' | 'already' | 'failed'> {
   const running = await harnessRunning()
   if (running) return 'already'
@@ -143,10 +149,21 @@ export async function ensureHarness(python = 'python',
         windowsHide: true,
         detached: true,
         stdio: 'ignore',
-        // issue #12 同类：锚定插件仓根 + PYTHONPATH，与 mdcg_client / token_store
-        // 同口径——不随宿主 cwd 漂移；harness 包不在仓内时注入不劣化（回落用户环境）。
-        cwd: repoRoot(),
-        env: { ...process.env, PYTHONPATH: pythonPathValue() },
+        // 同 mdcg_client：cwd 必须在包外（否则 pnpm 更新时 rmdir 包目录被 Windows
+        // 拒绝 → ERR_PNPM_EBUSY）；模块解析由 PYTHONPATH 保证，见 datapath.runRoot()。
+        cwd: runRoot(),
+        // 两条编码注入与 mdcg_client.mdcgChildEnv() 同口径（2026-09-20 v15-9）：
+        // 本站点此前只给 PYTHONPATH，是「唯一构造点」主张下**未表态**的 Python 站点
+        // （v15b 结构扫描：Python 目标 3 站点、走构造点 0 个、两条编码变量全缺 2 个）。
+        // 此处**不引** mdcgChildEnv()：它构造的是 md_cg 子进程环境（带 MDCG_ROOT /
+        // MDCG_MCP_SURFACE / MDCG_MCP_* 等，对 harness.guardian 无意义）；只对齐编码口径。
+        // 站点表态由 test/python-utf8-mode.test.ts ④（站点扫描）机械守护。
+        env: {
+          ...process.env,
+          PYTHONPATH: pythonPathValue(),
+          PYTHONUTF8: '1',
+          PYTHONIOENCODING: 'utf-8',
+        },
       })
     } catch (e) {
       log(opts, `守护失败：${String(e)}`)
@@ -370,7 +387,7 @@ export function installMutualMaintenance(
     try {
       writeHeartbeat(opts)
       // 守护 A：harness 不在 → 拉起
-      ensureHarness('python', opts).then((r) => {
+      ensureHarness(defaultPython(), opts).then((r) => {
         if (r === 'started') ctx.logger.info(`mutual: 已拉起 A 侧 harness（${r}）`)
       })
       // 读 A 戳分级判定

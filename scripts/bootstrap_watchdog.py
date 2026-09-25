@@ -46,6 +46,7 @@ try:
 except Exception:                                   # 兜底
     class _dp:                                      # type: ignore
         @staticmethod
+# 生效条件：无入参的 staticmethod，恒返回 os.path.join(BRAIN, "data")，结果只由模块级常量 BRAIN 决定，不读取任何环境变量或 argv。
         def data_root() -> str:
             return os.path.join(BRAIN, "data")
 
@@ -63,6 +64,7 @@ HEALTHY_ROUNDS = ("bootstrap_v2", "loop_start", "csre_rebuild")
 DEGRADED_ROUNDS = ("loop_error", "csre_rebuild_error")
 
 
+# 生效条件：无入参；LINGSHU_PYTHON 环境变量为非空串且 os.path.isfile(env) 为真时返回该值，否则当 sys.executable 非空且其 basename 含 "python" 时返回 sys.executable，否则按 LOCALAPPDATA 拼出的 Programs\Python\Python3*\python.exe 与 [系统盘]:\Python3*\python.exe 两个 glob 取 reverse 排序后首命中返回，两个模式均无命中时返回 cur or "python"（cur 为空串则回落 "python"）。
 def resolve_python() -> str:
     """选定拉起循环用的解释器。
 
@@ -77,7 +79,7 @@ def resolve_python() -> str:
         return cur
     la = os.environ.get("LOCALAPPDATA", "")
     for pat in (os.path.join(la, "Programs", "Python", "Python3*", "python.exe"),
-                r"C:\Python3*\python.exe"):
+                r"[系统盘]:\Python3*\python.exe"):
         hits = sorted(glob.glob(pat), reverse=True)
         if hits:
             return hits[0]
@@ -87,6 +89,7 @@ def resolve_python() -> str:
 PY = resolve_python()
 
 
+# 生效条件：evt 须支持 evt["ts"] 键赋值（该赋值在 try 之外，非映射类型会直接抛 TypeError），随后把 evt 以 json.dumps(ensure_ascii=False) 追加一行写入 WLOG；open/write 抛任何异常都只被 except 静默吞掉，函数返回 None。
 def log_watch(evt: dict) -> None:
     evt["ts"] = _dt.datetime.now().strftime(TS_FMT)
     try:
@@ -96,6 +99,7 @@ def log_watch(evt: dict) -> None:
         pass
 
 
+# 生效条件：n 默认取 6，先读 LOG 中 strip 后非空的行的后 n 条（n=0 时 lines[-0:] 等价 lines[0:]，返回全部非空行），逐行 json.loads，解析失败的行 continue 跳过、成功行按原顺序进 out；LOG 打开或读取抛异常时返回 []。
 def read_tail(n: int = 6) -> list:
     """读循环日志末 n 条（解析失败的行跳过）。"""
     try:
@@ -112,6 +116,7 @@ def read_tail(n: int = 6) -> list:
         return []
 
 
+# 生效条件：无入参，先取 read_tail(1)；末条列表为空时返回 (None, None)，否则对 last.get("ts", "") 按 TS_FMT strptime（缺 "ts" 键取到空串）成功则返回 (epoch_ts, last)，strptime 抛异常时返回 (None, None)。
 def last_log_ts() -> tuple[float | None, dict | None]:
     """读循环日志末条记录，返回 (epoch_ts, 原始行 dict)。"""
     tail = read_tail(1)
@@ -125,6 +130,7 @@ def last_log_ts() -> tuple[float | None, dict | None]:
         return None, None
 
 
+# 生效条件：无入参，对 read_tail(20) 逆序扫描，evt.get("round") 属于 DEGRADED_ROUNDS 时 n 加一、属于 HEALTHY_ROUNDS 时 break 终止扫描、其他 round（如 gap_watch）既不计数也不打断，返回累计 n（首条即健康或无匹配时为 0）。
 def consecutive_degraded() -> int:
     """末尾连续「错误类轮次」计数——内容级判据。"""
     n = 0
@@ -137,6 +143,7 @@ def consecutive_degraded() -> int:
     return n
 
 
+# 生效条件：无入参，按序收集 os.path.isdir(WISDOM) 为假时的 WISDOM、os.path.isfile(BOOTSTRAP) 为假时的 BOOTSTRAP、WISDOM 下 wisdom-book-cloud.db 的 os.path.isfile 为假时的该路径，返回 miss（三者均通过时为 []）。
 def missing_paths() -> list:
     """关键路径缺失检查——这类故障重启无用，须人工介入。"""
     miss = []
@@ -150,6 +157,7 @@ def missing_paths() -> list:
     return miss
 
 
+# 生效条件：无入参，用 wmic 列出名字含 python 的进程后，仅对 stdout 中含 "bootstrap_loop.py" 的行以行尾数字正则提取 pid，匹配到才追加 {"pid","cmd"}；subprocess.run 或解析抛异常时静默返回空 procs。
 def find_bootstrap_procs() -> list:
     """仅按命令行匹配 bootstrap_loop.py 的 python 进程。
 
@@ -158,26 +166,35 @@ def find_bootstrap_procs() -> list:
     \\r 干扰 PID 提取，一律 python re 提取（2026-08-31 教训固化）。
     """
     procs = []
+    errors = []
+    ps_cmd = (
+        "Get-CimInstance Win32_Process | "
+        "Where-Object Name -like '*python*' | "
+        "Select-Object ProcessId,CommandLine  | "
+        "ConvertTo-Csv -NoTypeInformation"
+    )
     try:
         out = subprocess.run(
-            ["wmic", "process", "where", "name like '%python%'",
-             "get", "processid,commandline", "/format:csv"],
+            ["powershell", "-NoProfile", "-Command", ps_cmd],
             capture_output=True, text=True, timeout=30,
             encoding="utf-8", errors="replace")
-        import re
-        pat = re.compile(r"(\d+)\s*$")
-        for line in out.stdout.splitlines():
-            if "bootstrap_loop.py" not in line:
-                continue
-            m = pat.search(line.strip())
-            if m:
-                procs.append({"pid": m.group(1),
-                              "cmd": line.strip()[:200].replace("\r", "")})
-    except Exception:
-        pass
+        if out.returncode != 0:
+            errors.append("powershell rc=%s" % out.returncode)
+        import csv as _csv, io as _io
+        for row in _csv.reader(_io.StringIO(out.stdout)):
+            if len(row) >= 2 and "bootstrap_loop.py" in row[1]:
+                procs.append({"pid": row[0], "cmd": row[1][:200]})
+    except Exception as exc:
+        errors.append("%s: %s" % (type(exc).__name__, exc))
+    if procs:
+        return procs
+    if errors:
+        return None
     return procs
 
 
+
+# 生效条件：procs 为可迭代列表，逐项以 p["pid"] 执行 taskkill /F /PID（p 缺 "pid" 键或 taskkill 调用抛异常的项被 except 吞掉后继续下一项），procs 为空则不做任何动作并返回 None。
 def kill_procs(procs: list) -> None:
     for p in procs:
         try:
@@ -187,6 +204,7 @@ def kill_procs(procs: list) -> None:
             pass
 
 
+# 生效条件：check_only 为真值时直接返回 {'action':'would_restart','cmd':[PY, BOOTSTRAP, '--interval', '600']}；为假值时以 env 中 GAP_DEBUG="1"、cwd=BRAIN 的 Popen 拉起同一命令行，sleep 6 秒后用 last_log_ts() 判断末条 round 是否为 'loop_start'，返回 action='restarted' 带 proc.pid 与 verify（loop_start_seen / no_loop_start_yet），Popen 等抛异常则返回 action='restart_failed' 与截断 200 字的 error。
 def restart(check_only: bool) -> dict:
     """拉起 bootstrap_loop（与设计一致：--interval 600, GAP_DEBUG=1）。"""
     env = dict(os.environ)
@@ -195,11 +213,17 @@ def restart(check_only: bool) -> dict:
     if check_only:
         return {"action": "would_restart", "cmd": cmd}
     try:
+        # P2-24（批次 30）：旧写法把 subprocess.DEVNULL(-3) 当 creationflags
+        # 传给 POSIX 分支（明显笔误，POSIX 上报错）——跨平台正确写法：
+        # Windows 用 DETACHED_PROCESS|CREATE_NO_WINDOW，POSIX 用
+        # start_new_session 脱离会话组。
+        _nt = os.name == "nt"
         proc = subprocess.Popen(
             cmd, cwd=BRAIN, env=env, stdout=subprocess.DEVNULL,
             stderr=subprocess.DEVNULL,
-            creationflags=subprocess.DEVNULL if os.name != "nt"
-            else (subprocess.DETACHED_PROCESS | subprocess.CREATE_NO_WINDOW))
+            creationflags=(subprocess.DETACHED_PROCESS
+                           | subprocess.CREATE_NO_WINDOW) if _nt else 0,
+            start_new_session=not _nt)
         # 等 6s 验证 loop_start 落地
         time.sleep(6)
         ts, last = last_log_ts()
@@ -211,6 +235,7 @@ def restart(check_only: bool) -> dict:
         return {"action": "restart_failed", "error": str(e)[:200]}
 
 
+# 生效条件：无入参，从 sys.argv 读 --interval（默认 600）与 --check-only（store_true），按序分支：关键路径缺失→status=config_error 返 3；末条日志 ts 不可解析→no_log 返 1；日志年龄 ≤ 2*interval+GRACE 且 consecutive_degraded() ≥ DEGRADE_LIMIT→degraded，仅在 find_bootstrap_procs() 非空且非 check_only 时 kill 后 restart(False)，action 为 restarted 记 recovered，返 0（degraded/recovered）否则 2；年龄 ≤ 上限→alive 返 0；否则按进程有无（stale_running/not_running）非 check_only 时 kill，再 restart(check_only)，restarted/would_restart 记 recovered/would_recover 返 0、其余记 recover_failed 返 2。
 def main() -> int:
     ap = argparse.ArgumentParser(description="bootstrap_loop 停转检测与守护 v2")
     ap.add_argument("--interval", type=int, default=600)
@@ -248,6 +273,13 @@ def main() -> int:
     # ① 内容级判据优先于新鲜度：新鲜但持续报错 → degraded，不报 alive
     if age <= stale_limit and deg >= DEGRADE_LIMIT:
         procs = find_bootstrap_procs()
+        if procs is None:
+            report.update({"status": "degraded",
+                           "proc_status": "probe_unknown",
+                           "detail": "探测失败（未知）——不 kill 不 restart（P2-14 fail-safe）"})
+            log_watch(report)
+            print(json.dumps(report, ensure_ascii=False))
+            return 2
         report.update({"status": "degraded", "proc_status":
                        "running" if procs else "not_running",
                        "procs": [{"pid": p["pid"]} for p in procs],
@@ -273,6 +305,13 @@ def main() -> int:
 
     # ③ 停转：查进程后恢复
     procs = find_bootstrap_procs()
+    if procs is None:
+        report.update({"status": "probe_unknown",
+                       "detail": "判活探测失败（未知）——本轮跳过 kill/restart，"
+                                 "防止 probe 失败被当成确认死亡而反复重启叠加进程（P2-14 根因）"})
+        log_watch(report)
+        print(json.dumps(report, ensure_ascii=False))
+        return 2
     report["procs"] = [{"pid": p["pid"]} for p in procs]
     if procs:
         report["proc_status"] = "stale_running"

@@ -52,11 +52,13 @@ SEG_SPLIT = re.compile(r"([，。；：、,;.!?！？\s]+)")
 
 # --------------------------------------------------------------------------- 数据
 
+# 生效条件：按 path（默认模块常量 DATA）以 utf-8 打开文件逐行 json.loads，仅保留 l.strip() 为真的行，返回解析出的记录列表。
 def load_rows(path=DATA):
     with open(path, encoding="utf-8") as f:
         return [json.loads(l) for l in f if l.strip()]
 
 
+# 生效条件：以 root（默认模块常量 ROOT）建 MdCGOS，rows 为假值（None/空容器）时回落 load_rows() 取数据，逐行用 r["id"] 与 r["text"] 调 add，仅当 r["id"] 已在构建开始时取的 cg.index["nodes"] 快照 have 中才 continue（该快照不随新增 id 更新），verbose 假值则不打印，最后 cg.flush() 并返回 cg。
 def build(root=ROOT, rows=None, verbose=True):
     """把数据集写进 md 认知图（幂等：同 id 覆盖）。"""
     rows = rows or load_rows()
@@ -81,6 +83,7 @@ def build(root=ROOT, rows=None, verbose=True):
 
 # --------------------------------------------------------------------- 查询构造
 
+# 生效条件：遍历 SYNONYM_GROUPS_WEIGHTED 每组，按权重降序找第一个出现在当前 out（初值 text，可能已被前组改写）里的词 w，若组内除 w 外还有词则用其中权重最大者 alt 执行一次 out.replace(w, alt, 1) 且 hits+1，随后 break 该组；返回 (out, hits)。
 def paraphrase(text):
     """按加权同义词组做一次同义/泛化改写，返回 (改写后, 替换次数)。
 
@@ -99,6 +102,7 @@ def paraphrase(text):
     return out, hits
 
 
+# 生效条件：text 经 SEG_SPLIT.split 后剔除空白项与分隔符本身得 parts，len(parts)<=1 时原样返回 text，否则按 rng.random() < keep_p（默认 0.5；keep_p 为 0 时全被丢弃）保留片段，若一条未留则回退 [parts[0]]，返回拼接串。
 def drop_segments(text, rng, keep_p=0.5):
     """随机丢弃约一半语义片段（模拟「记得不全」）。"""
     parts = [p for p in SEG_SPLIT.split(text)
@@ -111,6 +115,7 @@ def drop_segments(text, rng, keep_p=0.5):
     return "".join(kept)
 
 
+# 生效条件：rows 中 r.get("label")=="signal" 且 r.get("text") 为真的行入选，n 为真值且 n < len(sig) 时才用 random.Random(seed) 抽 n 条（n=0 等假值不抽样），每条产生 orig/head/drop 三条查询，仅在 paraphrase(t[:60]) 的 hits 非零时追加 para 查询，返回 qs。
 def make_queries(rows, n=250, seed=7):
     """从 signal 条目构造查询集（多模式）。"""
     sig = [r for r in rows if r.get("label") == "signal" and r.get("text")]
@@ -131,11 +136,13 @@ def make_queries(rows, n=250, seed=7):
 
 # ----------------------------------------------------------------------- 评测
 
+# 生效条件：传入 cg 后把 cg._read 换成按 entry["path"] 缓存的闭包（该 path 未命中才调用原 _read），返回该 cache 字典。
 def install_read_cache(cg):
     """评测是只读的：把节点文件读进内存，避免每次检索重复 1000 次磁盘 I/O。"""
     cache = {}
     orig = cg._read
 
+# 生效条件：entry["path"] 不在闭包 cache 中时调用 orig(entry) 存入该键，随后返回 cache[p]（同一 path 后续命中直接取缓存）。
     def _cached(entry):
         p = entry["path"]
         if p not in cache:
@@ -146,6 +153,7 @@ def install_read_cache(cg):
     return cache
 
 
+# 生效条件：对 queries 每条 item 以 cg.search_rrf(item["q"], k=k, paths=arm, judge=False, record=False, path_weights=path_weights, recall_only=recall_only, fusion=fusion) 取结果，rank 记 item["target"] 在返回 ids 中的 1 基位次（不在 ids 中记 0），逐条追加明细后返回 out。
 def run_arm(cg, queries, arm, k=10, path_weights=None, recall_only=None,
             fusion="sum"):
     """跑一臂，返回 per-query 明细。"""
@@ -167,6 +175,7 @@ def run_arm(cg, queries, arm, k=10, path_weights=None, recall_only=None,
     return out
 
 
+# 生效条件：对 queries 每条以 cg.search_rrf(item["q"], k=k, paths=(path,)) 单路取结果，rank 记 item["target"] 的 1 基位次（未命中记 0），fuzzy_hit 恒为 False、expand_source 恒为 None，返回 out。
 def run_single(cg, queries, path, k=10):
     """单路独立排序（用于诊断每路的自身质量）。"""
     out = []
@@ -181,6 +190,7 @@ def run_single(cg, queries, path, k=10):
     return out
 
 
+# 生效条件：rows 为空时返回 None；否则按 n=len(rows) 算 self@1、self@k（0<rank<=k，k 由形参给定）、mrr（仅 rank 非 0 行取 1/rank 再除 n）与标签占比（分母 sum(lab.values()) or 1，无标签时用 1），fuzzy_prov 在 hit_rows 为空时记 0.0。
 def summarize(rows, k=10):
     """汇总一个查询模式的指标。"""
     n = len(rows)
@@ -203,10 +213,12 @@ def summarize(rows, k=10):
     }
 
 
+# 生效条件：把 x 乘 100 后按 5 位宽保留一位小数加百分号返回，源码未对 x 做类型或范围校验。
 def _pct(x):
     return f"{x * 100:5.1f}%"
 
 
+# 生效条件：r4 长度为 0 时返回 {}；否则以 seed 建 rng，对 (1,"self@1") 与 (k,f"self@{k}") 由 r4/r5 的 0<rank<=kk 命中向量算 b01/b10，m=b01+b10 为 0 时 p=1.0 否则取 McNemar 精确单侧和除以 2**m，并用 n_boot 次有放回重采样取 deltas[int(0.025*n_boot)] 与 deltas[int(0.975*n_boot)-1] 为 ci，另加 MRR 键（b01/b10/p 与 ci 均为 None）后返回。
 def paired_test(r4, r5, k=10, seed=0, n_boot=5000):
     """配对显著性：bootstrap 95% CI + McNemar 精确单侧 p（H1: 五路更好）。"""
     from math import comb
@@ -237,6 +249,7 @@ def paired_test(r4, r5, k=10, seed=0, n_boot=5000):
     return out
 
 
+# 生效条件：scopes 以 ("全合并", r4, r5) 起头，仅当某模式在 r4 中有条目时才追加该模式（orig/head/para/drop）的 (模式名, 筛选后 a, 筛选后 b)；对每个 scope 用 k、seed 调 paired_test 并逐项打印 self@1、self@k、MRR 的 delta/ci/b01-b10/p，函数本身不返回值。
 def print_sig(r4, r5, qs, k=10, seed=0):
     """按查询模式 + 全模式合并，打印配对显著性。"""
     print(f"\n配对显著性（五路 − 四路，配对 bootstrap 5000 次 + McNemar 精确单侧）")
@@ -260,6 +273,7 @@ def print_sig(r4, r5, qs, k=10, seed=0):
         print("-" * 66)
 
 
+# 生效条件：把 cg._path_fuzzy 换成闭包，原结果按分数降序取前 50 后用 random.Random(seed) 打乱并改写为递减伪分；本函数自身无 return。
 def patch_shuffled_fuzzy(cg, seed=0):
     """把 fuzzy 路**候选集保留、内部顺序打乱**（对照：区分「候选集贡献」与「排序质量贡献」）。
 
@@ -269,6 +283,7 @@ def patch_shuffled_fuzzy(cg, seed=0):
     rng = random.Random(seed)
     orig = cg._path_fuzzy
 
+# 生效条件：以 (query, entries, context, expand=expand) 调用原 _path_fuzzy，结果按分数降序取前 50 条，用闭包 rng 打乱后改写为递减伪分 (node, float(n-i))，返回 (out, str(src)+"+shuffled")。
     def _shuf(query, entries, context=None, expand=None):
         out, src = orig(query, entries, context, expand=expand)
         out = sorted(out, key=lambda x: -x[1])[:50]      # fuzzy 真实候选集
@@ -280,10 +295,12 @@ def patch_shuffled_fuzzy(cg, seed=0):
     cg._path_fuzzy = _shuf
 
 
+# 生效条件：把 cg._path_fuzzy 换成忽略 context/expand、对 cg._read_many 全量条目按 random.Random(seed) 随机分降序排序的闭包；本函数自身无 return。
 def patch_random_path(cg, seed=0):
     """把第 5 路替换为**全库随机排序**（对照：max 融合机制本身能带来多少增益）。"""
     rng = random.Random(seed)
 
+# 生效条件：忽略 context 与 expand，对 cg._read_many(entries, stat) 的每条记录用 rng.random() 打分并降序排序，节点 id 取 fm.get("id") or e["path"]，返回 (out, "random")。
     def _rand(query, entries, context=None, expand=None):
         stat = {"scanned": 0}
         out = []
@@ -296,6 +313,7 @@ def patch_random_path(cg, seed=0):
     cg._path_fuzzy = _rand
 
 
+# 生效条件：不使用 cg，直接把 md_cg.mdcos.GLOBAL_CAP 置为 10**9 并返回该值。
 def patch_symmetric_pool(cg):
     """【2026-09-16 起已冗余】抬高 GLOBAL_CAP，让 lexical 与 fuzzy 候选池对称。
 
@@ -311,6 +329,7 @@ def patch_symmetric_pool(cg):
     return _m.GLOBAL_CAP
 
 
+# 生效条件：把 cg._lexical 换成先 cg._read_many(entries, stat) 全量读入、再 cg._score(docs, query, bigrams(query)) 打分的闭包；本函数自身无 return。
 def patch_lexical_full(cg):
     """让 lexical 也对**全量候选池**打分（消除「扫描范围」差异，只留排序算法差异）。
 
@@ -320,6 +339,7 @@ def patch_lexical_full(cg):
     """
     from md_cg.mdcg import bigrams
 
+# 生效条件：entries 经 cg._read_many(entries, stat) 全量读入后交给 cg._score(docs, query, bigrams(query)) 打分并返回其结果。
     def _lex(query, entries, stat):
         docs = cg._read_many(entries, stat)
         return cg._score(docs, query, bigrams(query))
@@ -327,12 +347,14 @@ def patch_lexical_full(cg):
     cg._lexical = _lex
 
 
+# 生效条件：把 cg._read 包装为仅当原 _read 返回的 fm 是 dict 时覆写 fm["importance"]=0.5（非 dict 不修改），返回 (fm, c)；本函数自身无 return。
 def patch_zero_importance(cg):
     """抹掉 importance：数据集里 signal 的 importance 系统性偏高（≈0.6），
     而 search_rrf 用 (-score, -importance) 做同分 tie-break → 会泄漏 label。
     """
     orig = cg._read
 
+# 生效条件：orig(entry) 返回的 fm 是 dict 时把 fm["importance"] 设为 0.5（非 dict 不修改），返回 (fm, c)。
     def _z(entry):
         fm, c = orig(entry)
         if isinstance(fm, dict):
@@ -342,6 +364,7 @@ def patch_zero_importance(cg):
     cg._read = _z
 
 
+# 生效条件：cg 与 qs 均须可用；内部先经 cg._candidates() 取候选池、cg._read_many 读正文，再按每题 query terms 统计 _like 命中数；只打印诊断（含 GLOBAL_CAP 与截断计数）并返回 None，不改库；
 def pool_diag(cg, qs):
     """候选池对称性诊断：lexical 的 LIKE 命中数是否真的被 GLOBAL_CAP 截断。"""
     from md_cg import mdcos as _m
@@ -364,6 +387,7 @@ def pool_diag(cg, qs):
     return 0
 
 
+# 生效条件：cg.search_rrf 可用、queries 每项含 q/target/mode 时，对目标未列首的题打印顶替者与目标在 ARM5 各单路的排名，最多打印 limit 例。
 def diag_failures(cg, queries, k=10, arm=ARM5, limit=6, path_weights=None):
     """打印失败案例：谁把目标挤掉了、目标在单路里排第几。"""
     print(f"\n失败案例诊断（{'+'.join(arm)}，Top-{k} 未把目标排第一）")
@@ -395,6 +419,7 @@ def diag_failures(cg, queries, k=10, arm=ARM5, limit=6, path_weights=None):
         print("  （无失败案例）")
 
 
+# 生效条件：args.ablate=="pool" 时直接返回 pool_diag(cg, qs)；=="idcheck" 时对四路 sum 与四路 max 逐条比较 rank/labels 并打印差异数后返回 0；其余取值时先算四路基线与五路 fuzzy max 基线，再按 =="shuffle" 调 patch_shuffled_fuzzy、否则调 patch_random_path 做扰动臂，打印三臂指标后返回 0（k 取 args.k）。
 def ablate(cg, qs, args):
     """对照实验：分离「候选集贡献」「排序质量贡献」「融合机制红利」。"""
     k = args.k
@@ -438,6 +463,7 @@ def ablate(cg, qs, args):
     return 0
 
 
+# 生效条件：argv 经 argparse 解析（--n/--k/--seed/--rebuild/--per-path/--sweep/--diag/--ablate/--sympool/--fusion/--lexfull/--zero-importance 等）；外部数据集缺失即抛异常、不静默降级；返回进程退出码；
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--n", type=int, default=250, help="抽样 signal 条数（0=全量）")

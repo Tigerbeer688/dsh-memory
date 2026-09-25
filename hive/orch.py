@@ -32,7 +32,7 @@ fail-closed（本文件的硬纪律，不降级）
 ----------------------------------------------------------------------------
   · 令牌缺失 / 不可用 → 立即写 result 并退出，**绝不**降级为 recorder 身份继续
     跑：静默降级 = 权限意图落空且不可见（第 4 条明令禁止的静默错执行）。
-  · 子任务 tools 只允许 lingshu_cg / web_search（编排工具不传给子代理）。
+  · 子任务 tools 只允许 lingshu_cg / web_search / read_file（编排工具不传给子代理）。
   · 子任务 spec **不可能**带 orchestrate（走白名单构造 + 本文件不构造该键）
     → 结构上防无限递归。
   · read_full 只允许读**本编排者派发的**子任务（越权读被拒）。
@@ -45,6 +45,7 @@ fail-closed（本文件的硬纪律，不降级）
 """
 from __future__ import annotations
 
+import hashlib
 import json
 import os
 import sys
@@ -66,21 +67,39 @@ FULL_MAX_CHARS = 20000          # read_full 单次默认上限（超出给头 + 
 DEFAULT_MAX_SUBTASKS = 8        # 单 job 子任务上限（spec.orchestrate.max_subtasks 可调）
 CHILDREN_FILE = "_children.json"
 TERMINAL_STATES = ("done", "error", "timeout", "killed")
-SUB_TOOLS_ALLOW = ("lingshu_cg", "web_search")   # 子代理可用工具（编排工具不外传）
-ORCH_TOOLS = ("spawn_subtask", "poll_subtasks", "read_full")
+SUB_TOOLS_ALLOW = ("lingshu_cg", "web_search", "read_file")   # 子代理可用工具（编排工具不外传；read_file 只读）
+ORCH_TOOLS = ("spawn_subtask", "poll_subtasks", "read_full", "record_adjudication")
+_ADJ_FILE = "_adjudication.jsonl"     # M5 纠正链侧车（job 目录内，随 job 留痕）
+_ADJ_KINDS = ("supersede", "reject", "confirm")
+
+
+# 生效条件：给定 model 与 context_files 列表，返回同源组键 = model + 排序后归一文件清单的 SHA1 前 8 位；同 context_files+同 model 的子任务同组（M5 同源标记，供纠正链裁决识别孪生来源）。
+def _source_group(model: str, context_files) -> str:
+    norm = "\x00".join(sorted(str(p) for p in (context_files or [])))
+    h = hashlib.sha1(f"{model}\x00{norm}".encode("utf-8")).hexdigest()[:8]
+    return f"sg_{h}"
 
 ORCH_SYSTEM_PROMPT = """你是蜂巢**编排者**（orchestrator），不是执行者。职责：
 1. 拆解：把任务切成可独立完成的子任务 → `spawn_subtask`（毫秒即返，**不要等**，继续拆下一个）
 2. 观察：`poll_subtasks` 轮询进度。子任务卡片默认只给正文头 200 字 + 工具轨迹摘要；
    需要核对细节时用 `read_full(job_id)` 按需拉取，不要凭标题猜测结论
-3. 收口：全部终态后汇总——核对证据、必要时用 `lingshu_cg`(op=review) 裁决冲突、
-   给出一份自足结论；可归档时用 `lingshu_cg`(op=write, layer=knowledge)
+3. 收口：全部终态后汇总——核对证据、给出一份自足结论；冲突以证据比对后
+   如实留痕（`lingshu_cg`(op=write, layer=contextual) 描述分歧点），**裁决归
+   设计者**（编排器令牌无 review 裁决权，can_admin=False 是安全收紧的设计行为）；
+   可归档时用 `lingshu_cg`(op=write, layer=knowledge)
 
 纪律：
 - 能并行的就一次派多个，不要串行等待
 - 子任务 prompt 必须**自足**（子代理看不到你的上下文，也不能再派发子任务）
-- 不要替子任务干活；你自己只在需要查/写记忆或裁决时调用 lingshu_cg
+- 不要替子任务干活；你自己只在需要查/写记忆或裁决时调用 lingshu_cg，
+  需要核对本地文件时用 read_file（只读）
+- **写后回读（必做）**：lingshu_cg(op=write) 返回后，必须以 op=read 按返回的
+  节点 id 回读，核对正文已真实落盘（**不信返回的 written 计数**——多实例下
+  计数可能与盘面不一致）；不一致重试 1 次，再失败如实报 error，不静默
 - 冲突以**证据**裁决，不以多数票；证据不足就如实说「未定」，不要编造
+- 子任务结果间有纠正/否决/确认关系时，用 `record_adjudication` 留痕
+  （台账随本任务目录归档，跨任务可回溯）；同 source_group 的孪生结果
+  收口时要点名比对，不以「结果一致」代替核对
 - 子任务失败要如实汇报失败原因，不要用其它子任务的结果顶替"""
 
 
@@ -90,6 +109,8 @@ class OrcError(Exception):
 
 # --------------------------------------------------------------- 工具 schema
 
+# 生效条件：调用即返回 spawn_subtask 工具的 OpenAI function schema（声明
+# job/depends_on/model 等参数面——编排器派生子任务的白名单入口）。
 def _spawn_schema() -> dict:
     return {
         "type": "function",
@@ -97,8 +118,9 @@ def _spawn_schema() -> dict:
             "name": "spawn_subtask",
             "description": (
                 "派发一个子代理任务（毫秒即返，不阻塞）。子任务在蜂巢 worker 池并发执行；"
-                "用 poll_subtasks 看进度、read_full 读细节。子代理可带 lingshu_cg（记忆）"
-                "与 web_search（联网）工具，但不能再派发子任务。"),
+                "用 poll_subtasks 看进度、read_full 读细节。子代理可带 lingshu_cg（记忆）、"
+                "web_search（联网）与 read_file（读本地文件/目录，只读）工具，"
+                "但不能再派发子任务。"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -110,8 +132,8 @@ def _spawn_schema() -> dict:
                     "context_files": {"type": "array", "items": {"type": "string"},
                                       "description": "要注入子代理的文件路径（相对/绝对）"},
                     "tools": {"type": "array", "items": {"type": "string"},
-                              "description": "只能是 lingshu_cg / web_search 的子集；"
-                                             "缺省=两者都给（编排工具不外传）"},
+                              "description": "只能是 lingshu_cg / web_search / read_file 的子集；"
+                                             "缺省=三者都给（编排工具不外传）"},
                     "timeout_s": {"type": "integer", "description": "缺省 600"},
                     "context_budget_tokens": {"type": "integer", "description": "缺省 200000"},
                     "reasoning_effort": {"type": "string", "description": "缺省 high"},
@@ -122,6 +144,8 @@ def _spawn_schema() -> dict:
     }
 
 
+# 生效条件：调用即返回 poll_subtasks 工具的 OpenAI function schema（声明
+# 子任务 id 列表参数——编排者拉取子任务进度的观测面）。
 def _poll_schema() -> dict:
     return {
         "type": "function",
@@ -129,7 +153,8 @@ def _poll_schema() -> dict:
             "name": "poll_subtasks",
             "description": (
                 "查看子任务状态与卡片：默认只给 content_head 200 字 + tool_trace 摘要 + "
-                "result_path（细节用 read_full）。不传 job_ids = 本编排者派发的全部子任务。"),
+                "result_path（细节用 read_full）。不传 job_ids = 本编排者派发的全部子任务；"
+                "显式传 id 只允许本编排者派发的子任务（未知/越权 id 整体拒绝）。"),
             "parameters": {
                 "type": "object",
                 "properties": {
@@ -143,6 +168,8 @@ def _poll_schema() -> dict:
     }
 
 
+# 生效条件：调用即返回 read_full 工具的 OpenAI function schema（声明节点 id
+# 参数——子代理按需读 L2 细节层的最小充分出口）。
 def _read_full_schema() -> dict:
     return {
         "type": "function",
@@ -163,10 +190,46 @@ def _read_full_schema() -> dict:
     }
 
 
+# 生效条件：调用即返回 record_adjudication 工具的 OpenAI function schema——
+# 强制字段（kind/supersede/evidence 等）fail-closed 校验的声明面（M5 纠正链）。
+def _adjudication_schema() -> dict:
+    """M5 纠正链侧车：裁决留痕工具（强制字段 fail-closed）。"""
+    return {
+        "type": "function",
+        "function": {
+            "name": "record_adjudication",
+            "description": (
+                "纠正链裁决留痕（M5）：对子任务结果间的纠正/否决/确认关系"
+                "落一份裁决台账（_adjudication.jsonl），供跨 job 配对回溯。"
+                "全部字段强制，缺一即拒（fail-closed）。裁决权边界："
+                "kind=confirm 仅确认无冲突；supersede/reject 需 evidence "
+                "给出被纠正方的 job_id 与依据。"),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "kind": {"type": "string",
+                             "enum": list(_ADJ_KINDS),
+                             "description": "supersede=以新代旧 / reject=否决 / "
+                                            "confirm=确认无冲突"},
+                    "subject": {"type": "string",
+                                "description": "被裁决的子任务 job_id"},
+                    "evidence": {"type": "array", "items": {"type": "string"},
+                                 "description": "裁决依据的 job_id 列表"
+                                                "（含 subject 自身之外的证据源）"},
+                    "verdict_note": {"type": "string",
+                                     "description": "一句话裁决理由（不得为空）"},
+                },
+                "required": ["kind", "subject", "evidence", "verdict_note"],
+            },
+        },
+    }
+
+
 ORCH_SCHEMAS = {
     "spawn_subtask": _spawn_schema(),
     "poll_subtasks": _poll_schema(),
     "read_full": _read_full_schema(),
+    "record_adjudication": _adjudication_schema(),
 }
 
 
@@ -182,10 +245,12 @@ _CFG = {
 }
 
 
+# 生效条件：无入参，模块级常量 CHILDREN_FILE 与 _CFG['job_dir'] 可用时返回 os.path.join(_CFG['job_dir'], CHILDREN_FILE)。
 def _children_path() -> str:
     return os.path.join(_CFG["job_dir"], CHILDREN_FILE)
 
 
+# 生效条件：无入参，读取 _children_path()（由模块级 CHILDREN_FILE 拼接）成功且 JSON 的 data.get('children') 为真值时返回 list(data['children'])，否则（OSError/ValueError 或 children 为 None/空/假值）返回 []。
 def _load_children() -> list:
     """读回子任务清单。
 
@@ -200,6 +265,7 @@ def _load_children() -> list:
         return []
 
 
+# 生效条件：无入参，当 _CFG['children'] 可被 json.dump 时写临时文件并 os.replace 到 _children_path()，OSError 被吞，函数总返回 None。
 def _save_children() -> None:
     try:
         tmp = _children_path() + ".tmp"
@@ -212,6 +278,7 @@ def _save_children() -> None:
 
 # ------------------------------------------------------------- 身份（Q3 落地）
 
+# 生效条件：无入参，环境变量 HIVE_ORCH_TOKEN 去空白后非空则返回该值；否则读 HIVE_ORCH_TOKEN_FILE 去空白后非空才尝试打开并返回文件内容 strip 值，path 为空串则返回 ''，打开 OSError 抛 OrcError。
 def _read_token() -> str:
     tok = (os.environ.get("HIVE_ORCH_TOKEN") or "").strip()
     if tok:
@@ -226,6 +293,7 @@ def _read_token() -> str:
         raise OrcError(f"读令牌文件失败：{path}（{e}）")
 
 
+# 生效条件：job_id 提供且 _read_token() 返回非空令牌、verify_token(tok) 返回非 None principal 时，设置 principal.session=f"hive_orch_{job_id}" 并尽力设 principal.harness="hive-orch"，返回 principal；令牌缺失、校验抛异常或 principal 为 None 均抛 OrcError。
 def load_principal(job_id: str):
     """读派生令牌 → Principal（fail-closed：任何失败抛 OrcError）。
 
@@ -259,6 +327,7 @@ def load_principal(job_id: str):
 
 # ------------------------------------------------------------------ 卡片视图
 
+# 生效条件：job_id 指向 _CFG['jobs'] 下任务，full 缺省 False 用 CARD_CHARS 截断（True 则不截断）；view 为空时按 state 是否在 TERMINAL_STATES 填 hint 后返回，view 含 content_head 时填 card['content_head'] 与 card['content_truncated']=True，否则填 card['content']=view.get('content')，并透传 view 中 ok/need_continue/handoff_ready/error_code/usage，card['tool_calls']=len(view.get('tool_trace') or [])，tool_trace_brief 取 trace[-TRACE_MAX:] 的 tool/ok/brief。
 def _card(job_id: str, full: bool = False) -> dict:
     """子任务卡片（Q2）：正文头 + 工具轨迹摘要 + 指针；full=True 时不截断。"""
     jobs = _CFG["jobs"]
@@ -271,6 +340,11 @@ def _card(job_id: str, full: bool = False) -> dict:
         "error": st.get("error"),
         "result_path": os.path.join(job_dir, "result.json"),
     }
+    # M5 同源标记：卡片带 source_group（编排者收口时识别同源孪生结果）
+    for c in _CFG.get("children") or []:
+        if c.get("job_id") == job_id and c.get("source_group"):
+            card["source_group"] = c["source_group"]
+            break
     view = _hm._result_view(job_dir, head=None if full else CARD_CHARS)
     if not view:
         if card["state"] in TERMINAL_STATES:
@@ -296,12 +370,14 @@ def _card(job_id: str, full: bool = False) -> dict:
     return card
 
 
+# 生效条件：无入参，遍历 _CFG['children'] 返回每项 c['job_id']；若某项缺 job_id 则抛 KeyError。
 def _known_children() -> list:
     return [c["job_id"] for c in _CFG["children"]]
 
 
 # -------------------------------------------------------------- 工具实现（三）
 
+# 生效条件：a 为 dict，在 len(_CFG['children']) < _CFG['max_subtasks']、a.get('user_prompt') 去空白后非空、a.get('model') 或 _CFG['model'] 去空白后非空、a.get('tools') 各项（缺省/空列表回落 list(SUB_TOOLS_ALLOW)）均属 SUB_TOOLS_ALLOW、a.get('context_files') 每项对应路径 isfile 为真时，构造 sub 白名单键（仅当 a.get(k) not in (None, '', [], {}) 才写入 system_prompt/context_files/max_tool_rounds/web_search_backend/mdcg_root/max_tokens/temperature/thinking），timeout_s 取 int(a.get('timeout_s') or _hm.DEFAULT_TIMEOUT_S)，context_budget_tokens 取 int(a.get('context_budget_tokens') or _hm.DEFAULT_CONTEXT_BUDGET_TOKENS)，reasoning_effort 取 a.get('reasoning_effort') or _hm.DEFAULT_REASONING_EFFORT，提交后 append 到 _CFG['children']、_save_children()、_ex.progress(kind='spawn_subtask') 并返回 ok=True 及 defaults；上述前置失败则返回对应 {'ok': False, 'error': ...}。
 def _spawn(a: dict) -> dict:
     """派发子任务。
 
@@ -329,14 +405,15 @@ def _spawn(a: dict) -> dict:
     if bad:
         return {"ok": False, "error": f"子代理不可用工具 {bad}（只允许 "
                 f"{list(SUB_TOOLS_ALLOW)}；编排工具不外传防递归）"}
-    if not tools:
-        tools = list(SUB_TOOLS_ALLOW)
     for rel in a.get("context_files") or []:
         p = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
         if not os.path.isfile(p):
             return {"ok": False, "error": f"context 文件不存在: {p}"}
     sub = {"model": model, "user_prompt": prompt, "tools": tools,
-           "workdir": os.getcwd()}
+           "workdir": os.getcwd(),
+           # M3.2 来源行「父任务」链路：子任务 spec 带父编排任务 id，
+           # exec.py main() 读入后由工具层注入 worker 直写来源行
+           "orch_job": _CFG.get("job_id") or ""}
     for k in ("system_prompt", "context_files", "max_tool_rounds", "web_search_backend",
               "mdcg_root", "max_tokens", "temperature", "thinking"):
         if a.get(k) not in (None, "", [], {}):
@@ -351,6 +428,8 @@ def _spawn(a: dict) -> dict:
     _CFG["children"].append({
         "job_id": cid, "prompt_head": prompt[:160], "tools": tools,
         "model": model, "ts": time.time(),
+        # M5 同源标记：同 context_files+同 model 归同组（纠正链裁决识别孪生来源）
+        "source_group": _source_group(model, a.get("context_files")),
     })
     _save_children()
     _ex.progress(_CFG["job_dir"], kind="spawn_subtask", child=cid,
@@ -362,11 +441,18 @@ def _spawn(a: dict) -> dict:
             "hint": "不要等；继续派发其它子任务，稍后用 poll_subtasks 收口"}
 
 
+# 生效条件：a 为 dict，a.get('job_ids') 转字符串后非空则用之，否则回落到 _known_children()；若 ids 仍空返回 {'ok': True, 'count': 0, 'children': [], 'hint': ...}；任一 id 不属于 _known_children()（含 ../ 穿越形态）返回 {'ok': False, 'error': ...}（与 _read_full 同款 fail-closed），否则 full=bool(a.get('full')) 逐 id 调 _card，done 计 c.get('state') 在 TERMINAL_STATES 的卡片，返回 count/done/active/children。
 def _poll(a: dict) -> dict:
-    ids = [str(x) for x in (a.get("job_ids") or [])] or _known_children()
+    known = _known_children()
+    ids = [str(x) for x in (a.get("job_ids") or [])] or known
     if not ids:
         return {"ok": True, "count": 0, "children": [],
                 "hint": "尚未派发子任务（先 spawn_subtask）"}
+    bad = [i for i in ids if i not in known]
+    if bad:
+        return {"ok": False, "error": (
+            f"{bad} 含非本编排者派发的任务（越权读被拒）。"
+            f"已知子任务：{known or '（无）'}")}
     full = bool(a.get("full"))
     cards = [_card(i, full=full) for i in ids]
     done = [c for c in cards if c.get("state") in TERMINAL_STATES]
@@ -374,6 +460,7 @@ def _poll(a: dict) -> dict:
             "active": len(cards) - len(done), "children": cards}
 
 
+# 生效条件：a 为 dict，a.get('job_id') 去空白后非空且 jid 属于 _known_children() 时，cap=int(a.get('max_chars') or FULL_MAX_CHARS)，读 _CFG['jobs']/jid/result.json；OSError 返回 {'ok': False, ...}，len(raw)>cap 时返回 truncated=True/head，否则返回 truncated=False/raw；job_id 缺失或越权返回 {'ok': False, ...}。
 def _read_full(a: dict) -> dict:
     jid = (a.get("job_id") or "").strip()
     if not jid:
@@ -397,33 +484,79 @@ def _read_full(a: dict) -> dict:
             "chars": len(raw), "raw": raw}
 
 
+# 生效条件：按 name 分派，name=='spawn_subtask' 返回 _spawn(args)、'poll_subtasks' 返回 _poll(args)、'read_full' 返回 _read_full(args)，其余 name 返回 {'ok': False, 'error': ...}；job_id 形参在源码中未被使用。
+def _record_adjudication(args: dict) -> dict:
+    """M5 纠正链侧车：强制字段校验（fail-closed）→ 追加 _adjudication.jsonl。
+
+    台账随编排 job 目录留痕（会话后可审计可回放）；session=本编排 job id。
+    """
+    kind = str(args.get("kind") or "").strip()
+    subject = str(args.get("subject") or "").strip()
+    evidence = [str(x) for x in (args.get("evidence") or []) if str(x).strip()]
+    note = str(args.get("verdict_note") or "").strip()
+    if kind not in _ADJ_KINDS:
+        return {"ok": False, "error": f"kind 必须为 {_ADJ_KINDS} 之一，got {kind!r}"}
+    if not subject:
+        return {"ok": False, "error": "subject 必填（被裁决的子任务 job_id）"}
+    if not evidence:
+        return {"ok": False, "error": "evidence 必填且非空（裁决依据 job_id 列表）——"
+                                      "不以「多个结果一致」代替证据"}
+    if not note:
+        return {"ok": False, "error": "verdict_note 必填（一句话裁决理由）"}
+    rec = {"ts": time.time(), "kind": kind, "subject": subject,
+           "evidence": evidence, "verdict_note": note[:400],
+           "session": f"hive_orch_{_CFG.get('job_id') or 'unknown'}"}
+    path = os.path.join(_CFG.get("job_dir") or "", _ADJ_FILE)
+    try:
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except OSError as e:
+        return {"ok": False, "error": f"裁决台账写入失败: {e}"}
+    _ex.progress(_CFG.get("job_dir"), **{**rec, "kind": "adjudication"})
+    return {"ok": True, "recorded": rec, "file": _ADJ_FILE,
+            "hint": "裁决已留痕；subject 结果按 kind 语义在收口结论中呈现"}
+
+
 def orch_handler(name: str, args: dict, job_id: str) -> dict:
-    """编排三工具的处理器（注册进 exec.register_tools）。"""
+    """编排工具的处理器（注册进 exec.register_tools）。
+
+    生效条件：name 为四个编排工具之一（spawn_subtask/poll_subtasks/
+    read_full/record_adjudication）时按名分派对应处理函数；未知工具名
+    → 上抛由执行器工具面统一报错。
+    验证方式：test——test_orch 85/0（含 M5 record_adjudication
+    fail-closed 字段校验与派生令牌身份链）。"""
     if name == "spawn_subtask":
         return _spawn(args)
     if name == "poll_subtasks":
         return _poll(args)
     if name == "read_full":
         return _read_full(args)
+    if name == "record_adjudication":
+        return _record_adjudication(args)
     return {"ok": False, "error": f"未注册的编排工具 {name!r}"}
 
 
 # ---------------------------------------------------------------------- 入口
 
+# 生效条件：spec 为 dict，spec.get('tools') 去空/缺省时初始 tools=['lingshu_cg','web_search','read_file']，否则 tools 为 given 去重；added 为 ("lingshu_cg",)+ORCH_TOOLS 中不在 tools 的项，tools.extend(added) 后返回 (tools, added)。
 def merge_tools(spec: dict) -> tuple:
     """算最终工具白名单：编排三工具是**能力下限**（强制并入），lingshu_cg 缺省并入。
 
     为什么强制：编排器没有这三工具就不是编排器（模型会转而自己干活，交出的
     "编排结果"其实是单代理结果，而 job 仍是 done —— 静默的能力缺失）。显式
     spec.tools 里想关掉编排能力属误配置，并入后由 added 字段留痕可审计。
+
+    read_file 只读、默认全路径放开（读放开 / 写严格）：进缺省面但**不强制并入**，
+    显式 spec.tools 不含它即视为使用者主动收窄编排者读面。
     """
     given = [str(t) for t in (spec.get("tools") or [])]
-    tools = list(dict.fromkeys(given)) if given else ["lingshu_cg", "web_search"]
+    tools = list(dict.fromkeys(given)) if given else ["lingshu_cg", "web_search", "read_file"]
     added = [t for t in ("lingshu_cg",) + ORCH_TOOLS if t not in tools]
     tools.extend(added)
     return tools, added
 
 
+# 生效条件：len(sys.argv)<2 时输出 usage 并返回 EXIT_SPEC；否则 job_dir=normpath(sys.argv[1])、job_id=basename(job_dir)，read_spec 异常则写 result 返回 EXIT_SPEC，spec.orchestrate.max_subtasks 为真值时尝试 _CFG['max_subtasks']=max(1,int(...))（TypeError/ValueError 静默跳过），load_principal(job_id) 抛 OrcError 则写 result 返回 EXIT_SPEC，成功则 _CFG.update({job_id, job_dir, jobs=_hm._jobs_dir(), model=(spec.get('model') or '').strip(), children=_load_children()})、merge_tools 补 tools、缺 system_prompt 填 ORCH_SYSTEM_PROMPT、写回 spec、register_tools(ORCH_SCHEMAS, orch_handler)、set_principal_factory(...)、log/progress，最后返回 _ex.main() 并在 finally 调 _save_children()。
 def main() -> int:
     if len(sys.argv) < 2:
         sys.stderr.write("usage: orch.py <job_dir>\n")
@@ -474,6 +607,14 @@ def main() -> int:
     spec["tools"] = tools
     if not (spec.get("system_prompt") or "").strip():
         spec["system_prompt"] = ORCH_SYSTEM_PROMPT
+    # 编排任务的工具轮次下限（2026-09-22 实测缺陷）：exec.py 默认 5 轮对
+    # 「派 N 个子任务 + 逐轮 poll + 收口」天然不够——轮次耗尽触发 forced_final，
+    # 模型的「想调工具」意图文本被当最终结论交回（观测：DSML 原文漏进 content）。
+    # 下限按子任务容量线性给足；显式传值优先（setdefault 不覆盖）。
+    spec.setdefault(
+        "max_tool_rounds",
+        max(12, 4 + 2 * int(_CFG.get("max_subtasks") or DEFAULT_MAX_SUBTASKS)),
+    )
     try:
         with open(os.path.join(job_dir, "spec.json"), "w", encoding="utf-8") as f:
             json.dump(spec, f, ensure_ascii=False)
@@ -502,4 +643,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     sys.exit(main())
-

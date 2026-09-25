@@ -7,8 +7,9 @@ v3 迁移（2026-09-10，三仓分离后）：
   - 路径：`WISDOM = ROOT/aeis/wisdom`（已随三仓分离删除）→
     `BRAIN/md_cg/whitebox_kb/wisdom`。
   - 数据根：不再硬编码 `ROOT/aeis/data/*`，统一走 `md_cg/datapath.py`
-    解析（env `MDCG_ROOT` > `data/paths.json` > 插件仓自身 `data/`）。
-    运行态落 `data/bootstrap/`。
+    解析（env `MDCG_ROOT` > `paths.json`（用户级，旧包内兼容读）> 用户级状态根
+    `data/`，即 `~/.dsh/.dsh-memory/data`——不再落插件包内，包内数据会被
+    pnpm 更新连目录删掉）。运行态落 `<数据根>/bootstrap/`。
 
 通道 A：路由缺口扫描 → triggers 补丁 → 验证 → 固化（零 LLM·确定性）
 通道 B：LLM 初稿（deepseek/glm）→ verifier 六层校验 → 测试 → 固化
@@ -35,16 +36,19 @@ sys.path.insert(0, WISDOM)
 sys.path.insert(0, HERE)
 sys.path.append(os.path.join(BRAIN, "md_cg"))      # 供顶层 import datapath
 
-# 数据根解析（记忆写入路径可配置·默认插件仓自身 data/）
+# 数据根解析（记忆写入路径可配置·默认用户级状态根 data/；解析器缺失时的
+# 兜底分支保留旧「仓内 data/」口径——那是本脚本自带的最后兜底，非解析默认）
 try:
     import datapath as _dp
 except Exception:                                   # 兜底：解析器缺失时不高挂
     class _dp:                                      # type: ignore
         @staticmethod
+# 生效条件：调用即返回 os.path.join(BRAIN, "data")，结果只取决于模块级常量 BRAIN，不接收参数。
         def data_root() -> str:
             return os.path.join(BRAIN, "data")
 
         @staticmethod
+# 生效条件：以 name 拼出 os.path.join(BRAIN, "data", name)，该路径 os.path.isfile 为真时返回该路径，否则返回 None。
         def find_existing(name: str):
             p = os.path.join(BRAIN, "data", name)
             return p if os.path.isfile(p) else None
@@ -54,13 +58,21 @@ os.makedirs(STATE, exist_ok=True)
 LOG = os.path.join(STATE, "bootstrap_log.jsonl")
 
 
+# 生效条件：evt 为 dict 时（含空 dict）先写入 evt["ts"]，再以 ensure_ascii=False 序列化追加一行到 LOG。
 def log_event(evt: dict) -> None:
     evt["ts"] = time.strftime("%Y-%m-%d %H:%M:%S")
+    # P2-13: rotate LOG when > 10MB (batch 31)
+    try:
+        if os.path.getsize(LOG) > 10485760:
+            os.replace(LOG, LOG + ".rotated")
+    except OSError:
+        pass
     with open(LOG, "a", encoding="utf-8") as f:
         f.write(json.dumps(evt, ensure_ascii=False) + "\n")
 
 
 # ==================== 通道 A：路由缺口扫描（零 LLM） ====================
+# 生效条件：limit_units 为真值且已遍历单元计数 count > limit_units 时提前返回当前 gaps，limit_units 为 None 或 0 时不限流；遍历每个 DOMAIN_UNITS 域单元时 domain_route 抛异常记 error 项、返回 unit != uid 或 ok 假值记 got 项，全遍历后返回 gaps。
 def scan_route_gaps(limit_units: int | None = None) -> list:
     from code_compose import domain_route, DOMAIN_UNITS
 
@@ -102,6 +114,7 @@ def scan_route_gaps(limit_units: int | None = None) -> list:
     return gaps
 
 
+# 生效条件：gap["unit"] 按 "-" 切分后存在长度 >= 2 的片段时返回 {domain, unit, add_triggers=前 3 个片段}，无此类片段时返回 None。
 def build_trigger_patch(gap):
     uid = gap["unit"]
     parts = [p for p in uid.split("-") if len(p) >= 2]
@@ -110,6 +123,7 @@ def build_trigger_patch(gap):
     return {"domain": gap["domain"], "unit": uid, "add_triggers": parts[:3]}
 
 
+# 生效条件：DOMAIN_UNITS.get(patch["domain"], {}).get(patch["unit"]) 取到的单元为 None 时返回 False；取到单元时把 patch["add_triggers"] 中长度 >= 2 且不在现 triggers 集合的项追加（无新项不修改 triggers），两种情况均返回 True。
 def apply_patch(patch):
     from code_compose import DOMAIN_UNITS
     unit = DOMAIN_UNITS.get(patch["domain"], {}).get(patch["unit"])
@@ -123,6 +137,7 @@ def apply_patch(patch):
     return True
 
 
+# 生效条件：patch["unit"] 作为 uid 拼出 "写一个{uid}单元" 探针调用 domain_route，返回 domain_route 结果的 unit == patch["unit"] 且 ok 为真值的布尔与。
 def verify_patch(patch):
     from code_compose import domain_route
     uid = patch["unit"]
@@ -131,6 +146,7 @@ def verify_patch(patch):
     return r.get("unit") == uid and r.get("ok")
 
 
+# 生效条件：patches 中某 patch 的 domain 命中 files 六键之一、对应 os.path.exists(path) 为真、且 path 内容正则搜到 `"uid": {` 行且其后 600 字符块内无 "triggers" 时才插入 triggers 行并让 changed 自增，否则跳过；返回 changed。
 def persist_triggers(patches):
     import re
     files = {
@@ -147,7 +163,8 @@ def persist_triggers(patches):
         path = files.get(dom)
         if not path or not os.path.exists(path):
             continue
-        src = open(path, encoding="utf-8").read()
+        with open(path, encoding="utf-8") as f:
+            src = f.read()
         pat_uid = re.compile(r'(\n(\s*)"' + re.escape(uid) + r'": \{\n)')
         m = pat_uid.search(src)
         if not m:
@@ -158,12 +175,73 @@ def persist_triggers(patches):
         ind = m.group(2)
         trig_json = json.dumps(triggers, ensure_ascii=False)
         src = src[:m.end(1)] + ind + '    "triggers": ' + trig_json + ',\n' + src[m.end(1):]
-        open(path, "w", encoding="utf-8").write(src)
+        _tmp = path + ".tmp"
+        with open(_tmp, "w", encoding="utf-8") as f:
+            f.write(src)
+        # P2-14: atomic replace - concurrent instances never see a
+        # half-written source file (batch 31).
+        os.replace(_tmp, path)
         changed += 1
     return changed
 
 
 # ==================== 通道 B：LLM 初稿 → verifier → 固化 ====================
+# ---- P1-7（批次 26）：LLM 产出代码的 AST 沙箱 ------------------------------
+# 危险名 denylist（配合 __builtins__ 收窄双层防御）：
+#   执行/IO 面：eval exec compile open __import__ breakpoint input
+#   反射面：globals locals vars getattr setattr delattr（内省逃逸链入口）
+#   进程面：exit quit（干扰循环宿主）
+_GEN_BANNED_NAMES = frozenset({
+    "eval", "exec", "compile", "open", "__import__", "breakpoint", "input",
+    "globals", "locals", "vars", "getattr", "setattr", "delattr",
+    "exit", "quit", "memoryview", "super",
+})
+# 自举生成物的合法计算面（排序/查找/字符串处理足够）；len/range 等纯函数
+_GEN_SAFE_BUILTINS = {name: getattr(__import__("builtins"), name)
+                      for name in (
+                          "abs", "all", "any", "bool", "bytes", "chr", "dict",
+                          "divmod", "enumerate", "filter", "float", "frozenset",
+                          "hash", "hex", "int", "isinstance", "len", "list",
+                          "map", "max", "min", "oct", "ord", "pow", "range",
+                          "repr", "reversed", "round", "set", "slice", "sorted",
+                          "str", "sum", "tuple", "zip", "True", "False", "None",
+                          "ArithmeticError", "IndexError", "KeyError",
+                          "TypeError", "ValueError", "ZeroDivisionError")}
+
+
+# 生效条件：code 为 LLM 返回或 channel_b_queue.json 产出的 Python 源码文本；ast.parse 失败抛原语法异常，ast.walk 命中 Import/ImportFrom 节点、Name.id 属 _GEN_BANNED_NAMES、Attribute.attr 以下划线双端包夹或属 ("system","popen") 任一即抛 ValueError（不执行）；全部通过则以 {"__builtins__": _GEN_SAFE_BUILTINS} 为命名空间 exec 编译产物并返回该 ns（其中含源码定义的函数）。
+def _safe_exec_gen(code: str) -> dict:
+    """LLM 产出代码的受限 exec：AST denylist + 内建收窄（P1-7，批次 26）。
+
+    拒绝（ValueError，不执行）：
+      · import 面——Import / ImportFrom 节点（禁 os/subprocess 前置）；
+      · 危险内建名调用——_GEN_BANNED_NAMES（执行/IO/反射/进程面）；
+      · 反射逃逸链——dunder 属性访问（__class__/__globals__/__subclasses__…）
+        与 os.system/popen 类敏感属性；
+      · Lambda/推导式中的同名调用同样被 walk 覆盖（AST 全遍历）。
+    执行命名空间 `__builtins__` 收窄到纯计算内建——即使 denylist 漏项，
+    ns 里也没有 open/import 可拿。
+    """
+    import ast
+    tree = ast.parse(code)
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Import, ast.ImportFrom)):
+            raise ValueError(f"沙箱拒绝 import（行 {getattr(node, 'lineno', '?')}）"
+                             "——自举产出应为纯函数，无需依赖")
+        if isinstance(node, ast.Name) and node.id in _GEN_BANNED_NAMES:
+            raise ValueError(f"沙箱拒绝受限名 {node.id}"
+                             f"（行 {getattr(node, 'lineno', '?')}）")
+        if isinstance(node, ast.Attribute):
+            if node.attr.startswith("__") or node.attr in ("system", "popen"):
+                raise ValueError(f"沙箱拒绝受限属性 .{node.attr}"
+                                 f"（行 {getattr(node, 'lineno', '?')}）"
+                                 "——反射逃逸链入口")
+    ns = {"__builtins__": _GEN_SAFE_BUILTINS}
+    exec(compile(code, "<gen>", "exec"), ns)   # noqa: S102——沙箱内（见上）
+    return ns
+
+
+
 def run_channel_b(llm_generate=None, max_tasks=5):
     """通道 B v2：从队列文件读取初稿（由 GLM-5.3-Flash 在对话轮次中批量
     产出到 channel_b_queue.json）→ verifier 校验 → 固化到 verified_units。
@@ -172,14 +250,22 @@ def run_channel_b(llm_generate=None, max_tasks=5):
     """
     from verifier import Verifier
 
+
     queue_path = os.path.join(STATE, "channel_b_queue.json")
     out_path = os.path.join(STATE, "channel_b_verified_units.json")
-    verified = json.load(open(out_path, encoding="utf-8")) if os.path.exists(out_path) else {}
+    # 批次 35：初始化必须是 dict——空串形态在产物文件不存在时首次固化即
+    # TypeError（verified[key]=... 对 str 赋值）。此缺陷因 run_channel_b
+    # 长期无测试覆盖而潜伏（V21 报告流程建议 2 的全链路冒烟首跑即暴露）。
+    verified = {}
+    if os.path.exists(out_path):
+        with open(out_path, encoding="utf-8") as f:
+            verified = json.load(f)
     stats = {"generated": 0, "passed": 0, "failed": 0, "source": "queue"}
 
     queue = []
     if os.path.exists(queue_path):
-        qd = json.load(open(queue_path, encoding="utf-8"))
+        with open(queue_path, encoding="utf-8") as f:
+            qd = json.load(f)
         queue = [t for t in qd.get("pending", [])
                  if t.get("status") not in ("verified", "failed")]
 
@@ -210,17 +296,40 @@ def run_channel_b(llm_generate=None, max_tasks=5):
         fname = fn_m.group(1) if fn_m else None
         if not fname:
             stats["failed"] += 1
+            # 批次 35：前置拒绝路径也必须标 failed——否则条目永久占位
+            # 反复重试（与 2026-08-28 卡队列缺陷同型；冒烟守卫暴露）
+            item["status"] = "failed"
             continue
 
         # 物理验证：exec + cases
-        ns = {}
+        # P1-7（批次 26，外部审查报告）：code 来自 LLM 返回 / channel_b_queue.json
+        # （模型可控输入），直接 exec = 以循环进程身份执行任意 Python。改为
+        # AST 白名单沙箱（报告建议 2）：自举循环的合法产出 = 纯算术/逻辑
+        # 函数（排序/查找等算法题），不需要 import 与 IO——denylist 拒绝
+        # import 面、危险内建与反射逃逸链，命中即 ValueError 不执行。
         try:
-            exec(compile(code, "<gen>", "exec"), ns)
+            ns = _safe_exec_gen(code)
         except Exception:
             stats["failed"] += 1
+            item["status"] = "failed"     # 批次 35：防卡队列（同上）
+            # 批次 35：沙箱拒绝（import 面/危险内建/反射逃逸）的产出单独
+            # 留痕——恶意/坏产出是最该进拒绝日志的类别（与 cases 未过同款）
+            _rej = os.path.join(STATE, "channel_b_drafts", "rejected_log.json")
+            os.makedirs(os.path.dirname(_rej), exist_ok=True)
+            _rej_list = []
+            if os.path.exists(_rej):
+                with open(_rej, encoding="utf-8") as f:
+                    _rej_list = json.load(f)
+            _rej_list.append({"task": task, "layer": "queue_sandbox",
+                              "why": "AST 沙箱拒绝（import 面/危险内建/"
+                                     "反射逃逸链）",
+                              "ts": time.strftime("%Y-%m-%d %H:%M")})
+            with open(_rej, "w", encoding="utf-8") as f:
+                json.dump(_rej_list, f, ensure_ascii=False, indent=1)
             continue
         if fname not in ns or not callable(ns[fname]):
             stats["failed"] += 1
+            item["status"] = "failed"     # 批次 35：防卡队列（同上）
             continue
         fn = ns[fname]
         all_pass = True
@@ -258,25 +367,31 @@ def run_channel_b(llm_generate=None, max_tasks=5):
             item["status"] = "failed"
             _rej = os.path.join(STATE, "channel_b_drafts", "rejected_log.json")
             os.makedirs(os.path.dirname(_rej), exist_ok=True)
-            _rej_list = json.load(open(_rej, encoding="utf-8")) \
-                if os.path.exists(_rej) else []
+            # V22 修复：必须是 []（对照 :319 沙箱拒绝分支）——空串形态在
+            # rejected_log.json 不存在时首次失败即 AttributeError 崩溃，
+            # 队列回写不执行 → 条目永久 pending，每轮重试再崩（死循环）。
+            _rej_list = []
+            if os.path.exists(_rej):
+                with open(_rej, encoding="utf-8") as f:
+                    _rej_list = json.load(f)
             _rej_list.append({"task": task, "layer": "queue_verifier",
                               "why": "cases 物理验证未过",
                               "ts": time.strftime("%Y-%m-%d %H:%M")})
-            json.dump(_rej_list, open(_rej, "w", encoding="utf-8"),
-                      ensure_ascii=False, indent=1)
+            with open(_rej, "w", encoding="utf-8") as f:
+                json.dump(_rej_list, f, ensure_ascii=False, indent=1)
 
     if queue:
         qd = {"_comment": "自举产物队列（已完成项标记 verified）",
               "_instructions": "bootstrap_loop 自动消化",
               "pending": queue}
-        json.dump(qd, open(queue_path, "w", encoding="utf-8"),
-                  ensure_ascii=False, indent=1)
-    json.dump(verified, open(out_path, "w", encoding="utf-8"),
-              ensure_ascii=False, indent=1)
+        with open(queue_path, "w", encoding="utf-8") as f:
+            json.dump(qd, f, ensure_ascii=False, indent=1)
+    with open(out_path, "w", encoding="utf-8") as f:
+        json.dump(verified, f, ensure_ascii=False, indent=1)
     return stats
 
 
+# 生效条件：channel_b 为假值时只走通道 A——scan_route_gaps() 的 gaps 非空则取前 max_patches 个构建含 add_triggers 的补丁，apply_patch 为假或 verify_patch 为假计入 patches_failed、verify_patch 为真计入 patches_verified 并入 persisted，persisted 非空才 persist_triggers(persisted)（只固化验证通过者）；channel_b 为真值时额外 import llm_channel 并以 max_tasks=3 调 run_channel_b，其异常写入 result["channel_b"]["error"]；随后 log_event 并返回 result。
 def run_once(channel_b=False, max_patches=20):
     result = {"gaps": 0, "patches_applied": 0, "patches_verified": 0,
               "patches_failed": 0, "persisted_files": 0}
@@ -301,7 +416,10 @@ def run_once(channel_b=False, max_patches=20):
             else:
                 result["patches_failed"] += 1
         if persisted:
-            result["persisted_files"] = persist_triggers(patches)
+            # V22 修复：只固化**验证通过者**（persisted）——此前误传全量
+            # patches，verify_patch 失败的补丁也被写进 wisdom 源文件，
+            # 绕过「补丁→验证→固化」闸（docstring 声明的流程）。
+            result["persisted_files"] = persist_triggers(persisted)
 
     # ② 通道 B：LLM 初稿 → verifier → 固化
     if channel_b:
@@ -316,6 +434,7 @@ def run_once(channel_b=False, max_patches=20):
     return result
 
 
+# 生效条件：_dp.find_existing("verify_cache.json") 返回 None 时只记 status=skipped 并返回；否则读取该 json 的固定键 "a866f668bd6f4a1c048e16f684df69bf" 条目，记录 a866_ok、checks 中是否含 "缓存命中"、非 "_" 前缀键数量；读取或处理抛异常记 error 后返回。
 def gap_watch() -> None:
     """GAP_DEBUG 诊断：自报本进程视角的配对信任指纹状态——
     区分「本进程写的 False」vs「他进程写回」。
@@ -330,7 +449,8 @@ def gap_watch() -> None:
                        "why": "verify_cache.json 未在数据根/插件仓/归档区找到",
                        "ts": time.strftime("%Y-%m-%d %H:%M:%S")})
             return
-        _d = json.load(open(vc, encoding="utf-8"))
+        with open(vc, encoding="utf-8") as f:
+            _d = json.load(f)
         _ent = _d.get("a866f668bd6f4a1c048e16f684df69bf")
         log_event({"round": "gap_watch", "pid": os.getpid(),
                    "src": vc,
@@ -381,6 +501,7 @@ def csre_freshness(last_kp_fp):
     return last_kp_fp
 
 
+# 生效条件：argparse 从命令行取 --interval（默认 600）、--channel-b、--once 后，--once 为真时只调一次 run_once(channel_b=args.channel_b)，并在环境变量 GAP_DEBUG 为非空真值时调 gap_watch() 后返回；未给 --once 时进入无限循环：每轮 run_once(channel_b=args.channel_b)（异常记 loop_error 后继续），GAP_DEBUG 为非空真值时才 gap_watch()，随后无条件执行 csre_freshness(last_kp_fp)，再按 --interval 睡眠。
 def main():
     """长期循环：--interval 秒一轮 run_once，异常留痕不中断。
 

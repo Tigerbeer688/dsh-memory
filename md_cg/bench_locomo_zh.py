@@ -89,6 +89,7 @@ KNOWN_DANGLING = {"scene_3_session_10_turn_19"}
 MAX_DF_FIXED = 5
 
 
+# 生效条件：任意 n_pool（含 0 等假值，源码不做校验）下返回 max(MAX_DF_FIXED, int(round(0.05 * n_pool)))，结果不小于模块级常量 MAX_DF_FIXED。
 def max_df_auto(n_pool):
     """池规模 → edges 的 df 上限。
 
@@ -100,6 +101,7 @@ def max_df_auto(n_pool):
     return max(MAX_DF_FIXED, int(round(0.05 * n_pool)))
 
 
+# 生效条件：path 指向逐行 JSON 的 UTF-8 文本时，跳过空行并逐行 yield json.loads 结果。
 def iter_jsonl(path):
     with open(path, encoding="utf-8") as f:
         for line in f:
@@ -108,11 +110,13 @@ def iter_jsonl(path):
                 yield json.loads(line)
 
 
+# 生效条件：path 能被 open(path, encoding="utf-8") 打开时返回 json.load(f) 的解析结果。
 def load_json(path):
     with open(path, encoding="utf-8") as f:
         return json.load(f)
 
 
+# 生效条件：os.path.isdir(d) 为假时直接返回空 dict；为真时按 sorted(os.listdir(d)) 顺序读取后缀为 .json 的分片并 out.update(part)（后者覆盖前者），任一分片不是 dict 时抛 SystemExit，否则返回合并后的 out。
 def load_chunks(d):
     """合并目录下全部分片 JSON（后者覆盖前者，便于修订单条）。"""
     out = {}
@@ -133,6 +137,7 @@ _SPEAKER_RE = re.compile(r"^([A-Za-z][A-Za-z .'\-]{0,24}): ")
 _DATE_RE = re.compile(r"Data time: (\d{1,2}:\d{2} [AP]M on \w+ \d{1,2} \w+, \d{4})")
 
 
+# 生效条件：调用即从 locomo_corpus.jsonl 建 id→记录映射、读 locomo_questions.jsonl，逐题取 q.get("evidence_turns") or []（缺键或假值按空列表）去重排序为证据 turn，text/title 用 c.get(...) or "" 兜假值、speaker/date 由 _SPEAKER_RE.match / _DATE_RE.search 命中才非空；verbose=True 时额外打印含 KNOWN_DANGLING 未登记告警与直接取键 q["qtype"] 的题型统计，verbose=False 时只跳过打印，写 RAW_TURNS/RAW_QUESTIONS 与返回 (rows, questions) 不变。
 def cmd_dump(verbose=True):
     """确定性派生：证据 turn 全集 + 题库 → raw_turns/raw_questions（零标注）。"""
     os.makedirs(ZH_TURNS, exist_ok=True)
@@ -176,6 +181,7 @@ def cmd_dump(verbose=True):
 
 
 # ------------------------------------------------------------------ status
+# 生效条件：verbose=True 时打印写入/查询侧完成度、多余 turn/qid 键与待补项（各截取前 head 项），并对已产出中文层用 bz.parse_zh 检查 identity/time/summary/terms 四项真值（并非五槽），非全真者记入 bad；verbose=False 时不打印、不做该槽位检查，返回值中 bad 恒为 []。
 def cmd_status(verbose=True, head=12):
     """产出进度：中文层 / 中文查询的覆盖与缺口（分批产出时用）。"""
     turns, questions = cmd_dump(verbose=False)
@@ -217,6 +223,7 @@ def cmd_status(verbose=True, head=12):
 
 
 # ------------------------------------------------------------------ prepare
+# 生效条件：miss_t 或 miss_q 任一非空即 raise SystemExit，否则按 sort_key（仅接受 scene_数字_session_数字_turn_数字 形式的 id，否则 raise SystemExit）对 turns 数值序排序，写出 corpus567.jsonl/questions500.jsonl 并返回 (corpus, out_q)，其中 answer 与 evidence_turns 为假值时分别落为 "" 与 []，verbose 只控制末尾打印。
 def cmd_prepare(verbose=True):
     """合并中文层 → corpus567.jsonl + questions500.jsonl（幂等覆盖）。"""
     turns, questions = cmd_dump(verbose=False)
@@ -231,6 +238,7 @@ def cmd_prepare(verbose=True):
             f"先跑 `status` 看缺口。")
 
     # 语料：按 (scene, session, turn) 数值序 —— 「承接前一条」需要确定的时间序
+# 生效条件：tid 匹配 ^scene_(\d+)_session_(\d+)_turn_(\d+)$ 时返回三个整数的 tuple（scene, session, turn），否则 raise SystemExit（不做其他容错或回退）。
     def sort_key(tid):
         m = re.match(r"scene_(\d+)_session_(\d+)_turn_(\d+)$", tid)
         if not m:
@@ -275,6 +283,7 @@ def cmd_prepare(verbose=True):
 
 
 # ------------------------------------------------------------------ build
+# 生效条件：max_df 为 None（默认）时用 max_df_auto(len(corpus)) 自动取值，max_df 传出值（含 0 等假值）则直接使用；随后对 bz.ARMS 每臂调 bz.build_arm(corpus, arm, max_df=md, root_base=...) 并返回 {arm["name"]: 建库结果}；verbose 形参在该符号源码段内未参与如何分支。
 def cmd_build(max_df=None, verbose=True):
     corpus, _ = cmd_prepare(verbose=False)
     md = max_df if max_df is not None else max_df_auto(len(corpus))
@@ -296,6 +305,7 @@ GATE_RE = re.compile(r"拒答率：([\d.]+)%")
 LINE_RE = re.compile(r"拒答线（正例 hit@1 题 Top-1 分 p10）：([\d.]+)")
 
 
+# 生效条件：RUST_BIN 经 os.path.exists 为假时抛 SystemExit；否则以 argv 列表 [RUST_BIN, "--dataset", "lc", "--tag", name, "--lib", lib, "--qfile", qfile]（extra 为真值时追加其元素）执行 subprocess.run，返回码非 0 或 stdout 未匹配 ROW_RE 时抛 SystemExit，成功时返回 (got, neg, line)，其中 GATE_RE/LINE_RE 未命中时对应值为 None。
 def run_one(name, lib, qfile, extra=None):
     """调用 Rust 评测器跑一臂（--dataset lc 的组映射 + 显式 lib/qfile）。
 
@@ -326,6 +336,7 @@ def run_one(name, lib, qfile, extra=None):
         (float(line.group(1)) if line else None)
 
 
+# 生效条件：对 rows 中每个 (label, got, note) 按 GROUPS 顺序打印 got[g] 的 hit@1/MRR（got 缺任一 GROUPS 键会 KeyError），并对 POS_GROUPS 组按样本数 n 加权算正例 hit@1/MRR；baseline 非 None 且某行 label 等于 baseline 时该行值记为参照，其后 label 不等于 baseline 的行附加 Δpp，无返回值。
 def print_table(title, rows, baseline=None):
     """rows: [(label, got, note)]；baseline = 参照行 label（算 Δ）。"""
     print(f"\n== {title} ==")
@@ -355,6 +366,7 @@ def print_table(title, rows, baseline=None):
               + f"{ov_h1 * 100:>10.1f}%{ov_mrr:>10.3f}{delta}{suffix}")
 
 
+# 生效条件：seeds 等于 "sorted" 时给每个 run_one 追加 ["--graph-seeds", "sorted"]，seeds 为其它值（含 None）时不追加；先 cmd_build(max_df=max_df) 取各臂库，再对 bz.ARMS 逐臂 run_one，neg 非 None 时把拒答率写入 note，返回 rows 并以 bz.ARMS[0]["name"] 为 baseline 打印主表。
 def cmd_run(max_df=None, seeds=None):
     """消融主表（5 组；正例 hit@1/MRR = precise+temporal+interference）。"""
     roots = cmd_build(max_df=max_df)
@@ -373,6 +385,7 @@ def cmd_run(max_df=None, seeds=None):
     return rows
 
 
+# 生效条件：cmd_build(max_df=max_df) 后取 bz.ARMS[-1]["name"] 对应的库，对同一库分别以索引序（lczh_a4_index，无额外参数）与 --graph-seeds sorted（lczh_a4_sorted）各跑一次 run_one，返回这两行结果并以 baseline="a4/index" 打印对照表。
 def cmd_seed(max_df=None):
     """对照：同一个 a4 库，只切换 graph 路种子口径（隔离种子缺陷与边质量）。"""
     roots = cmd_build(max_df=max_df)
@@ -389,6 +402,7 @@ def cmd_seed(max_df=None):
     return rows
 
 
+# 生效条件：kind 等于 "turn" 时从 RAW_TURNS 读取并按 id/speaker/date/text 打印 rows[start:end]（序号自 start+1 起，text 截到 width）；kind 为其它任何值时改从 RAW_QUESTIONS 按 qid/qtype/question 打印同一区间，无返回值。
 def cmd_show(kind, start, end, width=240):
     """打印 [start, end) 区间的待标注项（分批产出时读原文用）。
 
@@ -403,6 +417,7 @@ def cmd_show(kind, start, end, width=240):
             print(f"{i}\t{r['qid']}\t{r['qtype']}\t{r['question'][:width]}")
 
 
+# 生效条件：len(argv) > 1 时 cmd 取 argv[1]、否则 cmd 为 "status"；遍历 argv 时遇 "--max-df" 取 argv[i+1] 转 int 为 max_df、遇 "--seeds" 取 argv[i+1] 为 seeds；cmd 为 "show" 时调 cmd_show(argv[2], int(argv[3]), int(argv[4]))，为 "dump"/"status"/"prepare" 时分别无参转调同名函数，为 "build"/"seed" 时传 max_df=max_df，为 "run" 时传 max_df=max_df 与 seeds=seeds，其余 cmd 值抛 SystemExit("未知子命令")。
 def main(argv):
     cmd = argv[1] if len(argv) > 1 else "status"
     max_df = None

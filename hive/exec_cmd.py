@@ -13,7 +13,8 @@ result.json 的 error 字段），区别是**不调 LLM**——把 spec 里的�
   cwd                       工作目录（缺省 spec.workdir → job 目录）
   env                       {"K":"V"} 附加环境变量（覆盖继承值）
   fail_fast                 默认 true：任一步非 0 即停
-  timeout_step_s            单步超时（缺省 spec.timeout_s → 600）；rust 侧另有硬超时兜底
+  timeout_step_s            单步超时（缺省 600；**不继承 spec.timeout_s**——批次 23 D-5/v19
+                            两守卫解耦防同值撞车，rust 侧另有硬超时兜底）
   expect_files              ["路径"] 执行后断言存在（相对 cwd），缺失即 error
   expect_stdout_contains    ["子串"] 各步 stdout 合并文本须包含**全部**给定子串，缺一即 error
 订阅约定：model 写 "cmd"、user_prompt 写任务标签——仅为过 rust 侧必填校验，本执行器不调 API。
@@ -35,6 +36,7 @@ DEFAULT_STEP_TIMEOUT_S = 600
 EXIT_OK, EXIT_SPEC, EXIT_EXEC = 0, 2, 3
 
 
+# 生效条件：job_dir 与 obj 给出后无任何前置判断，直接用 UTF-8 打开 job_dir/result.json.tmp 写入 json.dump(obj, ensure_ascii=False)、flush+fsync，再 os.replace 到 job_dir/result.json（目录不可写等异常会向外抛）。
 def _write_result(job_dir: str, obj: dict) -> None:
     """tmp + fsync + rename 原子替换（并发读者不读到截断空窗口）。"""
     p = os.path.join(job_dir, "result.json")
@@ -46,6 +48,7 @@ def _write_result(job_dir: str, obj: dict) -> None:
     os.replace(tmp, p)
 
 
+# 生效条件：以 job_dir 与 msg 构造 {"ok": False, "error": msg, "model": "cmd"} 并写 result.json，extra 为真值时 r.update(extra) 合并、假值（None/{}）时不合并，最后返回 code（未传则为模块常量 EXIT_SPEC）。
 def _fail(job_dir: str, msg: str, code: int = EXIT_SPEC, extra: dict | None = None) -> int:
     r: dict = {"ok": False, "error": msg, "model": "cmd"}
     if extra:
@@ -54,6 +57,7 @@ def _fail(job_dir: str, msg: str, code: int = EXIT_SPEC, extra: dict | None = No
     return code
 
 
+# 生效条件：spec["commands"] 为非空 list 时逐项归一（dict 原样收、list 包成 {"command": item}、其它类型返回错误 err），commands 缺失/非 list/空列表时若 spec.get("command") 为真值则只生成单步，否则返回 (None, None) 走 LLM 委托；随后逐步校验 command：是字符串时报「只收 argv 数组」，是 None 或不是「非空且全为 str 的 list」时统一报「必须是非空字符串数组」。
 def _norm_steps(spec: dict):
     """→ (steps, err)；两者皆 None 表示「无命令 → 走 LLM 委托」。"""
     raw = spec.get("commands")
@@ -80,6 +84,7 @@ def _norm_steps(spec: dict):
     return steps, None
 
 
+# 生效条件：对 ("stdout", out) 与 ("stderr", err) 各自把全文写入 job_dir/step_<idx>_<name>.txt 并在写成功时记 rec["<name>_path"]（OSError 仅 pass 不留路径），同时无条件记 rec["<name>_head"] = text[:HEAD_CHARS]，仅当 len(text) > HEAD_CHARS 才置 rec["<name>_truncated"] = True。
 def _dump_step(job_dir: str, idx: int, out: str, err: str, rec: dict) -> None:
     """完整输出落 step_<i>_stdout/stderr.txt，result 只留 head（防爆炸）。"""
     for name, text in (("stdout", out), ("stderr", err)):
@@ -95,13 +100,14 @@ def _dump_step(job_dir: str, idx: int, out: str, err: str, rec: dict) -> None:
             rec[f"{name}_truncated"] = True
 
 
+# 生效条件：argv 直接取 step["command"]（缺键即 KeyError）；cwd 取 step.get("cwd") or default_cwd 并在非绝对时转 abspath，timeout 按 step.get("timeout_step_s") or spec.get("timeout_step_s") or DEFAULT_STEP_TIMEOUT_S 回退（**不继承 timeout_s**——批次 23 D-5/v19：step 守卫继承 job 总超时会与 scheduler 的 kill_tree 守卫同值撞车，终态随机 timeout/error；两守卫解耦后 step 级缺省 600s 远大于常规 job 超时，由 job 级兜底）；cwd 非目录即返回失败 rec 与 ""，否则以 shell=False 运行 subprocess.run，FileNotFoundError / TimeoutExpired（此路先 _dump_step 再返回 out）/ OSError 各返回失败 rec，正常结束记 ok=rc==0、exit_code=rc 并 _dump_step。
 def _run_step(step: dict, idx: int, job_dir: str, spec: dict, env: dict, default_cwd: str):
     argv = list(step["command"])
     cwd = step.get("cwd") or default_cwd
     cwd = cwd if os.path.isabs(cwd) else os.path.abspath(cwd)
     label = step.get("label") or f"step {idx}"
     timeout = step.get("timeout_step_s") or spec.get("timeout_step_s") or \
-        spec.get("timeout_s") or DEFAULT_STEP_TIMEOUT_S
+        DEFAULT_STEP_TIMEOUT_S
     t0 = time.time()
     rec = {"label": label, "command": argv, "cwd": cwd}
     if not os.path.isdir(cwd):
@@ -133,6 +139,7 @@ def _run_step(step: dict, idx: int, job_dir: str, spec: dict, env: dict, default
     return rec, out
 
 
+# 生效条件：以 steps 与 elapsed 生成首行「确定性执行：{len(steps)} 步，用时 {elapsed:.2f}s」，note 为真值时追加 " | {note}"、假值（空串）不追加，再逐步行输出 [i] OK/FAIL label、exit、duration、' '.join(s.get('command') or [])、error 真值时的 "! error"、stdout_head 去空白后末 6 行与 stderr_head 去空白后末 4 行，最后 "\n".join(lines)。
 def _render(steps: list, elapsed: float, note: str = "") -> str:
     head = f"确定性执行：{len(steps)} 步，用时 {elapsed:.2f}s" + (f" | {note}" if note else "")
     lines = [head]
@@ -149,6 +156,7 @@ def _render(steps: list, elapsed: float, note: str = "") -> str:
     return "\n".join(lines)
 
 
+# 生效条件：spec 为 None 时从 job_dir/spec.json 读取（OSError/ValueError 时置 {}）；spec.get("orchestrate") 真值时 exe 取 os.environ.get("HIVE_ORCH_PY")（空串视假值回落）或 here/orch.py，否则取 os.environ.get("HIVE_LLM_EXEC_PY") 或 here/exec.py；exe 非文件时返回 _fail(..., EXIT_EXEC)，否则用 sys.executable 运行 [exe, job_dir]、透传其 stdout/stderr 并返回 p.returncode。
 def _delegate(job_dir: str, spec: dict | None = None) -> int:
     """无命令 → 转发执行器：`spec.orchestrate` 真值 → orch.py（编排器），否则 exec.py。
 
@@ -181,6 +189,7 @@ def _delegate(job_dir: str, spec: dict | None = None) -> int:
     return p.returncode
 
 
+# 生效条件：job_dir/spec.json 读取抛 OSError/ValueError 即 _fail(..., EXIT_SPEC)；_norm_steps 返回 err 即 _fail(..., EXIT_SPEC)、返回 steps 为 None 即转 _delegate(job_dir, spec)；否则 env 由 spec.get("env") 字符串化后叠加在 os.environ 之上并 setdefault PYTHONUTF8="1"，default_cwd 取 spec.get("cwd") or spec.get("workdir") or job_dir，fail_fast 取 spec.get("fail_fast", True)（显式假值则不提前中断），逐步 _run_step 后按 expect_files、expect_stdout_contains 缺失项追加失败记录，写 result.json 并返回 EXIT_OK 或 EXIT_EXEC。
 def run_cmd(job_dir: str) -> int:
     t0 = time.time()
     try:
@@ -234,6 +243,7 @@ def run_cmd(job_dir: str) -> int:
         "content": _render(recs, elapsed, "；".join(notes)),
         "exit_code": 0 if not failed else (failed[0].get("exit_code") or 1),
         "duration_s": elapsed,
+        "finished_ts": time.time(),
         "steps": recs,
         "model": "cmd",
         "usage": {},
@@ -244,6 +254,7 @@ def run_cmd(job_dir: str) -> int:
     return EXIT_OK if not failed else EXIT_EXEC
 
 
+# 生效条件：len(sys.argv) < 2 时打印用法返回 EXIT_SPEC，sys.argv[1] 非目录时打印提示返回 EXIT_SPEC，否则返回 run_cmd(sys.argv[1])，其中任何异常由 _fail(job_dir, ..., EXIT_EXEC) 兜底转为返回码。
 def main() -> int:
     if len(sys.argv) < 2:
         print("用法: python exec_cmd.py <job_dir>", file=sys.stderr)

@@ -16,6 +16,7 @@ from compiler.parser import parse_tokens
 from compiler.name_checker import NameChecker
 
 
+# 生效条件：无必需形参，调用即返回挂载 compile/check/explain/init/tokens/ast/compile-pbc/run/debug/rust/version/help 子命令的 argparse.ArgumentParser（compile 的 -o 默认 "./output"、compile-pbc 默认 "out.pbc"、rust 的 -o 默认 "out/rust_project" 且 --trust 默认 0.0）。
 def create_parser() -> argparse.ArgumentParser:
     """创建命令行参数解析器"""
     parser = argparse.ArgumentParser(
@@ -115,6 +116,7 @@ def create_parser() -> argparse.ArgumentParser:
     return parser
 
 
+# 生效条件：args.input 经 _read_input 返回非 None 时，以 args.llm_assist/args.strict 构造 CompileOptions 调 compile_source，result.success 为真则在 Path(args.output) 目录写入 {Path(args.input).stem}.py 并返回 0、为假返回 1；args.verbose 为真时先打印 summary() 再打印一个空行，为假时按成功打印「编译成功 → 输出文件」与 token/语句/耗时行、按失败打印「编译失败」及 result.errors 各行；_read_input 返回 None 时直接返回 1。
 def cmd_compile(args) -> int:
     """执行 compile 命令"""
     source = _read_input(args.input)
@@ -155,6 +157,7 @@ def cmd_compile(args) -> int:
         return 1
 
 
+# 生效条件：args.input 可读出源码（非 None）且 validate_source 结果 result["valid"] 为真时打印 token/statement 计数与警告后返回 0；source 为 None 或 valid 为假（打印 errors 与 warnings）时返回 1。
 def cmd_check(args) -> int:
     """执行 check 命令"""
     source = _read_input(args.input)
@@ -187,6 +190,7 @@ def cmd_check(args) -> int:
         return 1
 
 
+# 生效条件：args.term 命中内置 explanations 字典的键时打印该条解释，未命中时打印「暂无内置解释」并提示搜索源文件用法；两条路径均返回 0。
 def cmd_explain(args) -> int:
     """执行 explain 命令"""
     # 暂时使用简单的内置解释
@@ -219,6 +223,7 @@ def cmd_explain(args) -> int:
     return 0
 
 
+# 生效条件：args.project_name 对应目录不存在时创建 src/tests/output 与 src/main.proto、protocol.toml 并返回 0；该目录已存在时打印「目录已存在」并返回 1。
 def cmd_init(args) -> int:
     """执行 init 命令"""
     project_name = args.project_name
@@ -271,6 +276,7 @@ path = "./protocol_runtime"
     return 0
 
 
+# 生效条件：args.input 经 _read_input 返回非 None 时调 tokenize，先逐个打印所有 type.name 非 "EOF" 的 token（行/列/类型/值），随后 errors 非空则打印词法错误数及各错误并返回 1、errors 为空则返回 0；_read_input 返回 None 时直接返回 1。
 def cmd_tokens(args) -> int:
     """执行 tokens 命令（调试用）"""
     source = _read_input(args.input)
@@ -295,6 +301,7 @@ def cmd_tokens(args) -> int:
     return 0
 
 
+# 生效条件：args.input 可读出源码（非 None）且 tokenize(source) 的 lex_errors 为空时，用 parse_tokens(tokens, []) 解析并打印 node_to_dict 的 JSON 后返回 0；source 为 None 或 lex_errors 非空（打印词法错误）时返回 1。
 def cmd_ast(args) -> int:
     """执行 ast 命令（调试用）"""
     source = _read_input(args.input)
@@ -310,6 +317,7 @@ def cmd_ast(args) -> int:
     
     ast = parse_tokens(tokens, [])
     
+# 生效条件：node 为 None 时返回字符串 "null"；否则返回含 type（有 type 属性取 node.type.name，否则取 str(type(node))）、line、value 的字典，且 getattr(node, 'children', []) 非空时追加递归 node_to_dict(c, depth+1) 的 children 列表。
     def node_to_dict(node, depth=0):
         if node is None:
             return "null"
@@ -327,6 +335,7 @@ def cmd_ast(args) -> int:
     return 0
 
 
+# 生效条件：无必需形参，调用即从 compiler 导入 __version__、打印版本与支持能力说明并返回 0。
 def cmd_version() -> int:
     """显示版本信息"""
     from compiler import __version__
@@ -335,6 +344,7 @@ def cmd_version() -> int:
     return 0
 
 
+# 生效条件：path 能被 Path(path).read_text(encoding="utf-8-sig") 成功读取时返回该文本（BOM 被剥离）；抛 FileNotFoundError 或其他 Exception 时打印错误并返回 None。
 def _read_input(path: str) -> Optional[str]:
     """读取输入文件（utf-8-sig：剥离 BOM——真实文件可能带 BOM）"""
     try:
@@ -347,6 +357,7 @@ def _read_input(path: str) -> Optional[str]:
         return None
 
 
+# 生效条件：sys.stdout 具 reconfigure 属性时以 errors="replace" 重配；parser.parse_args() 得到的 args.command 为 None 或 "help"、或不属于已列出的命令名时打印帮助并返回 0，为 "compile"/"check"/"explain"/"init"/"tokens"/"ast"/"compile-pbc"/"run"/"debug"/"rust"/"version" 时分别转调对应 cmd_* 并返回其返回值。
 def main():
     """CLI 主入口"""
     # Windows 控制台默认 GBK：输出中的 emoji（✅❌⚠️📖…）会触发 UnicodeEncodeError。
@@ -387,6 +398,7 @@ def main():
         return 0
 
 
+# 生效条件：args.input 可读出源码（非 None）且 compile_to_pbc(src, args.output) 的 result["ok"] 为真时，打印指令条数与 args.output 文件大小（文件不存在则记 0）并返回 0；src 为 None 或 ok 为假（打印前 5 条错误）时返回 1。
 def cmd_compile_pbc(args) -> int:
     """原生编译：中文源码 → .pbc（C3）"""
     import os
@@ -405,6 +417,7 @@ def cmd_compile_pbc(args) -> int:
     return 0
 
 
+# 生效条件：args.set 中每项含 "=" 时以首个 "=" 切出 name 与 val，val.strip() 去掉首个 "." 后 isdigit 为真则存 float(val)、否则存 val.strip() 字符串（不含 "=" 的项被跳过，args.set 为空时 symbols 为空字典）；之后以 args.pbc 与 symbols 调 run_pbc，并打印 trust、symbols、由 state["condition_space"] 各项 name 组成的条件空间与 halt 后返回 0。
 def cmd_run(args) -> int:
     """执行 .pbc（C3 独立运行时；--set 注入初始符号）"""
     from compiler.pbc import run_pbc
@@ -420,6 +433,7 @@ def cmd_run(args) -> int:
     return 0
 
 
+# 生效条件：args.input 可读出源码（非 None）且 generate_rust_project(source, args.output) 的 gen["ok"] 为真时打印项目信息；args.no_run 为真则返回 0，否则以解析后的 args.set 与 args.trust 调 build_and_run，rr["ok"] 为真打印 Rust VM 终态并返回 0、为假打印构建或运行 stderr 返回 1；source 为 None 或 gen["ok"] 为假返回 1。
 def cmd_rust(args) -> int:
     """Rust 原生后端（v0.4 · VM 路线）：源码 → cargo 项目 →（可选）构建运行"""
     import io
@@ -454,6 +468,7 @@ def cmd_rust(args) -> int:
     return 0
 
 
+# 生效条件：args.set 中每项含 "=" 时以首个 "=" 切出 name 与 val，val.strip() 去掉首个 "." 后 isdigit 为真则存 float(val)、否则存 val.strip() 字符串（不含 "=" 的项被跳过，args.set 为空时 symbols 为空字典）；之后以 args.pbc 与 symbols 调 debug_pbc，trace 非空时逐条打印 snap 的 ip/op/trust/条件空间 name 列表/halt，trace 为空（含 .pbc 为空或不可执行）时打印对应提示，两种情况均返回 0。
 def cmd_debug(args) -> int:
     """单步调试 .pbc（C4 调试器；--set 注入初始符号）"""
     from compiler.debugger import debug_pbc

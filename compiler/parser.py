@@ -66,21 +66,26 @@ class ASTNode:
     value: Any = None
     attributes: dict = field(default_factory=dict)
     
+# 生效条件：child 不是 None 时被 append 进 self.children，child 为 None 时不追加；
     def add_child(self, child: 'ASTNode'):
         if child is not None:
             self.children.append(child)
     
+# 生效条件：无 required 形参，self.type 为 NodeType 时返回 f"ASTNode({self.type.name}, value={self.value!r}, children={len(self.children)})"；
     def __repr__(self) -> str:
         return f"ASTNode({self.type.name}, value={self.value!r}, children={len(self.children)})"
 
 
 @dataclass
+# 生效条件：省略 line/column 时取默认 1，实例化即以 NodeType.PROGRAM 为类型且 statements 初始为空列表；
 class ProgramNode(ASTNode):
     """程序根节点"""
+# 生效条件：省略 line/column 时取默认 1，以 NodeType.PROGRAM 调用父类构造并把 self.statements 置为空列表；
     def __init__(self, line: int = 1, column: int = 1):
         super().__init__(NodeType.PROGRAM, line, column)
         self.statements: List[ASTNode] = []
     
+# 生效条件：stmt 非 None 时同时 append 进 self.statements 并调用 self.add_child(stmt)，stmt 为 None 时两条都不执行；
     def add_statement(self, stmt: ASTNode):
         if stmt is not None:
             self.statements.append(stmt)
@@ -88,8 +93,10 @@ class ProgramNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 question 即成立，节点类型为 NodeType.WENYUE，self.question 与 self.value 均等于该 question。
 class WenyueNode(ASTNode):
     """问曰节点"""
+# 生效条件：question 必传（line/column 默认 1），实例化即以 NodeType.WENYUE 为类型并把 question 同时写入 self.question 与 self.value；
     def __init__(self, question: str, line: int = 1, column: int = 1):
         super().__init__(NodeType.WENYUE, line, column)
         self.question = question
@@ -97,8 +104,10 @@ class WenyueNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 answer 即成立，节点类型为 NodeType.DAYUE，self.answer 与 self.value 均等于该 answer。
 class DayueNode(ASTNode):
     """答曰节点"""
+# 生效条件：answer 必传（line/column 默认 1），实例化即以 NodeType.DAYUE 为类型并把 answer 同时写入 self.answer 与 self.value；
     def __init__(self, answer: str, line: int = 1, column: int = 1):
         super().__init__(NodeType.DAYUE, line, column)
         self.answer = answer
@@ -106,20 +115,25 @@ class DayueNode(ASTNode):
 
 
 @dataclass
+# 生效条件：省略 line/column 时取默认 1，实例化即以 NodeType.SHUYUE 为类型且 steps 初始为空列表；
 class ShuyueNode(ASTNode):
     """术曰节点"""
+# 生效条件：省略 line/column 时取默认 1，以 NodeType.SHUYUE 调用父类构造并把 self.steps 置为空列表；
     def __init__(self, line: int = 1, column: int = 1):
         super().__init__(NodeType.SHUYUE, line, column)
         self.steps: List['StepNode'] = []
     
+# 生效条件：step 无条件 append 进 self.steps（源码无 None 判空）并调用 self.add_child(step)；
     def add_step(self, step: 'StepNode'):
         self.steps.append(step)
         self.add_child(step)
 
 
 @dataclass
+# 生效条件：step_num 与 statement 必传（line/column 默认 1），实例化即以 NodeType.STEP 为类型、写入 self.step_num/self.statement 并调用 add_child(statement)；
 class StepNode(ASTNode):
     """步骤节点"""
+# 生效条件：step_num 与 statement 必传（line/column 默认 1），写入 self.step_num/self.statement 并调用 self.add_child(statement)；
     def __init__(self, step_num: int, statement: ASTNode, line: int = 1, column: int = 1):
         super().__init__(NodeType.STEP, line, column)
         self.step_num = step_num
@@ -128,8 +142,10 @@ class StepNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 condition 与 then_body 即成立，二者依次加为子节点；仅当 else_body 非 None 时 else_body 才被加为子节点。
 class ConditionStmtNode(ASTNode):
     """条件语句：若 [条件] 则 [操作] [否则 [操作]]（body 可为语句列表）"""
+# 生效条件：condition 与 then_body 必传，else_body 非 None 时才作为第三个子节点加入，else_body 为 None 时子节点仅 condition 与 then_body；
     def __init__(self, condition: ASTNode, then_body, else_body=None,
                  line: int = 1, column: int = 1):
         super().__init__(NodeType.CONDITION_STMT, line, column)
@@ -143,8 +159,10 @@ class ConditionStmtNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 condition 与 body 即成立，节点类型为 NodeType.LOOP_STMT，condition 与 body 依次加为子节点。
 class LoopStmtNode(ASTNode):
     """循环语句：当 [条件] 执行 [操作]（while 语义，body 可为语句列表）"""
+# 生效条件：condition 与 body 必传（line/column 默认 1），二者都被加入子节点；
     def __init__(self, condition: ASTNode, body, line: int = 1, column: int = 1):
         super().__init__(NodeType.LOOP_STMT, line, column)
         self.condition = condition
@@ -154,8 +172,10 @@ class LoopStmtNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入可迭代的 statements 即成立，节点类型为 NodeType.BLOCK，statements 中每个元素被 add_child 追加为子节点。
 class BlockNode(ASTNode):
     """语句块：多条顺序执行的语句（循环体/条件体多语句支持）"""
+# 生效条件：statements 必传，实例化时逐个 s 调用 self.add_child(s)，statements 为空可迭代对象时不加任何子节点；
     def __init__(self, statements, line: int = 1, column: int = 1):
         super().__init__(NodeType.BLOCK, line, column)
         self.statements = statements
@@ -164,8 +184,10 @@ class BlockNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 name、params 与 body 即成立，节点类型为 NodeType.FUNC_DEF，name 与 params 存为字段，body 被加为子节点。
 class FuncDefNode(ASTNode):
     """函数定义：定义 名（参数）：语句（body 可为语句列表）"""
+# 生效条件：name、params、body 必传（line/column 默认 1），三者被写入 self.name/self.params/self.body 且 body 被加入子节点；
     def __init__(self, name: str, params: List[str], body, line: int = 1, column: int = 1):
         super().__init__(NodeType.FUNC_DEF, line, column)
         self.name = name
@@ -175,8 +197,10 @@ class FuncDefNode(ASTNode):
 
 
 @dataclass
+# 生效条件：value 为真值 ASTNode 时被加为子节点；value 为 None 时节点仍成立（类型 NodeType.RETURN_STMT）但不加子节点。
 class ReturnStmtNode(ASTNode):
     """返回语句：返回 [表达式]"""
+# 生效条件：value 必传（可为 None），value 为真值时将其加入子节点，value 为 None 等假值时不加入子节点；
     def __init__(self, value: Optional[ASTNode], line: int = 1, column: int = 1):
         super().__init__(NodeType.RETURN_STMT, line, column)
         self.value = value
@@ -185,8 +209,10 @@ class ReturnStmtNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 name 与 args 即成立，节点类型为 NodeType.CALL_EXPR，args 中每个元素被 add_child 追加为子节点。
 class CallExprNode(ASTNode):
     """函数调用：名（参数1，参数2）"""
+# 生效条件：name 与 args 必传（line/column 默认 1），args 中每个元素依次被加入子节点；
     def __init__(self, name: str, args: List[ASTNode], line: int = 1, column: int = 1):
         super().__init__(NodeType.CALL_EXPR, line, column)
         self.name = name
@@ -196,8 +222,10 @@ class CallExprNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 instruction 即成立，节点类型为 NodeType.INSTRUCTION_STMT；operands 为 None 时按空列表处理，非 None 时每个操作数被加为子节点。
 class InstructionStmtNode(ASTNode):
     """指令语句：道德经助记符 + 操作数"""
+# 生效条件：instruction 必传，operands 为 None 或空列表等假值时回落到新的 []（非空列表则沿用原对象），随后逐个 op 加入子节点；
     def __init__(self, instruction: TokenType, operands: List[ASTNode] = None,
                  line: int = 1, column: int = 1):
         super().__init__(NodeType.INSTRUCTION_STMT, line, column)
@@ -208,8 +236,10 @@ class InstructionStmtNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 target 与 value 即成立，节点类型为 NodeType.ASSIGN_STMT，target 存为字段，value 存于 value_node 并被加为子节点。
 class AssignStmtNode(ASTNode):
     """赋值语句：标识符 = 值"""
+# 生效条件：target 与 value 必传（line/column 默认 1），value 写入 self.value_node 并被加入子节点；
     def __init__(self, target: str, value: ASTNode, line: int = 1, column: int = 1):
         super().__init__(NodeType.ASSIGN_STMT, line, column)
         self.target = target
@@ -218,8 +248,10 @@ class AssignStmtNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 left、operator 与 right 即成立，节点类型为 NodeType.BINARY_EXPR，left 与 right 依次加为子节点。
 class BinaryExprNode(ASTNode):
     """二元表达式：左 操作符 右"""
+# 生效条件：left、operator、right 必传（line/column 默认 1），left 与 right 各被加入一次子节点；
     def __init__(self, left: ASTNode, operator: str, right: ASTNode,
                  line: int = 1, column: int = 1):
         super().__init__(NodeType.BINARY_EXPR, line, column)
@@ -231,8 +263,10 @@ class BinaryExprNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 left、op 与 right 即成立，节点类型为 NodeType.COMPARISON，left 与 right 依次加为子节点。
 class ComparisonNode(ASTNode):
     """比较表达式"""
+# 生效条件：left、op、right 必传（line/column 默认 1），left 与 right 各被加入一次子节点；
     def __init__(self, left: ASTNode, op: str, right: ASTNode,
                  line: int = 1, column: int = 1):
         super().__init__(NodeType.COMPARISON, line, column)
@@ -244,8 +278,10 @@ class ComparisonNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 name 即成立，节点类型为 NodeType.IDENTIFIER，self.name 与 self.value 均等于该 name。
 class IdentifierNode(ASTNode):
     """标识符"""
+# 生效条件：name 必传（line/column 默认 1），实例化即以 NodeType.IDENTIFIER 为类型并把 name 同时写入 self.name 与 self.value；
     def __init__(self, name: str, line: int = 1, column: int = 1):
         super().__init__(NodeType.IDENTIFIER, line, column)
         self.name = name
@@ -253,8 +289,10 @@ class IdentifierNode(ASTNode):
 
 
 @dataclass
+# 生效条件：传入 value 与 literal_type 即成立，节点类型为 NodeType.LITERAL，literal_value 与 value 均等于该 value，literal_type 原样保存。
 class LiteralNode(ASTNode):
     """字面量"""
+# 生效条件：value 与 literal_type 必传（line/column 默认 1），value 同时写入 self.literal_value 与 self.value，literal_type 仅被原样存储（源码不校验其取值）；
     def __init__(self, value: Union[str, float, int], literal_type: str,
                  line: int = 1, column: int = 1):
         super().__init__(NodeType.LITERAL, line, column)
@@ -267,6 +305,7 @@ class LiteralNode(ASTNode):
 # 语法分析器
 # =============================================================================
 
+# 生效条件：传入 tokens 即成立，current_token 取 tokens[0]（tokens 为空时为 None）；errors 为 None 时以空列表作为 self.errors。
 class Parser:
     """
     语法分析器 v2.0
@@ -280,12 +319,17 @@ class Parser:
         TokenType.ROU, TokenType.PU, TokenType.ZHI, TokenType.ZHIZU,
     }
     
+# 生效条件：tokens 必传，errors 为 None 时回落到新的 []，errors 为列表（含空列表）时**原样引用共享**（解析期间 append 的语法错误对调用方可见），self.current_token 在 tokens 非空时取 tokens[0]、tokens 为空时取 None；
     def __init__(self, tokens: List[Token], errors: List[str] = None):
         self.tokens = tokens
         self.pos = 0
-        self.errors: List[str] = errors or []
+        # errors if errors is not None（而非 errors or []）：空列表是 falsy，
+        # or 会把它换成内部新列表——语法错误 append 进新列表，永远回不到
+        # 调用方手里（共享列表语义失效，见 parse_tokens 调用方 compiler.py）。
+        self.errors: List[str] = errors if errors is not None else []
         self.current_token = self.tokens[0] if tokens else None
     
+# 生效条件：无 required 形参，先建 ProgramNode，随后 while not self._is_at_end()：遇 NEWLINE/SEMICOLON/COMMA 即 continue，stmt 为真值时 program.add_statement(stmt)，为假值时 _advance()，循环结束返回 program；
     def parse(self) -> ProgramNode:
         """解析整个程序"""
         program = ProgramNode()
@@ -294,6 +338,7 @@ class Parser:
             if self._match(TokenType.NEWLINE, TokenType.SEMICOLON, TokenType.COMMA):
                 continue
             
+            start_pos = self.pos
             stmt = self._parse_statement()
             if stmt:
                 program.add_statement(stmt)
@@ -304,12 +349,20 @@ class Parser:
                 #         print(f"    op{j}: {op.type.name} value={op.value!r}")
             else:
                 # print(f"  [parse] None at {self.current_token}")
-                self._advance()
+                # _parse_statement 返回 None 的分支（句号 PERIOD、无法识别的
+                # 语句开头、定义缺函数名）在返回前都已 _advance() 消费了当前
+                # token；此处再无条件推进一次会把句号/坏 token 之后的下一个
+                # token（往往是下一条语句的开头，如「道 A。德 B。」的「德」）
+                # 静默吞掉、且零错误记录。仅在确实未消费任何 token 时推进
+                # （防死循环兜底——现行各 None 分支均已推进，此兜底不触发）。
+                if self.pos == start_pos and self.current_token is not None:
+                    self._advance()
         
         return program
     
     # ---- 语句解析 ----
     
+# 生效条件：current_token 为 None 或 TokenType.EOF 返回 None；TokenType.WENYUE→_parse_wenyue_block、SHUYUE→_parse_shuyue_block、RUO→_parse_condition、DANG→_parse_loop、DINGYI→_parse_func_def、FANHUI→推进后取表达式返回 ReturnStmtNode、类型在 INSTRUCTION_TOKENS→_parse_instruction、IDENTIFIER→_parse_assign_or_call、PERIOD→推进并返回 None，其余追加带 L{line}:C{column} 的 errors 项、推进并返回 None；
     def _parse_statement(self) -> Optional[ASTNode]:
         """解析单个语句"""
         token = self.current_token
@@ -364,6 +417,7 @@ class Parser:
         self._advance()
         return None
     
+# 生效条件：无 required 形参，消费 SHUYUE 后以当前 token 的行列建 ShuyueNode，循环内先跳过分隔符（SEMICOLON/COMMA/COLON），当前 token 为 NUMBER 时取 int(float(value)) 为步骤号、可选跳过 PERIOD、解析步骤内容且内容为真值时 add_step(StepNode(...))，当前 token 非 NUMBER 即 break，最后返回 shuyue；
     def _parse_shuyue_block(self) -> Optional[ASTNode]:
         """
         解析术曰块（独立形式）：术曰：1。... 2。...
@@ -400,6 +454,7 @@ class Parser:
         
         return shuyue
     
+# 生效条件：无 required 形参（self 除外）时，若 self.current_token 为 WENYUE 且后续 _consume 能依次消费 DAYUE、SHUYUE，则收集 question/answer，循环跳过分隔符后仅当 current_token 为 NUMBER 时取 int(float(value))、可选消费 PERIOD，且仅当 _parse_step_content() 返回真值才 shuyue.add_step(StepNode(...))，非 NUMBER 时 break，最后设 shuyue.attributes 的 question/answer 并返回 shuyue；
     def _parse_wenyue_block(self) -> Optional[ASTNode]:
         """解析 问曰：... 答曰：... 术曰：... 结构"""
         # 问曰
@@ -447,6 +502,7 @@ class Parser:
         
         return shuyue
     
+# 生效条件：无 required 形参，按 current_token.type 分派——RUO→_parse_condition、DANG→_parse_loop、DINGYI→_parse_func_def、FANHUI→推进后取表达式返回 ReturnStmtNode(val,line=1,column=1)、助记符（INSTRUCTION_TOKENS）→_parse_instruction、IDENTIFIER 且 _peek_next() 为 EQUALS 或 LPAREN→_parse_assign_or_call 否则 _merge_identifiers、其余把到 NUMBER/PERIOD 前的 token 拼成字符串 LiteralNode（无内容返回 None）；
     def _parse_step_content(self) -> Optional[ASTNode]:
         """解析步骤内容"""
         if self.current_token and self.current_token.type == TokenType.RUO:
@@ -487,6 +543,7 @@ class Parser:
                                   column=self.current_token.column if self.current_token else 1)
             return None
     
+# 生效条件：无 required 形参，消费 RUO 后解析比较式并跳过标点消费 ZE，then_body 由 _parse_single_statement 取得，仅当再跳过标点后 current_token 为 FOUZE 时才推进并解析 else_body（否则 else_body=None），返回 ConditionStmtNode(condition, then_body, else_body, start_line, start_col)；
     def _parse_condition(self) -> Optional[ASTNode]:
         """解析条件语句：若 [条件] 则 [操作] [否则 [操作]]"""
         start_line = self.current_token.line if self.current_token else 1
@@ -511,6 +568,7 @@ class Parser:
         
         return ConditionStmtNode(condition, then_body, else_body, start_line, start_col)
     
+# 生效条件：无 required 形参，消费 DANG 后解析比较式、跳过标点消费 ZHIXING，body 取 _parse_statement_or_block()，返回 LoopStmtNode(condition, body, start_line, start_col)；
     def _parse_loop(self) -> Optional[ASTNode]:
         """解析循环语句：当 [条件] 执行 [操作]（while 语义）"""
         start_line = self.current_token.line if self.current_token else 1
@@ -528,6 +586,7 @@ class Parser:
         
         return LoopStmtNode(condition, body, start_line, start_col)
     
+# 生效条件：无 required 形参，消费 DINGYI 后 current_token 不属于 (IDENTIFIER, OP_ADD, OP_SUB, OP_MUL, OP_DIV) 时向 errors 追加"定义后期望函数名"并返回 None；否则取函数名，遇 LPAREN 时括号内仅 IDENTIFIER 被收作 params（其余 token 只推进），可选跳过 COLON，body 取 _parse_single_statement()，返回 FuncDefNode(name, params, body, start_line, start_col)；
     def _parse_func_def(self) -> Optional[ASTNode]:
         """解析函数定义：定义 名（参数1，参数2）：语句
         参数在（ ）内，逗号分隔；返回 FuncDefNode（body 可为块）"""
@@ -567,6 +626,7 @@ class Parser:
         
         return FuncDefNode(name, params, body, start_line, start_col)
     
+# 生效条件：无 required 形参，仅当 self.current_token 存在且其 type 属于 TokenType 的 {COMMA, PERIOD, SEMICOLON, COLON, QUESTION, EXCLAM} 之一时循环调用 self._advance；可变位置形参 target_types 在函数体内未被使用。
     def _skip_punctuation_before(self, *target_types: TokenType):
         """跳过标点符号"""
         while self.current_token and self.current_token.type in (
@@ -575,6 +635,7 @@ class Parser:
         ):
             self._advance()
     
+# 生效条件：无 required 形参，循环调用 _parse_single_statement 收语句：current_token 为 PERIOD 时推进并结束；为 SEMICOLON/COMMA 时推进且其后 token 为 NUMBER 或 SHUYUE 则结束、否则 continue；其他情况直接结束；stmts 为空返回 None，恰 1 条返回该语句本身，多条返回 BlockNode(stmts, line=stmts[0].line, column=stmts[0].column)；
     def _parse_statement_or_block(self) -> Any:
         """解析语句或块：返回语句列表（单语句=[stmt]；分号分隔多条）
 
@@ -611,6 +672,7 @@ class Parser:
             return stmts[0]
         return BlockNode(stmts, line=stmts[0].line, column=stmts[0].column)
 
+# 生效条件：无 required 形参，按 current_token.type 分派——RUO→_parse_condition、DANG→_parse_loop、DINGYI→_parse_func_def、FANHUI→推进后取表达式返回 ReturnStmtNode(val,line=1,column=1)、助记符（INSTRUCTION_TOKENS）→_parse_instruction、IDENTIFIER→_parse_assign_or_call，否则收集 _STOP（PERIOD/COMMA/SEMICOLON/WENYUE/DAYUE/SHUYUE/RUO/FOUZE/DANG/ZHIXING）之前的 token 拼成字符串 LiteralNode，文本为空返回 None；
     def _parse_single_statement(self) -> Optional[ASTNode]:
         """解析单条语句"""
         if self.current_token and self.current_token.type == TokenType.RUO:
@@ -646,6 +708,7 @@ class Parser:
                 return LiteralNode(text, "string")
             return None
     
+# 生效条件：无 required 形参，以当前 token 类型为 instr_type 并推进，随后循环至 _INST_STOP（PERIOD/COMMA/SEMICOLON/EOF 及各语句开头关键字）或 _is_at_end()：YU→推进后取 _parse_numeric_value 加入 operands、IDENTIFIER→_merge_identifiers 后加入、NUMBER→LiteralNode(float(value),"number")、STRING→LiteralNode(value,"string")、其他类型仅推进，返回 InstructionStmtNode(instr_type, operands, line=指令 token 行, column=指令 token 列)；
     def _parse_instruction(self) -> Optional[ASTNode]:
         """
         解析指令语句 v2.0
@@ -673,6 +736,10 @@ class Parser:
             TokenType.SHUYUE,    # 术曰 → 新语句
             TokenType.RUO,        # 若 → 条件语句
             TokenType.FOUZE,     # 否则 → 条件语句
+            TokenType.DANG,      # 当 → 循环语句
+            TokenType.ZHIXING,   # 执行 → 循环体开始
+            TokenType.DINGYI,    # 定义 → 函数定义
+            TokenType.FANHUI,    # 返回 → 返回语句
             TokenType.DAO,       # 道 → 指令（但不在操作数位置）
             TokenType.DE,        # 德 → 指令
             TokenType.ZIRAN,     # 自然 → 指令
@@ -719,6 +786,7 @@ class Parser:
                                    line=instr_token.line,
                                    column=instr_token.column)
     
+# 生效条件：无 required 形参，以 current_token 的 value 为首段并推进，之后把行号相同且类型为 IDENTIFIER/NUMBER 的 token.value 依次拼入（源码只比较 line、未比较列号是否连续），返回 IdentifierNode(拼接名, 起始 line, 起始 col)；
     def _merge_identifiers(self) -> ASTNode:
         """
         合并从当前位置开始的紧密相连的 IDENTIFIER/NUMBER 序列
@@ -744,6 +812,7 @@ class Parser:
         merged_name = "".join(parts)
         return IdentifierNode(merged_name, line, col)
     
+# 生效条件：无 required 形参，current_token 为 None 或类型为其他时返回 None；为 NUMBER 时返回 float 值 LiteralNode；为 IDENTIFIER 时若后随 PERIOD 再跟 NUMBER 则拼接为小数、后随 PERIOD 而后续非 NUMBER 则 float(prefix) 成功返回数值节点、ValueError 时返回 IdentifierNode、后随 NUMBER 则拼接转 float、其余后随返回 IdentifierNode。
     def _parse_numeric_value(self) -> Optional[ASTNode]:
         """解析数值（可能跨多个 token）"""
         if self.current_token is None:
@@ -780,6 +849,7 @@ class Parser:
         
         return None
     
+# 生效条件：无 required 形参，取自 self.current_token 的标识符消费后：紧跟 EQUALS 则解析表达式返回 AssignStmtNode(target=ident,...)；紧跟 LPAREN 则循环收集 IDENTIFIER/NUMBER 参数（其他 token 直接 _advance 跳过），遇到 RPAREN 或无 RPAREN 时均返回 CallExprNode(ident, args,...)；其余情况返回 IdentifierNode(ident,...)。
     def _parse_assign_or_call(self) -> Optional[ASTNode]:
         """解析赋值或调用
 
@@ -822,6 +892,7 @@ class Parser:
 
         return IdentifierNode(ident, line, col)
     
+# 生效条件：无 required 形参，先以 _parse_expression() 得 left，仅当随后 self.current_token.type 属于 DENGYU/DAYU/XIAOYU/WEI/BUWEI 时消费该 token（映射为 ==/>/</==/!=，WEI 与 DENGYU 均映射 ==）并取 right（_parse_numeric_value 返回 None 时改调 _parse_expression）返回 ComparisonNode，否则原样返回 left。
     def _parse_comparison(self) -> ASTNode:
         """解析比较表达式"""
         left = self._parse_expression()
@@ -941,6 +1012,7 @@ class Parser:
                 self._advance()
             return LiteralNode("".join(parts).strip(), "string")
     
+# 生效条件：必填实参 left 已解析，仅当 self.current_token.type 为 OP_ADD/OP_SUB/OP_MUL/OP_DIV 时消费该运算符、以 _parse_expression() 解析 right 并返回 BinaryExprNode（单级，不再递归调用自身），否则原样返回 left。
     def _parse_binary_tail(self, left: ASTNode) -> ASTNode:
         """解析二元算术尾部：left [+|-|*|/] right（右结合单级，满足循环体自增语义）"""
         if self.current_token and self.current_token.type in (
@@ -961,11 +1033,13 @@ class Parser:
     
     # ---- 辅助方法 ----
     
+# 生效条件：无 required 形参，self.pos >= len(self.tokens)（含 tokens 为空列表）或 self.current_token 非 None 且其 type 为 TokenType.EOF 时返回 True，否则返回 False。
     def _is_at_end(self) -> bool:
         return self.pos >= len(self.tokens) or (
             self.current_token is not None and self.current_token.type == TokenType.EOF
         )
     
+# 生效条件：无 required 形参，pos < len(self.tokens)-1 时 pos 加 1、current_token 置为 tokens[pos] 并返回之；pos == len(self.tokens)-1 时 pos 加 1、current_token 置为 None 并返回 None；pos 已大于 len(self.tokens)-1 时不改动，返回当前 self.current_token。
     def _advance(self) -> Optional[Token]:
         if self.pos < len(self.tokens) - 1:
             self.pos += 1
@@ -975,6 +1049,7 @@ class Parser:
             self.current_token = None
         return self.current_token
 
+# 生效条件：无 required 形参，仅当 self.pos < len(self.tokens)-1 时返回 self.tokens[self.pos + 1]（不推进 self.pos），否则返回 None（含 tokens 为空时）。
     def _peek_next(self) -> Optional[Token]:
         """查看下一个 token（不消费）"""
         if self.pos < len(self.tokens) - 1:
@@ -987,6 +1062,7 @@ class Parser:
             return True
         return False
     
+# 生效条件：必填实参 token_type 与 message 到位，self.current_token 非 None 且 type == token_type 时返回该 token 并 _advance；否则向 self.errors 追加含 token_type 不符位置与 message 的字符串并返回 None（current_token 为 None 时位置记为 EOF）。
     def _consume(self, token_type: TokenType, message: str) -> Optional[Token]:
         if self.current_token and self.current_token.type == token_type:
             token = self.current_token
@@ -997,6 +1073,7 @@ class Parser:
             self.errors.append(f"{loc} {message}，实际得到: '{self.current_token.value if self.current_token else 'EOF'}'")
             return None
     
+# 生效条件：无 required 形参，从 self.current_token 起循环收集，current_token 为 None、type 为 TokenType.EOF 或 type 属于 stop_types 时停止；循环内 type 为 COLON 的 token 只 _advance 不加入 parts，其余加入 parts 后推进，返回 parts（stop_types 为空元组时只有 EOF 或 token 耗尽能终止）。
     def _collect_until(self, *stop_types: TokenType) -> List[Token]:
         """收集 Token 直到遇到停止类型"""
         parts = []
@@ -1015,18 +1092,23 @@ class Parser:
 # 便捷函数
 # =============================================================================
 
+# 生效条件：传入 tokens 且 errors 为 None 时回落新的 []，为列表（含空列表）时原样共享给 Parser（语法错误可回流），返回 Parser(...).parse() 得到的 ProgramNode。
 def parse_tokens(tokens: List[Token], errors: List[str] = None) -> ProgramNode:
     """便捷函数：将 Token 列表解析为 AST"""
-    parser = Parser(tokens, errors or [])
+    parser = Parser(tokens, errors if errors is not None else [])
     return parser.parse()
 
 
+# 生效条件：传入 source 字符串时，tokenize(source) 产出 tokens 与 lex_errors，parse_errors 作为共享列表传入 parse_tokens 收集语法错误，返回 (AST, lex_errors, parse_errors)。
 def parse_source(source: str) -> tuple:
     """便捷函数：从源代码直接解析为 AST"""
     from .lexer import tokenize
     tokens, lex_errors = tokenize(source)
-    ast = parse_tokens(tokens, [])
-    return ast, lex_errors, ast.errors if hasattr(ast, 'errors') else []
+    # 语法错误经共享列表回流（ProgramNode 无 errors 属性，旧写法
+    # ast.errors 恒 []——含语法错误的源码在这里永远报成功）。
+    parse_errors: List[str] = []
+    ast = parse_tokens(tokens, parse_errors)
+    return ast, lex_errors, parse_errors
 
 
 # =============================================================================

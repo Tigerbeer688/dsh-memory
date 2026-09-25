@@ -25,7 +25,7 @@ import tempfile
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, os.path.dirname(_HERE))
 
-from .md_whitebox import DEFAULT_ROOT, build_db_from_md  # noqa: E402
+from .md_whitebox import DEFAULT_ROOT, build_db_from_md, corpus_gap  # noqa: E402
 
 # 平铺导入引导（对齐 whitebox_kb/__init__：md_access 需在 sys.path 注入后导入）
 _WB = os.path.join(_HERE, "whitebox_kb")
@@ -134,6 +134,13 @@ def _param_groups(arg_tpls, samples):
 
 def main():
     ok = True
+    # 依赖自辩（2026-09-20 v14 缺陷 F）：md 语料是 gitignored 本地数据面，
+    # 缺失/空壳时**本模块自己**打 SKIP 返回 0——不再依赖外部 runner 探测
+    # （旁路执行时 runner 不在场），也不再留下未捕获异常或空壳副作用。
+    _gap = corpus_gap(DEFAULT_ROOT)
+    if _gap:
+        print("SKIP test_md_access_parity：%s" % _gap)
+        return 0
     print("== [1] 重建派生库 + 建 MdConn ==")
     stats = build_db_from_md(force=True, verbose=True)
     md_conn = MdConn(DEFAULT_ROOT, layers=LAYERS)
@@ -142,8 +149,13 @@ def main():
         n_sq = sq.execute("SELECT COUNT(*) FROM nodes").fetchone()[0]
         n_md = len(md_conn._all_rows())
         print(f"  派生库 nodes={n_sq}  md 直读行={n_md}")
-        ok &= _ok(n_sq == n_md == stats["nodes"] == 4355,
-                  "行数等价且为 4355")
+        # 判据=三方等价（派生库 == md 直读 == 还原计数）。旧断言把 `== 4355`（导出前
+        # 快照行数）一并写死：绝对行数是本地数据面规模、非代码契约，锚死它会让「数据面
+        # 正常生长」被误判成等价性破坏（2026-09-19 重跑 migrate_wisdom_graph.export 后
+        # 4355 → 4459 即由此假红）。保留量级下界防退化为空库。
+        ok &= _ok(n_sq == n_md == stats["nodes"] and n_sq >= 4000,
+                  f"行数三方等价（派生库 {n_sq} == md 直读 {n_md} == "
+                  f"还原 {stats['nodes']}）且 >= 4000")
 
         print("== [2] 8 处真实 SQL 逐位对拍 ==")
         names, prefixes, kps = _sample_params(md_conn)

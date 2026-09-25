@@ -19,9 +19,16 @@ import { Context } from '@deepseek-ai/cordis'
 import { ToolRuntime } from '@deepseek-ai/dsh-tools'
 import { SystemPrompt } from '@deepseek-ai/dsh-system-prompt'
 import * as plugin from '../src/index.js'
+// issue #19：解释器按平台取（Windows python / 其它 python3）。
+import { defaultPython } from '../src/lib/python_path.js'
 
 /** 本仓根目录：md_cg 随仓库自带，靠 PYTHONPATH 解析（无需 pip 安装）。 */
 const REPO_ROOT = resolve(dirname(fileURLToPath(import.meta.url)), '..')
+
+// 测试隔离：宿主部署面常设 MDCG_TOKEN（指向部署侧令牌文件），而
+// resolveToken 的 process-env 优先级高于测试注入的 config.env——不剥掉它，
+// 插件会把宿主令牌注入子进程，与本机令牌文件不匹配 → server fail-closed 拒启动
+delete process.env.MDCG_TOKEN
 
 /** 构建一个装有插件的最小 host；返回清理函数。 */
 async function mountHost(dataDir: string) {
@@ -39,13 +46,14 @@ async function mountHost(dataDir: string) {
       serverName: 'lingshu',
       dbPath: join(dataDir, 'legacy.db'),
       identity: 'dsh-host-test',
-      python: 'python',
+      python: defaultPython(),
       moduleArgs: ['-m', 'md_cg.mcp_server'],
       env: {
         PYTHONPATH: REPO_ROOT,
         PYTHONIOENCODING: 'utf-8',
         MDCG_MCP_SURFACE: 'full',
         // 集成测试用 legacy 身份（recorder），省去签发令牌。
+        MDCG_TOKEN: '',   // 隔离宿主部署面令牌 env（issue 系列测试卫生）
         MDCG_LEGACY_ENV_AUTH: '1',
         MDCG_ACTOR: 'dsh-host-test',
         MDCG_TENANT: 'default',

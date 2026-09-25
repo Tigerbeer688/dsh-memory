@@ -12,6 +12,9 @@ import { createInterface } from 'node:readline'
 import { mkdirSync, appendFileSync } from 'node:fs'
 import { dirname, join } from 'node:path'
 import { homedir } from 'node:os'
+// issue #19：自检命令文案按平台给出（Windows python / 其它 python3）、
+// 并在 ENOENT 时把「解释器名不匹配」这一第一因直接写进日志。
+import { explainMissingPython, selfCheckCommand } from './lib/python_path.js'
 
 /**
  * 调试探针：记录桥生命周期到独立文件（绕过 DSH 日志系统，便于定位启动问题）。
@@ -156,8 +159,34 @@ export class LingshuBridge {
     return new Promise((resolve) => this.bootQueue.push(resolve))
   }
 
+  /**
+   * V23 修复（缺陷 :284）：清理上一个仍存活的子进程。
+   * 握手超时/启动失败重试时直接 spawn 新进程并覆盖 this.proc（:182），
+   * 旧进程若仍存活（卡死但不退出的服务端）既不 kill 也不关 stdin——
+   * 引用被覆盖后永远无人清理 = 僵尸进程泄漏（最多 MAX_RETRIES 个并存，
+   * dispose 也只收尾最后一个）。换代前统一回收：stdin EOF 优雅退出 + kill 兜底。
+   * 幂等：已退出（exitCode/signalCode 非 null）的进程跳过。
+   */
+  private killStaleProc(): void {
+    const old = this.proc
+    this.proc = null                    // 先摘引用：旧进程随后的 exit 事件走 stale 早退分支
+    if (!old || old.exitCode !== null || old.signalCode !== null) return
+    try {
+      old.stdin?.end()
+    } catch {
+      /* 已关闭则忽略 */
+    }
+    try {
+      old.kill()
+    } catch {
+      /* 已退出则忽略 */
+    }
+  }
+
   private spawnAndHandshake(): void {
     if (this.disposed) return
+    // V23：重试路径先回收上一个仍存活的子进程（防换代泄漏僵尸进程）
+    this.killStaleProc()
     this.procStartedAt = Date.now()
     const { python, args, env, cwd } = this.options
     const childEnv = { ...process.env, ...env }
@@ -203,6 +232,12 @@ export class LingshuBridge {
       // 进程无法启动（python 不存在等）——响亮失败
       if (!this.disposed) {
         console.error(`[lingshu-bridge] 灵枢进程启动失败: ${err.message}`)
+        // issue #19：ENOENT 的第一因通常不是「环境损坏」，而是解释器名与平台不匹配
+        // （Linux/macOS 按 PEP 394 只有 python3）。把成因与修法写进同一条日志——
+        // 原始日志把该缺陷伪装成「调用超时」，用户按超时方向排查只会白耗一轮。
+        if ((err as NodeJS.ErrnoException).code === 'ENOENT') {
+          console.error(`[lingshu-bridge] ${explainMissingPython(python)}`)
+        }
         probe(`spawn error: ${String(err)}`)
         this.readyState = 'failed'
         this.flushBootQueue(false)
@@ -211,6 +246,13 @@ export class LingshuBridge {
     })
 
     proc.on('exit', (code, signal) => {
+      // V23：被换代清理的旧进程退出（this.proc 已指向新一代或为 null）——
+      // 不动当前进程的 rl/pending/重试状态机，只留探针；否则旧 exit 会
+      // close 新进程的 readline、误拒新进程的挂起请求并多触发一轮重试。
+      if (proc !== this.proc) {
+        probe(`stale proc exit code=${code} signal=${signal}（换代已回收，不影响当前进程）`)
+        return
+      }
       // 探针：写独立文件记录退出（绕过 DSH 日志系统，便于定位）
       const uptimeS = this.procStartedAt
         ? Math.round((Date.now() - this.procStartedAt) / 1000)
@@ -230,8 +272,8 @@ export class LingshuBridge {
         this.unexpectedExits.push(Date.now())
         if (uptimeS >= 0 && uptimeS < 5) {
           console.error(
-            '[lingshu-bridge] 进程启动后 5 秒内即退出——请检查 python 可执行文件与 md_cg 依赖。' +
-            '自检 `python -m md_cg.mcp_server` 须在插件包根目录运行' +
+            `[lingshu-bridge] 进程启动后 5 秒内即退出——请检查 ${python} 可执行文件与 md_cg 依赖。` +
+            `自检 \`${selfCheckCommand(python)}\` 须在插件包根目录运行` +
             '（插件已自动锚定 cwd 与 PYTHONPATH，issue #12）。')
         } else if (this.unexpectedExits.length >= 3) {
           console.error(
@@ -292,7 +334,8 @@ export class LingshuBridge {
       this.flushBootQueue(false)
       console.error(
         `[lingshu-bridge] 连续启动失败 ${this.retries} 次，已停止自动重启（不再后台空转）。` +
-        '请检查 python 可执行文件与 md_cg 依赖；自检 `python -m md_cg.mcp_server` 须在插件包根目录运行' +
+        `请检查 ${this.options.python} 可执行文件与 md_cg 依赖；` +
+        `自检 \`${selfCheckCommand(this.options.python)}\` 须在插件包根目录运行` +
         '（插件已自动锚定 cwd 与 PYTHONPATH，issue #12），修复后在 DSH 中重新启用 dsh-memory 插件。')
       probe(`give up: ${this.retries} consecutive failures, entering failed terminal state`)
       return
@@ -322,7 +365,9 @@ export class LingshuBridge {
     if (this.gaveUp) {
       return Promise.reject(new Error(
         '灵枢进程不可用：连续启动失败已达上限，已停止重试。' +
-        '请检查 python 可执行文件与 md_cg 依赖（自检 `python -m md_cg.mcp_server` 须在插件包根目录运行），修复后重新启用 dsh-memory 插件。'))
+        `请检查 ${this.options.python} 可执行文件与 md_cg 依赖` +
+        `（自检 \`${selfCheckCommand(this.options.python)}\` 须在插件包根目录运行），` +
+        '修复后重新启用 dsh-memory 插件。'))
     }
     const id = this.nextId++
     const timeout = this.options.timeoutMs
