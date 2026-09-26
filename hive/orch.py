@@ -49,6 +49,7 @@ import hashlib
 import json
 import os
 import sys
+import tempfile
 import time
 
 HIVE_DIR = os.path.dirname(os.path.abspath(__file__))
@@ -265,15 +266,58 @@ def _load_children() -> list:
         return []
 
 
-# 生效条件：无入参，当 _CFG['children'] 可被 json.dump 时写临时文件并 os.replace 到 _children_path()，OSError 被吞，函数总返回 None。
+# 生效条件：path 与 payload 给定——tempfile.mkstemp(prefix=<basename>., suffix=".tmp", dir=path 同目录) 建唯一临时文件，UTF-8 json.dump(payload, ensure_ascii=False)+flush+fsync 后 os.replace 原子替换到 path；Windows replace 撞读者瞬态句柄（PermissionError）按 10ms×递增重试至多 50 次，replace 撞 FileNotFoundError（tmp 被瞬态消费/清理）时重建唯一名重写再试；任一重试耗尽才向外抛；finally best-effort 清理仍存在的 tmp（成功路径零残留）。与 exec.write_result 同一模板（v10 N82 先例，K1 并发压测守卫在位）。
+def _atomic_write_json(path: str, payload) -> None:
+    """tmp + fsync + rename 原子替换（N142/N88 批次 49）。
+
+    N142：旧 _save_children 固定共享 tmp `_children.json.tmp`+裸写——双写者
+    对撞（N92 孤儿+recover_orphans 重投并存的编排 job）撕裂 JSON 被 replace
+    落盘，接管者 _load_children 读坏回 [] 全量重复派发。唯一临时名（同目录
+    保证 rename 原子性，随机后缀防共享名对撞）+双异常重试自愈。
+    N88：spec 补全写回裸 open("w") 先截断再写——写中途异常（磁盘满/杀毒锁/
+    强杀落窗）毁掉任务契约，rust 重投读坏 spec 永久失败；原子替换保证
+    任意时刻要么旧完整态、要么新完整态。
+    """
+    d = os.path.dirname(path) or "."
+    base = os.path.basename(path)
+
+    def _mk_and_dump():
+        fd, tmp = tempfile.mkstemp(prefix=base + ".", suffix=".tmp", dir=d)
+        with os.fdopen(fd, "w", encoding="utf-8") as f:
+            json.dump(payload, f, ensure_ascii=False)
+            f.flush()
+            os.fsync(f.fileno())
+        return tmp
+
+    tmp = _mk_and_dump()
+    try:
+        for attempt in range(50):
+            try:
+                os.replace(tmp, path)
+                return
+            except PermissionError:
+                if attempt == 49:
+                    raise
+                time.sleep(0.01 * (attempt + 1))
+            except FileNotFoundError:
+                if attempt == 49:
+                    raise
+                tmp = _mk_and_dump()
+    finally:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+
+
+# 生效条件：无入参，当 _CFG['children'] 可被 json.dump 且目录可写时经 _atomic_write_json（mkstemp 唯一名+fsync+os.replace，N142 批次 49）原子落到 _children_path()；任一失败经 log 留痕（v8 N70 写侧残面收口——不再 except OSError: pass 静默吞：清单丢失会让接管者 _load_children 回 [] 全量重复派发，必须可查），函数总返回 None。
 def _save_children() -> None:
     try:
-        tmp = _children_path() + ".tmp"
-        with open(tmp, "w", encoding="utf-8") as f:
-            json.dump({"children": _CFG["children"]}, f, ensure_ascii=False)
-        os.replace(tmp, _children_path())
-    except OSError:
-        pass
+        _atomic_write_json(_children_path(), {"children": _CFG["children"]})
+    except OSError as e:
+        _ex.log(_CFG.get("job_dir") or ".",
+                f"子任务清单落盘失败（{type(e).__name__}: {e}）"
+                "——接管续跑将重复派发，请检查磁盘/权限")
 
 
 # ------------------------------------------------------------- 身份（Q3 落地）
@@ -377,7 +421,7 @@ def _known_children() -> list:
 
 # -------------------------------------------------------------- 工具实现（三）
 
-# 生效条件：a 为 dict，在 len(_CFG['children']) < _CFG['max_subtasks']、a.get('user_prompt') 去空白后非空、a.get('model') 或 _CFG['model'] 去空白后非空、a.get('tools') 各项（缺省/空列表回落 list(SUB_TOOLS_ALLOW)）均属 SUB_TOOLS_ALLOW、a.get('context_files') 每项对应路径 isfile 为真时，构造 sub 白名单键（仅当 a.get(k) not in (None, '', [], {}) 才写入 system_prompt/context_files/max_tool_rounds/web_search_backend/mdcg_root/max_tokens/temperature/thinking），timeout_s 取 int(a.get('timeout_s') or _hm.DEFAULT_TIMEOUT_S)，context_budget_tokens 取 int(a.get('context_budget_tokens') or _hm.DEFAULT_CONTEXT_BUDGET_TOKENS)，reasoning_effort 取 a.get('reasoning_effort') or _hm.DEFAULT_REASONING_EFFORT，提交后 append 到 _CFG['children']、_save_children()、_ex.progress(kind='spawn_subtask') 并返回 ok=True 及 defaults；上述前置失败则返回对应 {'ok': False, 'error': ...}。
+# 生效条件：a 为 dict，在 len(_CFG['children']) < _CFG['max_subtasks']、a.get('user_prompt') 去空白后非空、a.get('model') 或 _CFG['model'] 去空白后非空、a.get('tools') 各项（缺省/空列表回落 list(SUB_TOOLS_ALLOW)）均属 SUB_TOOLS_ALLOW、a.get('context_files') 每项对应路径 isfile 为真时，构造 sub 白名单键（仅当 a.get(k) not in (None, '', [], {}) 才写入 system_prompt/context_files/max_tool_rounds/web_search_backend/mdcg_root/max_tokens/temperature/thinking），timeout_s 取 _ex._int_arg(a,'timeout_s',_hm.DEFAULT_TIMEOUT_S,hi=sys.maxsize)、context_budget_tokens 取 _ex._int_arg(a,'context_budget_tokens',_hm.DEFAULT_CONTEXT_BUDGET_TOKENS,hi=sys.maxsize)（脏值/非正回落默认，不夹紧），reasoning_effort 取 a.get('reasoning_effort') or _hm.DEFAULT_REASONING_EFFORT，提交后 append 到 _CFG['children']、_save_children()、_ex.progress(kind='spawn_subtask') 并返回 ok=True 及 defaults；上述前置失败则返回对应 {'ok': False, 'error': ...}。
 def _spawn(a: dict) -> dict:
     """派发子任务。
 
@@ -418,11 +462,18 @@ def _spawn(a: dict) -> dict:
               "mdcg_root", "max_tokens", "temperature", "thinking"):
         if a.get(k) not in (None, "", [], {}):
             sub[k] = a[k]
-    # 统一子代理默认注入（与 MCP 面同源常量，显式传值优先）
-    sub["timeout_s"] = int(a.get("timeout_s") or _hm.DEFAULT_TIMEOUT_S)
+    # 统一子代理默认注入（与 MCP 面同源常量，显式传值优先）。
+    # 脏参容错（v2 N13，2026-09-25）：timeout_s/context_budget_tokens 是模型
+    # 可控参数，function calling 常见脏值 '600s'/'20k'/[600] 曾从裸 int() 抛
+    # ValueError/TypeError 逃出工具处理器 → exec.main 兜底以 EXIT_API 判死
+    # 整个编排 job（已派发子任务全部成孤儿）。接 exec._int_arg 模板：脏值/
+    # 非正回落默认；hi=sys.maxsize = 本面不引入新值域上限（上限属调度面语义）。
+    sub["timeout_s"] = _ex._int_arg(a, "timeout_s", _hm.DEFAULT_TIMEOUT_S,
+                                    hi=sys.maxsize)
     sub["reasoning_effort"] = a.get("reasoning_effort") or _hm.DEFAULT_REASONING_EFFORT
-    sub["context_budget_tokens"] = int(
-        a.get("context_budget_tokens") or _hm.DEFAULT_CONTEXT_BUDGET_TOKENS)
+    sub["context_budget_tokens"] = _ex._int_arg(
+        a, "context_budget_tokens", _hm.DEFAULT_CONTEXT_BUDGET_TOKENS,
+        hi=sys.maxsize)
     jobs = _hm._jobs_dir()
     cid = _hm._submit(jobs, sub)
     _CFG["children"].append({
@@ -460,7 +511,7 @@ def _poll(a: dict) -> dict:
             "active": len(cards) - len(done), "children": cards}
 
 
-# 生效条件：a 为 dict，a.get('job_id') 去空白后非空且 jid 属于 _known_children() 时，cap=int(a.get('max_chars') or FULL_MAX_CHARS)，读 _CFG['jobs']/jid/result.json；OSError 返回 {'ok': False, ...}，len(raw)>cap 时返回 truncated=True/head，否则返回 truncated=False/raw；job_id 缺失或越权返回 {'ok': False, ...}。
+# 生效条件：a 为 dict，a.get('job_id') 去空白后非空且 jid 属于 _known_children() 时，cap=_ex._int_arg(a,'max_chars',FULL_MAX_CHARS,hi=sys.maxsize)（脏值/非正回落默认），读 _CFG['jobs']/jid/result.json；OSError 返回 {'ok': False, ...}，len(raw)>cap 时返回 truncated=True/head，否则返回 truncated=False/raw；job_id 缺失或越权返回 {'ok': False, ...}。
 def _read_full(a: dict) -> dict:
     jid = (a.get("job_id") or "").strip()
     if not jid:
@@ -469,7 +520,10 @@ def _read_full(a: dict) -> dict:
         return {"ok": False, "error": (
             f"{jid} 不是本编排者派发的子任务（越权读被拒）。"
             f"已知子任务：{_known_children() or '（无）'}")}
-    cap = int(a.get("max_chars") or FULL_MAX_CHARS)
+    # 脏参/负数容错（v2 N13）：'2k' 等脏串曾抛 ValueError 逃出杀 job；
+    # 负数（如 -100）曾使 len(raw)>cap 恒真而 head=raw[:-100]——truncated=True
+    # 却返回 ~90% 全文（截断契约破坏）。_int_arg：脏值/非正一律回落默认。
+    cap = _ex._int_arg(a, "max_chars", FULL_MAX_CHARS, hi=sys.maxsize)
     path = os.path.join(_CFG["jobs"], jid, "result.json")
     try:
         with open(path, encoding="utf-8") as f:
@@ -556,7 +610,7 @@ def merge_tools(spec: dict) -> tuple:
     return tools, added
 
 
-# 生效条件：len(sys.argv)<2 时输出 usage 并返回 EXIT_SPEC；否则 job_dir=normpath(sys.argv[1])、job_id=basename(job_dir)，read_spec 异常则写 result 返回 EXIT_SPEC，spec.orchestrate.max_subtasks 为真值时尝试 _CFG['max_subtasks']=max(1,int(...))（TypeError/ValueError 静默跳过），load_principal(job_id) 抛 OrcError 则写 result 返回 EXIT_SPEC，成功则 _CFG.update({job_id, job_dir, jobs=_hm._jobs_dir(), model=(spec.get('model') or '').strip(), children=_load_children()})、merge_tools 补 tools、缺 system_prompt 填 ORCH_SYSTEM_PROMPT、写回 spec、register_tools(ORCH_SCHEMAS, orch_handler)、set_principal_factory(...)、log/progress，最后返回 _ex.main() 并在 finally 调 _save_children()。
+# 生效条件：len(sys.argv)<2 时输出 usage 并返回 EXIT_SPEC；否则 job_dir=normpath(sys.argv[1])、job_id=basename(job_dir)，read_spec 异常则写 result 返回 EXIT_SPEC，spec.orchestrate.max_subtasks 为真值时尝试 _CFG['max_subtasks']=max(1,int(...))（TypeError/ValueError 静默跳过），load_principal(job_id) 抛 OrcError 则写 result 返回 EXIT_SPEC，成功则先 _CFG.update({job_id, job_dir, jobs=_hm._jobs_dir(), model=(spec.get('model') or '').strip()}) 再 _CFG.update({children: _load_children()})（v10 N87：children 装载必须后于 job_dir 就位——单字面量会在构造期以初态空 job_dir 求值 _load_children，恒读 CWD 相对 _children.json）、merge_tools 补 tools、缺 system_prompt 填 ORCH_SYSTEM_PROMPT、写回 spec、register_tools(ORCH_SCHEMAS, orch_handler)、set_principal_factory(...)、log/progress，最后返回 _ex.main() 并在 finally 调 _save_children()。
 def main() -> int:
     if len(sys.argv) < 2:
         sys.stderr.write("usage: orch.py <job_dir>\n")
@@ -594,13 +648,21 @@ def main() -> int:
         return EXIT_SPEC
 
     # —— ② 运行时配置（子任务清单持久化读回：换人续跑不重复派发）
+    # v10 N87（2026-09-25，复现成立）：children 的装载必须拆到 _CFG 的
+    # job_dir 就位**之后**——旧的单个 update 字面量里 "children":
+    # _load_children() 在**字典构造期**求值，此刻 _CFG["job_dir"] 仍为模块
+    # 初态空串，_children_path() 恒解析为 CWD 相对 "_children.json"（=serve
+    # 的 HIVE_DIR）：接管者恒视为无子任务全量重复派发（max_subtasks 从 0
+    # 重计可放行翻倍）；CWD 恰有他人/遗留 _children.json 时读进他人清单，
+    # poll/read_full 以本编排者身份读他人结果（越权读污染）。两阶段 update
+    # 是纯求值顺序调整，零语义变更。
     _CFG.update({
         "job_id": job_id,
         "job_dir": job_dir,
         "jobs": _hm._jobs_dir(),
         "model": (spec.get("model") or "").strip(),
-        "children": _load_children(),
     })
+    _CFG.update({"children": _load_children()})
 
     # —— ③ spec 补全并写回（exec.main 会重新读盘；补全留痕在 spec 里可审计）
     tools, added = merge_tools(spec)
@@ -616,8 +678,9 @@ def main() -> int:
         max(12, 4 + 2 * int(_CFG.get("max_subtasks") or DEFAULT_MAX_SUBTASKS)),
     )
     try:
-        with open(os.path.join(job_dir, "spec.json"), "w", encoding="utf-8") as f:
-            json.dump(spec, f, ensure_ascii=False)
+        # N88（批次 49）：原子写回——exec.main 会重新读盘，裸 open("w") 先截断
+        # 再写，写中途异常毁任务契约（rust 重投读坏 spec 永久失败）。
+        _atomic_write_json(os.path.join(job_dir, "spec.json"), spec)
     except OSError as e:
         _ex.log(job_dir, f"spec 补全写回失败（{e}）——工具注册仍按内存值生效")
 
