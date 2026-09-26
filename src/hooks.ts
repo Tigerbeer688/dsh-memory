@@ -255,8 +255,12 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
           // 2) knowledge 层：基于当前对话上下文召回高相关度教训
           if (lastUserMsg) {
             try {
+              // 召回必须限定 knowledge 层：不传 layer 时 cg.search 搜全部层，
+              // 而查询词就是几秒前刚落盘 contextual 层的同一句用户消息，
+              // 自匹配高分回声会把真正的教训挤出 top-k（【灵枢交易教训】
+              // 因此回显用户原话）。
               const query = lastUserMsg.slice(0, 80) + ' 教训 经验 错误'
-              const kr = await graph.recall(query, 8)
+              const kr = await graph.read(query, { k: 8, layer: 'knowledge' })
               const kItems = (kr && Array.isArray((kr as any).pack)) ? (kr as any).pack : (kr && Array.isArray((kr as any).results)) ? (kr as any).results : (Array.isArray(kr) ? kr : [])
               ctx.logger.info(`dsh-memory: knowledge-recall(query="${query.slice(0, 40)}") 返回 ${kItems.length} 条`)
               const kText = kItems

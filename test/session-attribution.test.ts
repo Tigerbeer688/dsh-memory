@@ -31,11 +31,13 @@ type SessionEventHandler = (session: unknown, event: unknown) => void
 
 interface TimelineCall { limit?: number; extra: Record<string, unknown> }
 interface RememberCall { content: string; extra: Record<string, unknown> }
+interface ReadCall { query: string; extra: Record<string, unknown> }
 
-/** 最小 MdcgClient 形态：只实现 hooks 用到的四个方法，并记录调用。 */
+/** 最小 MdcgClient 形态：只实现 hooks 用到的方法，并记录调用。 */
 function makeGraph() {
   const timelineCalls: TimelineCall[] = []
   const rememberCalls: RememberCall[] = []
+  const readCalls: ReadCall[] = []
   const graph = {
     isReady: (): boolean => true,
     async timeline(limit?: number, extra: Record<string, unknown> = {}) {
@@ -50,8 +52,16 @@ function makeGraph() {
       return { ok: true }
     },
     async recall() { return { ok: true } },
+    /** 镜像 MCP `cg(op=read)` → `cg.search(q, layer=...)`：不传 layer 搜全部层，
+     *  于是刚写入 contextual 的同一句话按自匹配高分排在知识教训之前。 */
+    async read(query: string, extra: Record<string, unknown> = {}) {
+      readCalls.push({ query, extra })
+      const lesson = { node: { content: '【教训】下单前先核对交易时段，避免集合竞价误操作' }, score: 0.42 }
+      const echo = { node: { content: '下单前要不要检查交易时段？' }, score: 0.82 }
+      return { results: extra['layer'] === 'knowledge' ? [lesson] : [echo, lesson] }
+    },
   }
-  return { graph, timelineCalls, rememberCalls }
+  return { graph, timelineCalls, rememberCalls, readCalls }
 }
 
 function makeHarness(graph: object, overrides: Partial<MemoryHooksOptions> = {}) {
@@ -175,4 +185,20 @@ test('⑥ 开关尊重既有语义：关掉 autoRecall 则不注册自动召回�
 
   assert.equal(assembleHandlerCount(), 0, 'autoRecall=false 不应注册 system-prompt/assemble 监听')
   assert.equal(timelineCalls.length, 0, 'autoRecall=false 不应发起 timeline 调用')
+})
+
+test('⑦ 教训召回限定 knowledge 层：查询词是刚落盘的同一句话，不限层则回声顶掉教训', async () => {
+  const { graph, readCalls } = makeGraph()
+  const { send, assemble } = makeHarness(graph)
+
+  send({ id: 'sess_A' }, userEvent('下单前要不要检查交易时段？'))
+  await Promise.resolve()
+  const a = await assemble({ agent: { session: { id: 'sess_A' } } })
+
+  assert.deepEqual(readCalls[0]!.extra, { k: 8, layer: 'knowledge' },
+    'cg(op=read) 必须显式带 layer：缺省搜全部层会返回用户原话的自匹配回声')
+  const block = a.contexts.find((c) => c.name === 'lingshu:knowledge-recall')
+  assert.ok(block, '应注入【灵枢交易教训】块')
+  assert.ok(block.text.includes('下单前先核对交易时段'), '应召回 knowledge 层教训')
+  assert.ok(!block.text.includes('下单前要不要检查交易时段？'), '不得回显用户自己的原话')
 })
