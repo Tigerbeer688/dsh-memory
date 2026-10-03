@@ -17,6 +17,13 @@ import sys
 import tempfile
 import traceback
 
+# 三档自治批次②（2026-10-02）**夹具隔离**：本守卫考的不是档位面（档位守卫 =
+# md_cg/test_autonomy_modes.py），故显式置 full 档——回到改动前「动作直落」的
+# 行为，使本文件的断言意图（合并/覆写/软删真的发生）逐条不变；env 键名从唯一
+# 真源表取（本文件不构成第二处字面量）。
+from . import autonomy_modes as _autonomy_modes          # noqa: E402
+os.environ[_autonomy_modes.AUTONOMY_ENV_KEYS["mode"]] = "full"
+
 from . import chain, linkref, writepipe
 from .mdcos import MdCGSecure
 from .security import Principal
@@ -45,8 +52,9 @@ def _mk_cg(tmp, role="designer"):
     return MdCGSecure(root, principal=p)
 
 
-def _policy(tmp, required=("PASSED",), forbidden=("FORBIDDEN_WORD",)):
-    path = os.path.join(tmp, "policy.json")
+def _policy(tmp, required=("PASSED",), forbidden=("FORBIDDEN_WORD",),
+            name="policy.json"):
+    path = os.path.join(tmp, name)
     with open(path, "w", encoding="utf-8") as f:
         json.dump({"forbidden": list(forbidden),
                    "required": list(required)}, f)
@@ -239,7 +247,13 @@ def _run(tmp):
            out_r.get("committed") is False and _fm(cg, "mem_rej0001") == {},
            repr(out_r))
 
-    os.environ.pop("MDCG_POLICY_FILE", None)
+    # 迁移（issue #43，2026-09-29）：修前「未设 MDCG_POLICY_FILE」= 空规则 →
+    # text 恒 DEFER；修后未设会**回落到包内默认 data/policy.json**（本用例的
+    # 内容无 CCG 六要素 → 变 REJECT）。本用例的语义是 **DEFER 出口的副作用**
+    # （非 ACCEPT/REJECT 不落盘、不建边），与策略来源无关，故显式给一份**空
+    # 规则库**复现 DEFER——不改断言口径，只把「来源」钉成显式的。
+    os.environ["MDCG_POLICY_FILE"] = _policy(tmp, required=(), forbidden=(),
+                                             name="policy_empty.json")
     out_d = pipe.execute(cg, {"content_kind": "text",
                               "content": "无规则可判 关联 %s" % TGT,
                               "layer": "knowledge", "node_id": "mem_def0001"})

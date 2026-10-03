@@ -199,22 +199,35 @@ def is_dep_sentinel(value) -> bool:
     return False
 
 
-# 生效条件：content 中不存在名字等于 field_name 的 `# 字段：` 行 → 返回 None；存在 → 返回首个命中行首个冒号之后的 strip 结果（可为空串）；
+# 生效条件：content 中不存在形如 `# <field_name>` 的标题行 → 返回 None；存在 → 返回该行的值（行内冒号之后的 strip 结果；无冒号则取标题后首个非空非标题行），可为空串；
 def ccg_field_value(content, field_name: str):
-    """读取 `# <字段>：<值>` 的值（首个命中行；全/半角冒号兼容）。无该行 → None。
+    """读取 `# <字段>` 的值（首个命中行；全/半角冒号兼容）。无该行 → None。
 
-    与 `ccgc._upsert_ccg_line` 的解析口径一致（去 `#`→按冒号切名字→名字相等即
-    命中）——即**写入口径与读入口径共用同一条行语义**，避免「写进去读不出」。
+    两种书写形态（**冒号可有可无**，2026-09-28 放宽——此前无冒号形态被读成
+    「行在、值为空」，与判据 `ccg_mark_present` 的「行在即已声明」自相矛盾）：
+      * `# 生效条件：<值>` → 取行内值；
+      * `# 生效条件` + 换行 + `<值>` → 取标题后**首个非空、非标题行**。
+    标题后紧跟另一个标题时返回空串——不得把下一个要素的正文吞成本字段的值。
+
+    判据单点在 `ccg_mark_present`；`mdcos._ccg_field` 与 `tasks._field_line`
+    均委托本函数，避免「判齐了却读不出」的第二套口径。
     """
-    for ln in (content or "").split("\n"):
-        s = ln.strip()
-        if not s.startswith("#"):
+    lines = (content or "").split("\n")
+    for i, ln in enumerate(lines):
+        rest = _ccg_heading_rest(ln, field_name)
+        if rest is None:
             continue
-        if s.lstrip("#").strip().split("：")[0].split(":")[0].strip() != field_name:
-            continue
-        for p in ("# " + field_name + "：", "# " + field_name + ":"):
-            if p in ln:
-                return ln.split(p, 1)[1].strip()
+        for sep in ("：", ":"):
+            if rest.startswith(sep):
+                return rest[len(sep):].strip()
+        if rest.strip():
+            # 前缀式标题（如 `# 功能名（备注）`）：余文即值
+            return rest.strip()
+        for nxt in lines[i + 1:]:
+            t = nxt.strip()
+            if not t:
+                continue
+            return "" if t.startswith("#") else t
         return ""
     return None
 
@@ -324,7 +337,56 @@ def loads(text: str):
     return fm, content
 
 
-# 生效条件：content 中出现 "# {mark}：" 或 "# {mark}:"（中/英文冒号）即把该 mark 计入 present 与 required_present；complete 为 required_present 覆盖全部 CCG_REQUIRED、all_present 为 present 覆盖全部 CCG_MARKS，ratio = len(required_present)/len(CCG_REQUIRED)，四键连同两个清单一起返回。
+# 生效条件：value 的 str 形态含 "\n" 或 "\r" 时返回 True，否则 False。
+def ccg_value_has_break(value) -> bool:
+    """CCG 行值是否含换行——含换行即可注入一行伪造的独立正文行。
+
+    正文读面按**首个命中行**取值，被注入的伪造行一旦排在前头就把真值顶替掉；
+    故写入面必须 fail-closed 拒（N208，2026-09-28）。判据单点在此：
+    `ccgc._has_line_break` 与 `consolidate._upsert_ccg_line` 同源，
+    避免「一处拒、另一处照收」——副本漏加固即是把注入面留开。
+    """
+    v = str(value if value is not None else "")
+    return ("\n" in v) or ("\r" in v)
+
+
+# 生效条件：line 匹配 `^#\s*<mark>`（与写入闸门 data/policy.json 的必需正则同一语义）时返回 mark 之后的余文，否则返回 None；行内置下划线均不参与判定。
+def _ccg_heading_rest(line: str, mark: str):
+    """`# <mark>…` 标题行的**行语义单点**：命中返回 mark 之后的余文，否则 None。
+
+    正则与写入闸门 `data/policy.json` 的 `(?m)^#\\s*<mark>` **逐字对齐**——
+    两侧判定必须同一条行语义，否则又长出一处口径分叉（本函数即为此而立）。
+    由此确定的边界（都是**故意**与闸门一致的宽松/严格，不是疏漏）：
+      * `# 生效条件`、`#生效条件`、`# 生效条件：v`、`# 生效条件 v` → 命中；
+      * `## 生效条件`、`  # 生效条件`（缩进）→ **不**命中（闸门同样不认二级标题/缩进标题）。
+    """
+    m = re.match(r"^#\s*" + re.escape(mark), line or "")
+    if not m:
+        return None
+    return (line or "")[m.end():]
+
+
+# 生效条件：content 中存在 `# <mark>` 标题行（判据=_ccg_heading_rest 非 None；与写入闸门同一正则语义，冒号可有可无）时返回 True，否则 False。
+def ccg_mark_present(content: str, mark: str) -> bool:
+    """六要素「已声明」的**唯一判据**（2026-09-28 收单点）：`# <mark>` 标题行在
+
+    —— 冒号可有可无。判据与写入闸门 `data/policy.json` 的必需正则
+    `(?m)^#\\s*<mark>` **同一语义**（标题前缀即算声明）：闸门放行的正文，
+    检索面不得再判它「要素不全」。
+
+    为什么必须收成一个函数（本判据的由来，是一次真实的口径分叉）：写入闸门
+    不要求冒号，而检索面 `ccg_completeness` 原先要求冒号 —— 同一条正文被写入
+    判 ACCEPT、被检索路由判 BLINDSPOT「CCG 要素不全」；存量实测含六要素的节点
+    中 88 件处于该状态（归档看着写成了，检索面当它没声明）。收单点后复扫
+    12043 件，闸门与检索面结论不一致 = 0。
+    """
+    for ln in (content or "").split("\n"):
+        if _ccg_heading_rest(ln, mark) is not None:
+            return True
+    return False
+
+
+# 生效条件：content 中出现 "# {mark}：" 或 "# {mark}:"（中/英文冒号）或仅 "# {mark}" 标题行即把该 mark 计入 present 与 required_present；complete 为 required_present 覆盖全部 CCG_REQUIRED、all_present 为 present 覆盖全部 CCG_MARKS，ratio = len(required_present)/len(CCG_REQUIRED)，四键连同两个清单一起返回。
 def ccg_completeness(content: str) -> dict:
     """CCG 要素齐全度——白箱可审计性的量化指标。
 
@@ -332,10 +394,12 @@ def ccg_completeness(content: str) -> dict:
     合成（`condition_space_text`）。缺声明 = 缺证据，只能补写或判 BLINDSPOT，
     不能被「常用条件默认省略」静默掩盖。故 CCG_REQUIRED == CCG_MARKS，
     `complete` 与 `all_present` 同源；保留两个键只为不动既有调用面。
+
+    判据本身**不看标点**（冒号可有可无）——形态归形态、齐不齐归齐不齐：
+    判据单点是 `ccg_mark_present`，与写入闸门同一语义。
     """
-    all_present = [m for m in CCG_MARKS if f"# {m}：" in content or f"# {m}:" in content]
-    required_present = [m for m in CCG_REQUIRED
-                        if f"# {m}：" in content or f"# {m}:" in content]
+    all_present = [m for m in CCG_MARKS if ccg_mark_present(content, m)]
+    required_present = [m for m in CCG_REQUIRED if ccg_mark_present(content, m)]
     return {
         "present": all_present,
         "required_present": required_present,
@@ -574,3 +638,76 @@ def cond_terms(text: str) -> list[str]:
                 seen.add(seg)
                 out.append(seg)
     return out
+
+
+# ---- §5.1 六要素的**索引角色**：那张表从 4 行长成 6 行（P2-1）------------------
+#
+# 理论真源 `docs/theory/智能论3.4.md:3053-3059` 的「要素 | 标记 | 内容 |
+# **图的索引角色**」表**只有 4 行**（功能名/生效条件/子功能/执行）。v0.4 §5.1
+# 依裁定 2 把表补成 6 行，后两行为**新增检索维度**；本常量即那 6 行的
+# **代码侧唯一真源**（检索面、索引条目、守卫三处共用一份，禁止各写一份）。
+#
+# 表的两列语义：
+#   · 字段名 = CCG 六要素之一（`CCG_MARKS` 的子集，顺序即理论表序）；
+#   · 索引键 = 该要素在检索面上的**键名**（前 4 行既有，后 2 行本批新增）。
+# 「索引键」进索引条目（`MdCG._node_entry`）成为**免读文件的扁指标量**——
+# 与既有 `time_window` / `observation_position` 同款理由（检索期不读盘）。
+CCG_INDEX_ROLES = (
+    ("功能名",     "语义符号",   "已有"),
+    ("生效条件",   "条件词",     "已有（S2 门控）"),
+    ("子功能",     "结构词",     "已有"),
+    ("执行",       "机制词",     "已有"),
+    ("验证方式",   "后置条件词", "P2-1 新增：按验证手段检索"),
+    ("不适用条件", "拒绝域词",   "P2-1 新增：按边界检索（boundary_hit）"),
+)
+
+#: 新增两行的**字段名 → 索引键名**映射（索引条目里的扁平键；单一真源）。
+#: 键名刻意带 `_terms` 后缀：它们是**词项列表**（扁指标量），不是正文行原样。
+POSTCONDITION_FIELD = "验证方式"
+REJECTION_FIELD = "不适用条件"
+POSTCONDITION_TERMS_KEY = "postcondition_terms"
+REJECTION_TERMS_KEY = "rejection_terms"
+INDEX_TERMS_KEYS = (POSTCONDITION_TERMS_KEY, REJECTION_TERMS_KEY)
+
+#: 索引词项的最小长度。口径与 `mdcg.NEG_MIN_TERM`（负条件判据的词长下限）
+#: **同值同义**：单字符碎片（的/与/3）不是检索键。两处不可各自取值——
+#: `md_cg/test_p2_six_elements.py` 有交叉断言钉住两常量相等。
+ELEMENT_TERM_MIN = 2
+
+#: 索引词项的切分面：槽分隔（；;）、短语分隔（，,、/）、括号与空白。
+#: 为什么与 `cond_terms` 不同：那两个要素是**自由文本行**（不是条件空间四槽
+#: 合成串），没有「槽标签：」前缀，故不需要剥标签那一步；切分面本身同族。
+_ELEMENT_TERM_SPLIT_RE = re.compile(r"[；;，,、/（）()\[\]【】{}\s]+")
+
+
+# 生效条件：value 为假值（None/空串/纯空白）时按空文本处理返回 []；否则按「；;，,、/（）()[]【】{}空白」切分、逐段 strip、丢弃长度 < ELEMENT_TERM_MIN 的段与纯数字段、命中 is_dep_sentinel（空值语义哨兵）或 is_placeholder_text（骨架占位）的段、以及已入选的重复段，返回保序去重的 out；
+def element_terms_from_text(value, min_len: int = ELEMENT_TERM_MIN) -> list[str]:
+    """要素文本 → 索引词项（**确定性切分，无语义猜测**）。
+
+    这是「六要素索引键」的**切分单点**：`MdCG._node_entry` 与守卫共用。
+    只做形态切分 + 空值语义剔除，不做任何同义/近义扩展（同 `cond_terms` 纪律）。
+    """
+    out, seen = [], set()
+    for seg in _ELEMENT_TERM_SPLIT_RE.split(str(value or "")):
+        seg = seg.strip().strip("。.．:：")
+        if len(seg) < int(min_len) or seg.isdigit():
+            continue
+        if is_dep_sentinel(seg) or is_placeholder_text(seg):
+            continue
+        if seg not in seen:
+            seen.add(seg)
+            out.append(seg)
+    return out
+
+
+# 生效条件：field_name 为 CCG 要素名且 content 含该行时，取该行值（走 ccg_field_value 单点）→ 经 element_terms_from_text 切分成词项列表；该行缺失/值为空时返回 []；
+def ccg_element_terms(content: str, field_name: str,
+                      min_len: int = ELEMENT_TERM_MIN) -> list[str]:
+    """CCG 要素文本 → 索引词项（**取值走既有单点**，检索面不得另写正则）。
+
+    取值**必须**经 `ccg_field_value`（仓内 CCG 行解析的唯一真源：冒号可有可无、
+    首个命中行为准、与写入闸门 `data/policy.json` 同一行语义）；本函数只在其上
+    叠加**切分**，绝不自己 `re.match(r"^#\\s*验证方式")` ——那会立刻长出第二套
+    行语义（`ccg_mark_present` 的取单点动因即此类分叉）。
+    """
+    return element_terms_from_text(ccg_field_value(content, field_name), min_len)

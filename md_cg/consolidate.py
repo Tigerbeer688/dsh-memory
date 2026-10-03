@@ -530,9 +530,10 @@ def replay_check(pos_terms, neg_terms, body: str) -> dict:
 
 # ---- 写盘（固化）---------------------------------------------------------
 
-# 生效条件：给定 content 与 field，当 content 含 "# field：" 或 "# field:" 时返回 True，否则 False。
+# 生效条件：委托 nodefile.ccg_mark_present——content 含 "# field" 标题行（冒号可有可无）则返回 True，否则 False。
 def _has_ccg_line(content: str, field: str) -> bool:
-    return f"# {field}：" in (content or "") or f"# {field}:" in (content or "")
+    # 判据单点在 nodefile（2026-09-28 收口径）：冒号可有可无，与写入闸门同一语义。
+    return nodefile.ccg_mark_present(content, field)
 
 
 # 生效条件：给定 fm 与 content，对每个 CCG_FIELDS，若 frontmatter.comment 值非空或正文含对应 CCG 行则记入，返回已有字段字典。
@@ -551,7 +552,17 @@ def existing_fields(fm: dict, content: str) -> dict:
 
 # 生效条件：给定 content、field、value，若已有 "# field：" 行则替换并返回新正文；否则插在 "# 功能名" 之后，若无则该行前置。
 def _upsert_ccg_line(content: str, field: str, value: str) -> str:
-    """在正文里写入/替换 `# <字段>：<值>`，优先插在「# 功能名」之后。"""
+    """在正文里写入/替换 `# <字段>：<值>`，优先插在「# 功能名」之后。
+
+    **值必须单行**（N208，2026-09-28）：本函数此前只有 `ccgc` 那份副本做了
+    加固而自身漏掉——而本副本被 `backfill` 与 `crosscheck` 共用，等于注入面
+    在这两条路径上仍然开着。判据委托 `nodefile.ccg_value_has_break`（单点）。
+    """
+    if nodefile.ccg_value_has_break(value):
+        raise ValueError(
+            "ccg 行值含换行：%r——值必须是单行（换行会注入伪造的独立正文行，"
+            "正文读面按首个命中行取值即被顶替）。N208 fail-closed 拒写。"
+            % (str(value)[:80],))
     lines = (content or "").split("\n")
     for i, ln in enumerate(lines):
         s = ln.strip()
@@ -849,11 +860,20 @@ def fill_verification_basis(root: str, basis: str, layer: str = None,
 # 场景：情境层（contextual）里有些记忆被反复命中/并入——它们已经不是「一次情境」，
 # 而是稳定的规律。本动作把它们提升为长期知识（knowledge），并保留：
 #   · 双向可追溯：promoted_from + 演化账本（KIND_LAYER_SHIFT）；
-#   · 条件门槛：四要素（CCG）不全者**不提升**（未可判定就不该升格为长期知识）；
+#   · 条件门槛：六要素（CCG，真源 `nodefile.CCG_REQUIRED`：功能名/生效条件/
+#     子功能/执行/验证方式/不适用条件）不全者**不提升**（未可判定就不该升格为
+#     长期知识）——C-7 前此处只查四要素，缺「验证方式」的弱证据节点可蒙混升格；
 #   · 可预演：apply=False 只出报表；可留痕：`_maintain.jsonl`。
 
 MAINTAIN_LOG = "_maintain.jsonl"
-CCG_REQUIRED = ("生效条件", "子功能", "执行", "不适用条件")
+# C-7（2026-09-29）：本模块此前自带**第二份**要素常量——4 元素
+# ("生效条件","子功能","执行","不适用条件")，与真源 `nodefile.CCG_REQUIRED`
+# 的**六要素**（多「功能名」「验证方式」）不一致 ⇒ 缺「验证方式」的弱证据节点
+# `all(_has_ccg_line(...))` 仍判 complete，可被 `promote_memories` 升格进
+# knowledge 层；`predict` 亦按此常量判 node_ready，同一缺口在两个消费面同时
+# 放大。判据单点在 `nodefile`，本处只**转发**不复制——副本再抄一次就会再次
+# 漂移（N208 同型教训：`_upsert_ccg_line` 的 ccgc 副本加固而本副本漏掉）。
+CCG_REQUIRED = nodefile.CCG_REQUIRED
 
 
 # 生效条件：给定 cg、nid、e、fm、content、target_layer，把节点写入目标层（必要时按 routing 分桶）并删除旧路径，返回新相对路径与 bucket。
@@ -875,11 +895,16 @@ def _relocate_layer(cg, nid, e, fm, content, target_layer):
             "bucket": bucket}
 
 
-# 生效条件：给定 root，把 source_layer 中命中次数不小于 min_merge 或 importance 不小于 min_importance 且条件完整的节点提升到 target_layer，返回统计 rep。
+# 生效条件：给定 root，把 source_layer 中命中次数不小于 min_merge 或 importance 不小于 min_importance 且**六要素完整**（真源 nodefile.CCG_REQUIRED，经模块常量 CCG_REQUIRED 转发）的节点提升到 target_layer，返回统计 rep；require_conditions 为真时六要素不全者计入 skipped_incomplete 不提升。
 def promote_memories(root, source_layer="contextual", target_layer="knowledge",
                      min_merge=2, min_importance=0.6, require_conditions=True,
                      limit=None, apply=False, actor="maintain") -> dict:
-    """把反复命中的情境记忆批量提升为长期知识（可预演 / 可留痕 / 可追溯）。"""
+    """把反复命中的情境记忆批量提升为长期知识（可预演 / 可留痕 / 可追溯）。
+
+    升格门槛（C-7，2026-09-29）：要件清单与写入闸门**同源**
+    （`nodefile.CCG_REQUIRED` 六要素，模块常量转发）——原先本模块自带 4 元素
+    副本，缺「验证方式」的弱证据节点会被判 complete 并升格。
+    """
     cg = MdCGOS(root)
     entries = cg._candidates(layer=source_layer)
     rep = {"root": root, "source_layer": source_layer, "target_layer": target_layer,
@@ -905,7 +930,7 @@ def promote_memories(root, source_layer="contextual", target_layer="knowledge",
         imp = float(fm.get("importance") or e.get("importance") or 0.0)
         complete = all(_has_ccg_line(content, f) for f in CCG_REQUIRED)
         if require_conditions and not complete:
-            rep["skipped_incomplete"] += 1  # 四要素不全 → 不可判定，不升格
+            rep["skipped_incomplete"] += 1  # 六要素不全 → 不可判定，不升格
             continue
         hot = hits >= int(min_merge)
         if not hot and imp < float(min_importance):
@@ -1329,7 +1354,7 @@ def induce_memories(cg_or_root, source_layer="contextual", target_layer="knowled
         require_conditions = True
 
     nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
-    pool = [nid for nid, e in nodes.items()
+    pool = [nid for nid, e in list(nodes.items())
             if (not source_layer or (e or {}).get("layer") == source_layer)
             and not (e or {}).get("protected")
             and not (set(INDUCE_SKIP_TAGS) & set((e or {}).get("tags") or []))]

@@ -14,7 +14,7 @@
 
 用法（root 须与待裁决部署一致：--root 或环境变量 MDCG_ROOT）：
   python -m md_cg.review_cli list
-  python -m md_cg.review_cli accept  <pid> --reason "实跑测试证据"
+  python -m md_cg.review_cli accept  <pid> --session <会话id> --reason "实跑测试证据"
   python -m md_cg.review_cli reject  <pid> --reason "内容有误"
   python -m md_cg.review_cli edit    <pid> --content "修正后内容" --reason "..."
   python -m md_cg.review_cli merge   <pid> --into <已有节点id> --reason "..."
@@ -26,7 +26,29 @@ noop 语义：**已评估、判定不改变任何现有记忆**——只留痕�
 审计 md 节点）并关闭提案，不落业务节点、不进负记忆。它与 reject 的区别是
 「评估过了、无需改动」而非「否掉这条候选」，故不可借 noop 绕过 accept 门控。
 
+变更单（三档自治批次②，kind=mutation）：队列里除「提案」外还有**变更单**
+——对既有记忆的 B 合并 / C 改写 / D 删除（设计 v0.2 §四）。`list` 会把它显式
+标为 `变更单(动作名→目标)`：accept = **执行**对应动作（B reinforce/converge、
+C 覆写落盘、D 软删），reject = 原样留痕不执行；edit/merge/noop 对变更单未定义
+（fail-closed 报错，不会静默当已处理）。存量条目无 `kind` 键，一律按提案走原
+路径（零迁移）。
+
 裁决留痕：decisions.jsonl + 审计 md 节点（由 review_decide 内部完成）。
+
+落盘归因（P1 修复，2026-09-26，DSH 端在役实测回告）：
+  · 会话：--session（各子命令通用）缺省取环境变量 MDCG_SESSION，仍无则维持
+    现状随机会话并 stderr 告警一行。同一批裁决传同一 session，落盘节点的
+    frontmatter.session 才稳定一致（此前每次随机 sess_<uuid12>，同批 5 节点
+    5 个会话 id）。
+  · 写入者：accept/edit 落盘节点的 frontmatter.writer 保留**提案原始写入者**
+    （propose 时库端快照的 actor，如 dsh-memory）；裁决者身份不丢失，记入
+    frontmatter.reviewer（designer-cli）。
+  · DSH 前置条件（环境侧自行核对，本 CLI 不校验）：MCP 写入面对 DSH 形态会话
+    id（session-<8>-<4>-<4>-<4>-<12>）有 `_normalize_session` 防编造校验
+    （md_cg/mcp_server.py）——会话目录须真存在于 MDCG_DSH_SESSIONS_ROOT 或
+    ~/.dsh/sessions 之下，否则该会话在 MCP 面降级为 anonymous。本 CLI 直构
+    Principal 不经该校验，但若裁决的会话 id 与 MCP 面共用，请先确认目录在位，
+    否则两侧归因对不上。
 """
 import argparse
 import json
@@ -57,18 +79,65 @@ def _root(args):
     return root
 
 
-# 生效条件：args 就绪时先构造写死权限的 Principal(actor="designer-cli", clearance="secret", can_write=True, can_admin=True, role="designer", auth_mode="local-cli")，再以 _root(args) 取到的存储根返回 MdCGSecure(root, principal=p)。
+# 生效条件：args 的 session 属性为真值（含 getattr 缺省 None 回落）或环境变量 MDCG_SESSION 去空白后非空时返回该值（前者优先），两者皆无返回 None。
+def _session_of(args):
+    """裁决会话归属：--session > 环境变量 MDCG_SESSION > None（随机 + 告警）。"""
+    s = str(getattr(args, "session", None)
+            or os.environ.get("MDCG_SESSION", "") or "").strip()
+    return s or None
+
+
+# 生效条件：args 就绪时先经 _session_of 取裁决会话归属，取到 None 时向 stderr 告警一行（缺省随机会话、同批裁决请传同一 --session）后维持现状；随后构造写死权限的 Principal(actor="designer-cli", clearance="secret", can_write=True, can_admin=True, role="designer", auth_mode="local-cli", session=<上述归属>)，再以 _root(args) 取到的存储根返回 MdCGSecure(root, principal=p, autoflush=1)。
 def _cg(args):
+    session = _session_of(args)
+    if session is None:
+        # P1 归因（2026-09-26，DSH 端在役实测）：缺省随机会话会让同一批裁决
+        # 得到互不相同的落盘归属（5 节点 5 个 sess_* 实录）。不拒绝、告警一行
+        # 后维持现状（向后兼容）；要稳定归属请显式传同一 --session。
+        sys.stderr.write("警告：未指定 --session / 环境变量 MDCG_SESSION，"
+                         "本次裁决落盘使用随机会话 id——同一批裁决请传同一 "
+                         "--session 以稳定归属。\n")
     p = Principal(actor="designer-cli", clearance="secret",
                   can_write=True, can_admin=True, role="designer",
-                  auth_mode="local-cli")
-    return MdCGSecure(_root(args), principal=p)
+                  auth_mode="local-cli", session=session)
+    # 索引可见性（P1b，2026-09-26）：autoflush=1 —— 与 mcp_server.py:3695-3702
+    # 同款（server 级兜底 2026-09-16 已修），本处是同一兜底的**第二落点**，
+    # DSH 端在役实测 read null 后补齐。根因：缺省 autoflush=64 时写入先经
+    # _stage 入内存 _dirty，攒够阈值才 flush() 落分片日志 `_index_log/`；
+    # 本 CLI 正常退出有 main 的 finally cg.close() 与库层 atexit 双兜底
+    # （mdcg.py _LIVE_CGS），但兜底刻意只覆盖正常退出——被 kill / 崩溃时
+    # 两者都不执行，裁决节点停在内存索引、日志从未落，盘面文件在而索引
+    # 链路断，在役旧读面 `_load_index` 盲信既有快照即 read null。逐条落
+    # 日志后任意退出形态下写入对其它进程立即可见（review_decide 自身的
+    # 显式 flush 只覆盖其目标/审计节点，且与节点文件落盘之间仍有窗口）。
+    return MdCGSecure(_root(args), principal=p, autoflush=1)
 
 
 # 生效条件：rec 支持 .get 时，取 rec.get("content") 为假值则取 rec.get("statement")、再为假值则取空串，把其中的换行替换为空格，并按 width（缺省 66）切片后仅当 len(text) > width 才追加 "…"，返回该字符串。
 def _brief(rec, width=66):
     text = (rec.get("content") or rec.get("statement") or "").replace("\n", " ")
     return text[:width] + ("…" if len(text) > width else "")
+
+
+# 生效条件：rec 支持 .get 且其 kind 为 "mutation" 时返回「变更单(动作名→目标)」标签，其余（含缺键 = 存量提案）返回「提案」；本函数只读，不产生任何副作用；
+def _kind_label(rec):
+    """队列条目类型标签（三档自治批次②：变更单与提案在同一队列里可分辨）。
+
+    为什么要有：设计 §四「两类条目共用一个队列，靠类型字段区分」——显示面若
+    不区分，裁决者面对一张 `[pid] pending · contextual 层` 的单子看不出它是
+    「新写入候选」还是「对既有记忆的 B/C/D 变更单」，也无从知道确认后会发生
+    什么。缺键（存量条目）一律按提案显示（零迁移）。
+    """
+    try:
+        kind = str(rec.get("kind") or "").strip()
+        slot = (rec.get("extra") or {}).get("mutation") or {}
+    except AttributeError:
+        return "提案"
+    if kind != "mutation":
+        return "提案"
+    name = slot.get("action_name") or slot.get("action") or "?"
+    tgt = slot.get("target") or rec.get("id")
+    return "变更单(%s%s)" % (name, ("→ " + str(tgt)) if tgt else "")
 
 
 # 生效条件：cg 与 args 就绪时按 args.cmd 分派——"list" 时 cg.review_list() 为空则打印空队列并返回 0、非空则逐条打印（tags 取真值拼接、layer/round 为假值显示 "?"/0）后返回 0；"rounds" 时打印 cg.review_rounds(args.pid) 并返回 0；"stats" 时打印 cg.review_stats() 的记录数/提案数/待审数/已关闭数与动作分布（含 noop 计数）并返回 0；"edit" 时以 args.content 加真值 args.tags（按逗号分割并剔除空项）/args.layer 组成 edits 调 cg.review_decide；其余 cmd（含 noop）以 getattr(args, "into", None) 与 args.reason 调 cg.review_decide；后两类再按 out.get("ok") 为真返回 0，否则打印 out 并返回 1。
@@ -82,8 +151,9 @@ def _execute(cg, args):
         print("待审 %d 条：" % len(pend))
         for r in pend:
             tags = (", tags=" + ",".join(r.get("tags") or [])) if r.get("tags") else ""
-            print("  [%s] %s · %s 层%s · round=%s\n      %s" % (
-                r.get("pid"), r.get("status"), r.get("layer") or "?",
+            print("  [%s] %s · %s · %s 层%s · round=%s\n      %s" % (
+                r.get("pid"), r.get("status"), _kind_label(r),
+                r.get("layer") or "?",
                 tags, r.get("round") or 0, _brief(r)))
         print('\n裁决示例：python -m md_cg.review_cli accept <pid> --reason "实跑测试证据"')
         return 0
@@ -131,6 +201,10 @@ def main(argv=None):
         description="灵枢审核队列裁决（designer 权限）")
     common = argparse.ArgumentParser(add_help=False)
     common.add_argument("--root", help="存储根目录（默认环境变量 MDCG_ROOT）")
+    common.add_argument("--session", default=None,
+                        help="裁决会话 id（落盘归属 frontmatter.session；缺省取"
+                             "环境变量 MDCG_SESSION，仍无则随机会话并 stderr 告警。"
+                             "同一批裁决传同一值即得同一归属）")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     sub.add_parser("list", help="列出待审条目", parents=[common])

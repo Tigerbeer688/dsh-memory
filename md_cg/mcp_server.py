@@ -39,12 +39,54 @@ DSH 侧配置（cordis.yml / MCP client）：
 from __future__ import annotations
 
 import json
-import json
 import os
 import sys
 
+# ---------------------------------------------------------------- 入口自保证 UTF-8
+# 约束（工作纪律第 15 条）：本调用必须在**任何文件/库 I/O 之前**——utf8_boot.ensure_utf8
+# 在解释器未开 UTF-8 模式时以相同 argv 重启自身（-X utf8），早于它的任何 open/stdio
+# 读写都走 locale 编码（Windows 中文机 = cp936：裸 open 抛 UnicodeDecodeError、中文写
+# 落 GBK 字节）。本文件下方 _package_version() 就在**模块级**读 package.json，故锚点
+# 必须落在它之前。仓库根入 sys.path 的形态照 hive/exec.py::_md_cg_import 的最小写法
+# （助手在仓根，不是 md_cg 包目录）。
+# 被 import（本模块非 __main__）时助手只置子进程继承面、绝不重启/退出——F6：静默重启
+# 会吞掉调用方输入；本入口的真实接入形态是 `python -m md_cg.mcp_server`（mcp.json）。
+_UTF8_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _UTF8_ROOT not in sys.path:
+    sys.path.insert(0, _UTF8_ROOT)
+from utf8_boot import ensure_utf8  # noqa: E402
+
+ensure_utf8(__file__)
+
+
+# SERVER_VERSION 从包根 package.json 动态读取（issue #42：硬编码 0.1.0 与发布
+# 版本脱节，握手自报假版本）；读不到（文件缺失/损坏/裁剪）回落保底值不阻塞启动。
+# v21-R1（2026-09-28）：**回落必须覆盖全形态**——修前只捉 (OSError, ValueError)
+# 却无条件 `.get("version")`，顶层是合法 JSON 但非对象（`[1,2]`/`"0.9.9"`/`123`/
+# `null`/`true`）时 AttributeError 逃出 except，而本句在**模块级**立即求值 ⇒
+# `python -m md_cg.mcp_server` 连 initialize 都发不出就退出（服务起不来，量级
+# 远重于「版本号退化」）；`{"version": 123}` 不抛但把 int 塞进握手
+# serverInfo.version（协议要字符串）。同族已修：hive/hive_mcp/mcp_server.py。
+def _package_version() -> str:
+    """读包根 package.json 的 version；**任何**形态异常都回落 "0.1.0"。
+
+    生效条件：文件可读、json.load 得 dict、且 doc["version"] 为 strip() 后非空
+    的 str 时返回该值；文件缺失 / OSError / JSON 非法 / 顶层非对象 / version
+    缺失·非字符串·空白串时一律回落 "0.1.0"（TypeError、AttributeError 一并兜底，
+    绝不把异常抛给 import 期）。
+    """
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+        with open(os.path.join(root, "package.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        ver = doc.get("version") if isinstance(doc, dict) else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "0.1.0"
+    return ver if isinstance(ver, str) and ver.strip() else "0.1.0"
+
+
 SERVER_NAME = "mdcg-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = _package_version()
 PROTOCOL_VERSION = "2024-11-05"
 
 
@@ -138,7 +180,9 @@ TOOLS = [
                        "「跳过超大、继续试更小的」在预算紧张时淘汰最有价值的详实条目。"
                        "会话开始或重要工作前调用。可选启用第 5 路模糊召回（分级隶属度）"
                        "与第 6 路条件语义路（条件结构驱动），并注入调用方 LLM 的查询"
-                       "扩展词（索引侧始终白箱）。",
+                       "扩展词（索引侧始终白箱）。缺省另含第 7 路因果路（沿 edges 多跳）"
+                       "与第 8 路时间路（时间邻近度）——按裁定「全进默认检索」缺省开，"
+                       "可用 causal=false / temporal=false 单独关。",
         "inputSchema": _s("", query=_p("string", "描述当前任务的查询", True),
                           budget_tokens=_p("integer", "token 预算（默认 1200）"),
                           max_item_tokens=_p("integer", "单条上限（默认 250）；超限条目截断纳入。"
@@ -161,12 +205,22 @@ TOOLS = [
                           goal=_p("string", "当前目标（第 5 篇第 3 章）：启用 goal 路给召回定向；"
                                             "省略则自动取活跃目标"),
                           goal_path=_p("boolean", "启用目标定向路（默认否；给 goal 即自动启用）"),
+                          causal=_p("boolean", "因果路（P3，设计稿 §6.2）：以词法/实体命中"
+                                               "为种子沿 edges 多跳扩散，**缺省开**（全进默认"
+                                               "检索）；传 false 单独关本路。无 edges 的库上"
+                                               "自然为空"),
+                          temporal=_p("boolean", "时间路（P3，设计稿 §6.3）：按时间邻近度"
+                                                "排序的排名项，核走 time_core.cred_factor；"
+                                                "**缺省开**；传 false 单独关本路。无时间算子/"
+                                                "区间时恒空"),
                           include_recent=_p("boolean", "是否附「近期事件」窗口（默认否）"),
                           recent_limit=_p("integer", "近期事件条数（默认 10）"),
                           fusion=_p("string", "融合模式：sum（经典 RRF，奖励多路共识）"
                                               "| max（取各路最高贡献，不奖励共识）。"
                                               "fuzzy=true 时缺省 max——实测 sum 会低估"
-                                              "「只有模糊路捞到」的目标，self@1 −10.1%")),
+                                              "「只有模糊路捞到」的目标，self@1 −10.1%；"
+                                              "因果路（causal，缺省开）同为单路独有召回型，"
+                                              "故一并缺省 max")),
     },
     {
         "name": "mdcg_search",
@@ -683,7 +737,10 @@ KERNEL_TOOLS = [
             offset=_p("integer", "read 的续读起始行（1 基；传上次返回的 next_offset）；"
                                  "edges 的分页偏移（排序后切片，默认 0）"),
             content=_p("string", "write 的内容（建议含 CCG 5 要素注释）"),
-            content_kind=_p("string", "write 的内容类型：code|image_desc|text|permission|work_done|work_wip|ccg_marks|hyperedge"),
+            content_kind=_p("string", "write 的内容类型：code|image_desc|text|permission|work_done|work_wip|ccg_marks|hyperedge。"
+                                      "text 类需带 CCG 六要素（功能名／生效条件／子功能／执行／验证方式／不适用条件，各占一行、"
+                                      "以「# 要素名：」起首）；缺失会被写入闸门拒绝，返回体如实列出缺失清单（verdict.detail.missing）——"
+                                      "补全后重写即可，无需原样再发。要求由规则库（MDCG_POLICY_FILE 指向的 policy 的 required/required_kinds）定义"),
             depends_on=_p("array", "write/verify：本单元**依赖**的节点 id 列表（CCG「子功能」"
                                    "的落字段，单值/逗号串亦可）。被依赖单元被修改或被证伪时，"
                                    "本节点**同跳**标「存疑」（一跳同步；多跳走 maintain"
@@ -1105,6 +1162,25 @@ def _readable_sensitivities(cg):
         return None
 
 
+# 生效条件：a 的 key 存在且值 is not None 时返回 int(a[key])（显式 0/负数是显式
+# 请求，原样透传由库层判定），键缺失或值为 None 时返回 default；a 恒为 args dict。
+def _int_arg(a, key, default):
+    """int 入参的统一取用口径：**「显式 0 也是显式」**（2026-09-30）。
+
+    与 budget_tokens 的先例同口径（见 read 分支 `a["budget_tokens"] if
+    a.get("budget_tokens") is not None else 1200`）：旧写法 `int(a.get(k) or N)`
+    把显式 0（以及 -1）当「没传」，静默换成默认 N —— 调用方以为「要 0 条」，
+    拿到的却是 N 条，且返回形似正常。
+
+    **不自造报错**：k<=0 的语义（空结果 / 报错）判定单点在库层。实测
+    `cg.search(q, k=0)` / `cg.recall(q, budget_tokens=..., k=0)` 均返回空结果
+    且不抛（见 test_read_face_input_gates.py 的 M1 断言），故本层只判
+    「透传 vs 回落默认」，与 budget_tokens 保持同一判据面。
+    """
+    v = a.get(key)
+    return int(v) if v is not None else default
+
+
 def _node_view(node, offset: int = 0):
     if not node:
         return None
@@ -1234,7 +1310,7 @@ def _consistency_call(cg, a):
     raise ValueError(f"consistency 未知 action：{act}")
 
 
-# 生效条件：当 cg、a 传入时，按 a.get('action') or 'report'（空串/None 回退 'report'）分派，window=int(a.get('window') or 50)（a.get('window') 假值回落 50）：action=report 返回 cg.metacognition_report(window=window)；action=trace 返回 cg.metacognition_trace(window=window)；action=calibration 返回 cg.metacognition_calibration(max_scan=int(a.get('limit') or 2000))（a.get('limit') 假值回落 2000）；action=blindspots 返回 cg.metacognition_blindspots(limit=int(a.get('limit') or 20), window=window)（a.get('limit') 假值回落 20）；action=trust 返回 cg.metacognition_trust(window=window)；action=self_check 返回 cg.self_check(a.get('query') or a.get('text') or '', k=int(a.get('k') or 5))（query/text 假值回落 ''，k 假值回落 5）；action=history 返回 cg.metacognition_history(limit=int(a.get('limit') or 100))（a.get('limit') 假值回落 100）；action=catalog 返回 metacognition.catalog()；action=d_meta 返回 cg.metacognition_d_meta(window=window)（边界压力向量，三代理各自 [0,1]、不合成单值）；其他 action 抛 ValueError；
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'report'（空串/None 回退 'report'）分派，window=int(a.get('window') or 50)（a.get('window') 假值回落 50）：action=report 返回 cg.metacognition_report(window=window)；action=trace 返回 cg.metacognition_trace(window=window)；action=calibration 返回 cg.metacognition_calibration(max_scan=int(a.get('limit') or 2000))（a.get('limit') 假值回落 2000）；action=blindspots 返回 cg.metacognition_blindspots(limit=int(a.get('limit') or 20), window=window)（a.get('limit') 假值回落 20）；action=trust 返回 cg.metacognition_trust(window=window)；action=self_check 返回 cg.self_check(a.get('query') or a.get('text') or '', k=_int_arg(a, 'k', 5))（query/text 假值回落 ''，k 显式原样透传、缺省回落 5）；action=history 返回 cg.metacognition_history(limit=int(a.get('limit') or 100))（a.get('limit') 假值回落 100）；action=catalog 返回 metacognition.catalog()；action=d_meta 返回 cg.metacognition_d_meta(window=window)（边界压力向量，三代理各自 [0,1]、不合成单值）；其他 action 抛 ValueError；
 def _metacognition_call(cg, a):
     """独立元认知统一入口（cg op=metacognition 与 mdcg_metacognition 共用）。
 
@@ -1258,7 +1334,7 @@ def _metacognition_call(cg, a):
         return cg.metacognition_trust(window=window)
     if act == "self_check":
         return cg.self_check(a.get("query") or a.get("text") or "",
-                             k=int(a.get("k") or 5))
+                             k=_int_arg(a, "k", 5))
     if act == "history":
         return cg.metacognition_history(limit=int(a.get("limit") or 100))
     if act == "catalog":
@@ -1503,6 +1579,7 @@ def _sustain_call(cg, a):
     路线图「常驻服务：会话/心跳/自愈」。原则：诊断只读；自愈只碰派生物
     （索引/临时文件/日志边界），永不删节点；缺密钥属于权限事实，只报告不修。
     """
+    from . import sleep as _sleep
     from . import sustain
     act = (a.get("action") or "status").strip().lower()
     name = a.get("name") or os.environ.get("MDCG_SUSTAIN_NAME") or "md_cg"
@@ -1543,7 +1620,7 @@ def _sustain_call(cg, a):
         qs = a.get("queries")
         if isinstance(qs, str):
             qs = [x for x in qs.replace("\n", ",").split(",") if x.strip()]
-        return _pl.measure(cg, qs, k=int(a.get("k") or 20),
+        return _pl.measure(cg, qs, k=_int_arg(a, "k", 20),
                            pools=(a.get("pools") if a.get("pools") is not None
                                   else True),
                            n_queries=int(a.get("limit") or 50))
@@ -1553,7 +1630,7 @@ def _sustain_call(cg, a):
         qs = a.get("queries")
         if isinstance(qs, str):
             qs = [x for x in qs.replace("\n", ",").split(",") if x.strip()]
-        return _pl.compare(cg, qs, k=int(a.get("k") or 20),
+        return _pl.compare(cg, qs, k=_int_arg(a, "k", 20),
                            pools=a.get("pools"),
                            n_queries=int(a.get("limit") or 50))
     if act in ("start", "up"):
@@ -1563,16 +1640,27 @@ def _sustain_call(cg, a):
                                 or sustain.DEFAULT_BEAT_INTERVAL),
             heal_interval=float(a.get("heal_interval")
                                 or sustain.DEFAULT_HEAL_INTERVAL),
-            auto_heal=bool(a.get("auto_heal", True)),
+            # 四档 auto_* 一律经 sustain 的**单一真源读取器**（P0-2）——此处
+            # 不得再写缺省字面量：op 路径原 `auto_tidy` 缺省 False 与 env 路径
+            # 的 True 相反，同 (root,name) 走两条入口语义不一致。显式入参仍优先。
+            auto_heal=sustain.auto_from_args("auto_heal", a),
             scrub_interval=float(a.get("scrub_interval")
                                  or sustain.DEFAULT_SCRUB_INTERVAL),
-            auto_scrub=bool(a.get("auto_scrub", False)),
+            auto_scrub=sustain.auto_from_args("auto_scrub", a),
             evolve_interval=float(a.get("evolve_interval")
                                   or sustain.DEFAULT_EVOLVE_INTERVAL),
-            auto_evolve=bool(a.get("auto_evolve", False)),
+            auto_evolve=sustain.auto_from_args("auto_evolve", a),
             tidy_interval=float(a.get("tidy_interval")
                                 or sustain.DEFAULT_TIDY_INTERVAL),
-            auto_tidy=bool(a.get("auto_tidy", False)))
+            auto_tidy=sustain.auto_from_args("auto_tidy", a),
+            # 第六档睡眠周期（§4.7）：五个值一律经 `md_cg/sleep.py` 的**单一真源
+            # 读取器**（此处不得再写缺省字面量，也不得再写 env 键名字面量——
+            # 键名真源是 `sleep.SLEEP_ENV_KEYS`）。与 env 路径逐字同一组调用。
+            sleep_interval=_sleep.sleep_interval(),
+            auto_sleep=_sleep.sleep_enabled(),
+            sleep_merge=_sleep.sleep_merge_mode(),
+            sleep_window=_sleep.sleep_window(),
+            sleep_scrub_apply=_sleep.sleep_scrub_apply())
         return {"loop": lp.start().status()}
     if act in ("stop", "down"):
         lp = sustain.get_loop(cg, name)
@@ -1605,7 +1693,7 @@ def _sustain_call(cg, a):
     raise ValueError(f"sustain 未知 action：{act}")
 
 
-# 生效条件：当 cg、a 传入时，按 a.get('action') or 'sweep'（空串/None 回退 'sweep'）分派，ids/kinds 若为字符串则按逗号或空白拆成列表，node_id=a.get('node_id') or a.get('node')，target=ids or ([node_id] if node_id else None)（ids 假值回落 node_id 列表或 None）：action 为 sample/spot_check 返回 scrub.sample(cg, int(a.get('k') or a.get('n') or scrub.DEFAULT_SAMPLE), strategy=a.get('strategy') or 'stratified', seed=a.get('seed'))（k/n 假值链回落 scrub.DEFAULT_SAMPLE）；action 为 associate/related 时若 node_id 假值抛 ValueError，否则返回 scrub.associate(cg, node_id, hops=int(a.get('hops') or scrub.DEFAULT_HOPS), limit=int(a.get('k') or 30), lexical=bool(a.get('lexical', True)))（hops 假值回落常量，k 假值回落 30，lexical 缺键为 True）；action 为 audit/check 返回 scrub.audit(cg, target, hops=int(a.get('hops') or 1), min_severity=a.get('min_severity') or 'info')；action 为 decontaminate/repair 返回 scrub.decontaminate(cg, target, kinds=kinds, dry_run=bool(a.get('dry_run', True)), min_severity=a.get('min_severity') or 'medium', hops=int(a.get('hops') or 1), actor=a.get('actor'), override=bool(a.get('override')))；action 为 calibrate/calibration 返回 scrub.calibrate(cg, apply=bool(a.get('apply')), override=bool(a.get('override')), actor=a.get('actor'))；action 为 sweep/run 返回 scrub.sweep(cg, n=int(a.get('k') or a.get('n') or scrub.DEFAULT_SAMPLE), seed=a.get('seed'), dry_run=bool(a.get('dry_run', True)), hops=int(a.get('hops') or scrub.DEFAULT_HOPS), strategy=a.get('strategy') or 'stratified', apply_calibration=bool(a.get('apply')), actor=a.get('actor'))；action 为 history/log 返回 scrub.history(cg, limit=int(a.get('k') or 100))（k 假值回落 100）；action=summary 返回 scrub.summary(cg)；action=catalog 返回 scrub.catalog()；其他 action 抛 ValueError；
+# 生效条件：当 cg、a 传入时，按 a.get('action') or 'sweep'（空串/None 回退 'sweep'）分派，ids/kinds 若为字符串则按逗号或空白拆成列表，node_id=a.get('node_id') or a.get('node')，target=ids or ([node_id] if node_id else None)（ids 假值回落 node_id 列表或 None）：action 为 sample/spot_check 返回 scrub.sample(cg, _int_arg(a, 'k', _int_arg(a, 'n', scrub.DEFAULT_SAMPLE)), strategy=a.get('strategy') or 'stratified', seed=a.get('seed'))（k/n 显式原样透传、缺省链回落 scrub.DEFAULT_SAMPLE）；action 为 associate/related 时若 node_id 假值抛 ValueError，否则返回 scrub.associate(cg, node_id, hops=int(a.get('hops') or scrub.DEFAULT_HOPS), limit=_int_arg(a, 'k', 30), lexical=bool(a.get('lexical', True)))（hops 假值回落常量，k 显式原样透传、缺省回落 30，lexical 缺键为 True）；action 为 audit/check 返回 scrub.audit(cg, target, hops=int(a.get('hops') or 1), min_severity=a.get('min_severity') or 'info')；action 为 decontaminate/repair 返回 scrub.decontaminate(cg, target, kinds=kinds, dry_run=bool(a.get('dry_run', True)), min_severity=a.get('min_severity') or 'medium', hops=int(a.get('hops') or 1), actor=a.get('actor'), override=bool(a.get('override')))；action 为 calibrate/calibration 返回 scrub.calibrate(cg, apply=bool(a.get('apply')), override=bool(a.get('override')), actor=a.get('actor'))；action 为 sweep/run 返回 scrub.sweep(cg, n=_int_arg(a, 'k', _int_arg(a, 'n', scrub.DEFAULT_SAMPLE)), seed=a.get('seed'), dry_run=bool(a.get('dry_run', True)), hops=int(a.get('hops') or scrub.DEFAULT_HOPS), strategy=a.get('strategy') or 'stratified', apply_calibration=bool(a.get('apply')), actor=a.get('actor'))；action 为 history/log 返回 scrub.history(cg, limit=_int_arg(a, 'k', 100))（k 显式原样透传、缺省回落 100）；action=summary 返回 scrub.summary(cg)；action=catalog 返回 scrub.catalog()；其他 action 抛 ValueError；
 def _scrub_call(cg, a):
     """记忆自净统一入口（抽查 / 联想 / 去污染 / 校准偏差）。
 
@@ -1625,14 +1713,14 @@ def _scrub_call(cg, a):
 
     if act in ("sample", "spot_check"):
         return scrub.sample(
-            cg, int(a.get("k") or a.get("n") or scrub.DEFAULT_SAMPLE),
+            cg, _int_arg(a, "k", _int_arg(a, "n", scrub.DEFAULT_SAMPLE)),
             strategy=a.get("strategy") or "stratified", seed=a.get("seed"))
     if act in ("associate", "related"):
         if not node_id:
             raise ValueError("scrub associate 需要 node_id")
         return scrub.associate(cg, node_id,
                                hops=int(a.get("hops") or scrub.DEFAULT_HOPS),
-                               limit=int(a.get("k") or 30),
+                               limit=_int_arg(a, "k", 30),
                                lexical=bool(a.get("lexical", True)))
     if act in ("audit", "check"):
         return scrub.audit(cg, target, hops=int(a.get("hops") or 1),
@@ -1649,13 +1737,13 @@ def _scrub_call(cg, a):
                                actor=a.get("actor"))
     if act in ("sweep", "run"):
         return scrub.sweep(
-            cg, n=int(a.get("k") or a.get("n") or scrub.DEFAULT_SAMPLE),
+            cg, n=_int_arg(a, "k", _int_arg(a, "n", scrub.DEFAULT_SAMPLE)),
             seed=a.get("seed"), dry_run=bool(a.get("dry_run", True)),
             hops=int(a.get("hops") or scrub.DEFAULT_HOPS),
             strategy=a.get("strategy") or "stratified",
             apply_calibration=bool(a.get("apply")), actor=a.get("actor"))
     if act in ("history", "log"):
-        return scrub.history(cg, limit=int(a.get("k") or 100))
+        return scrub.history(cg, limit=_int_arg(a, "k", 100))
     if act == "summary":
         return scrub.summary(cg)
     if act == "catalog":
@@ -1731,9 +1819,37 @@ def _action_sig(a, op):
     return None, None
 
 
-# 生效条件：op0=(a.get("op") or "").strip().lower()，op0 为空时按 a.get("content")→"write"、a.get("query") 或 a.get("node_id")→"read"、a.get("intent")→"route"、都无→"read" 推导 op；act0=(args.get("action") or "").strip().lower()，act0 为空时用 _action_sig(args, op) 推导且推导出时写回 args["action"]；args["op"]=op 后调 _cg_dispatch，返回 dict 且 op0 为空时补 out["op"]、out["op_derived"]=True 与 hint，act0 为空且 (act_derived 或 op in _ACTION_DEFAULT) 时 setdefault("action", eff)、out["action_derived"]=True 并按是否有 act_derived 写 hint_action。
+# 生效条件：op0=(a.get("op") or "").strip().lower()，op0 为空时按 a.get("content")→"write"、a.get("query") 或 a.get("node_id")→"read"、a.get("intent")→"route"、都无→"read" 推导 op；act0=(args.get("action") or "").strip().lower()，act0 为空时用 _action_sig(args, op) 推导且推导出时写回 args["action"]；另恒定计算 act_source（explicit|sig|default|none）；args["op"]=op 后调 _cg_dispatch，返回 dict 且 op0 为空时补 out["op"]、out["op_derived"]=True 与 hint，**无条件** setdefault out["action_source"]=act_source，act0 为空且 (act_derived 或 op in _ACTION_DEFAULT) 时 setdefault("action", eff)、out["action_derived"]=True 并按是否有 act_derived 写 hint_action。
 def _cg_call(cg, a):
-    """认知图唯一入口（外层：op/action 缺省推导兜底 + 推导透出；主体见 _cg_dispatch）。"""
+    """认知图唯一入口（外层：op/action 缺省推导兜底 + 推导透出；主体见 `_cg_dispatch`）。
+
+    **action 来源契约（2026-09-30，调用方不必猜）**：返回 dict 里
+    `action_source` **恒定在场**（旧行为只在「推导过」时给 `action_derived`，
+    显式传 action 时返回里无任何痕迹——调用方无法判断这个 action 是自己传的
+    还是系统替它挑的）。四态取值：
+
+      · ``"explicit"`` —— 本次显式传了非空 action（真值判断只在「取 action 与否」
+        上用；判据本身用 `.strip()` 后非空，False/0 不是合法 action 字面量）。
+        此时 `action_derived` **不出现**（保持旧契约：只标记「推导发生过」）。
+      · ``"sig"`` —— 未传 action，且参数签名唯一指向某 action（表 `_ACTION_SIGS`）：
+        按签名执行，附 `action_derived=True` + `hint_action`（点名依据键）。
+      · ``"default"`` —— 未传 action 且无签名：按**默认动作表**执行，同样
+        `action_derived=True` + `hint_action`（点名走的是哪条默认）。
+      · ``"none"`` —— 未传 action、无签名、该 op 也无默认：本层不填 action，
+        交库层自行决定（此时 `action_derived` 亦不出现）。
+
+    默认动作表（op → 缺省 action；真源=本模块常量 `_ACTION_DEFAULT`，逐项与各
+    分支的 `a.get("action") or "<默认>"` 由 test_action_derive.py 双向守卫；
+    本表照表渲染，由 test_read_face_input_gates.py 断言与常量逐项一致）：
+
+      causal→path · ccg→compile · consolidate→promote · consistency→check ·
+      evolution→summary · export→stat · forget→forget · goal→list ·
+      identity→profile · ingest→stat · insight→outlook · link→ls ·
+      maintain→stat · metacognition→report · predict→routes · protect→stats ·
+      recent→list · ref→read · review→list · scrub→sweep ·
+      self_state→snapshot · session→recall · sustain→status · task→list ·
+      theory→check · whitebox→ping
+    """
     op0 = (a.get("op") or "").strip().lower()
     op = op0
     if not op:
@@ -1754,9 +1870,15 @@ def _cg_call(cg, a):
         act_derived, act_sig = _action_sig(args, op)
         if act_derived:
             args["action"] = act_derived     # 按签名补 action：避免写意图被默认吞掉
+    act_source = ("explicit" if act0 else
+                  "sig" if act_derived else
+                  "default" if op in _ACTION_DEFAULT else "none")
     args["op"] = op
     out = _cg_dispatch(cg, args)
     if isinstance(out, dict):
+        # 「推导发生过」恒定在场：无论走默认、走推导还是显式传，都透出
+        # action_source（setdefault 不覆盖 op 自有的同名字段）。
+        out.setdefault("action_source", act_source)
         if not op0:
             out["op"] = op
             out["op_derived"] = True
@@ -1883,7 +2005,7 @@ def _help_call(cg, a):
                      limit=int(a.get("limit") or a.get("k") or 40))
 
 
-# 生效条件：当 cg、a 传入时，act=(a.get('action') or '').strip().lower()（空串/None 得空串），若 act 空则 act=_action_sig(a, 'task')[0] or 'list'，name=a.get('name') or a.get('task_name') or a.get('task') or ''，nid=a.get('node_id') or a.get('task_id') or ''，tstat=a.get('task_status') or a.get('new_status') or ''（各假值链回落 ''）：act 为 open/add/upsert 时 importance 取 a.get('importance')，非 None 则 float、转换失败置 None，返回 _t.upsert(cg, name or nid, plan=a.get('plan'), status=tstat or None, result=a.get('result'), condition=a.get('condition'), goal=a.get('goal_text') or a.get('goal'), acceptance=a.get('acceptance'), boundary=a.get('boundary'), change=a.get('change'), note=a.get('note'), tags=a.get('tags'), importance=imp, actor=a.get('actor'))；act 为 status/set_status 时若 tstat 假值返回 {'ok': False, 'error': '缺 task_status', 'hint': '可选 active|blocked|done|dropped；迁 done 必须同时给 result'}，否则返回 _t.set_status(cg, nid or name, tstat, result=a.get('result'), note=a.get('note'), actor=a.get('actor'))；act=plan_add 返回 _t.plan_add(cg, nid or name, a.get('change') or a.get('text'), actor=a.get('actor'))；act=get 返回 _t.get_task(cg, nid or name)；act=find 返回 _t.find_similar(cg, name, k=int(a.get('k') or a.get('limit') or 5))（k/limit 假值链回落 5）；act=session 返回 _t.session_tasks(cg, active_limit=int(a.get('active_limit') or 5), done_limit=int(a.get('done_limit') or 5))（各假值回落 5）；act 非 list 时返回 {'ok': False, 'error': '未知 task action：%r' % act, 'hint': '可选 open|status|plan_add|get|list|find|session'}；act=list 返回 _t.list_tasks(cg, status=tstat or None, limit=a.get('limit'))；
+# 生效条件：当 cg、a 传入时，act=(a.get('action') or '').strip().lower()（空串/None 得空串），若 act 空则 act=_action_sig(a, 'task')[0] or 'list'，name=a.get('name') or a.get('task_name') or a.get('task') or ''，nid=a.get('node_id') or a.get('task_id') or ''，tstat=a.get('task_status') or a.get('new_status') or ''（各假值链回落 ''）：act 为 open/add/upsert 时 importance 取 a.get('importance')，非 None 则 float、转换失败置 None，返回 _t.upsert(cg, name or nid, plan=a.get('plan'), status=tstat or None, result=a.get('result'), condition=a.get('condition'), goal=a.get('goal_text') or a.get('goal'), acceptance=a.get('acceptance'), boundary=a.get('boundary'), change=a.get('change'), note=a.get('note'), tags=a.get('tags'), importance=imp, actor=a.get('actor'))；act 为 status/set_status 时若 tstat 假值返回 {'ok': False, 'error': '缺 task_status', 'hint': '可选 active|blocked|done|dropped；迁 done 必须同时给 result'}，否则返回 _t.set_status(cg, nid or name, tstat, result=a.get('result'), note=a.get('note'), actor=a.get('actor'))；act=plan_add 返回 _t.plan_add(cg, nid or name, a.get('change') or a.get('text'), actor=a.get('actor'))；act=get 返回 _t.get_task(cg, nid or name)；act=find 返回 _t.find_similar(cg, name, k=_int_arg(a, 'k', _int_arg(a, 'limit', 5)))（k/limit 显式原样透传、缺省链回落 5）；act=session 返回 _t.session_tasks(cg, active_limit=int(a.get('active_limit') or 5), done_limit=int(a.get('done_limit') or 5))（各假值回落 5）；act 非 list 时返回 {'ok': False, 'error': '未知 task action：%r' % act, 'hint': '可选 open|status|plan_add|get|list|find|session'}；act=list 返回 _t.list_tasks(cg, status=tstat or None, limit=a.get('limit'))；
 def _task_call(cg, a):
     """结构层任务实体（op=task）——跨会话的工程台账。
 
@@ -1935,7 +2057,8 @@ def _task_call(cg, a):
         return _t.get_task(cg, nid or name)
 
     if act == "find":
-        return _t.find_similar(cg, name, k=int(a.get("k") or a.get("limit") or 5))
+        return _t.find_similar(
+            cg, name, k=_int_arg(a, "k", _int_arg(a, "limit", 5)))
 
     if act == "session":
         return _t.session_tasks(cg, active_limit=int(a.get("active_limit") or 5),
@@ -1948,7 +2071,7 @@ def _task_call(cg, a):
     return _t.list_tasks(cg, status=tstat or None, limit=a.get("limit"))
 
 
-# 生效条件：op 取 a.get("op") 转 str 去空白并 lower；缺失时按参数签名回推（含 content→write / query|node_id→read / intent→route；无签名可推时维持 read），op=="help" 在角色闸门之前直通 _help_call；其余 op 先经 cg.principal.require_op(op)（越权即 AccessDenied）再按 alias→内联名→cli 表分派；未识别 op 抛 ValueError；
+# 生效条件：op 取 a.get("op") 转 str 去空白并 lower；缺失时按参数签名回推（含 content→write / query|node_id→read / intent→route；无签名可推时维持 read），op=="help" 在角色闸门之前直通 _help_call；其余 op 先经 cg.principal.require_op(op)（越权即 AccessDenied）再按 alias→内联名→cli 表分派；未识别 op 抛 ValueError；fork：op=="forget" 的**删除**分支走 cg.forget_gated（三档自治批次②：档位判定在既有资格闸之后，变更确认档出变更单且不软删；restore 分支不变），op=="write" 经 writepipe 默认链（链尾 autonomy 档位闸）；
 def _cg_dispatch(cg, a):
     """认知图唯一入口的 op 分发主体。"""
     op = (a.get("op") or "read").strip().lower()
@@ -2110,13 +2233,37 @@ def _cg_dispatch(cg, a):
                   "ccg_contract": dict(nodefile.CCG_CONTRACT_ROLES)})
         # 能力外置可观测：本进程实际注入了哪些外部验证器（含失败原因）
         h["external_verifiers"] = audit.load_external_verifiers()
+        # 写入策略来源（issue #43 契约④）：与启动 stderr / --show-config 同一
+        # 单点 policy_report()——工具面也能回答「我的策略从哪来、可不可用」。
+        # 诊断面**不得把整个 op=info 拖崩**（-32603）：策略自描述自身的异常在此
+        # 收口成不可用形状（与 policy_report 内部兜底同一形状，见
+        # audit.unavailable_report），info 的其余字段照常返回。
+        try:
+            h["write_policy"] = audit.policy_report()
+        except Exception as _pe:                  # noqa: BLE001
+            h["write_policy"] = audit.unavailable_report(_pe)
         h["theory"] = _th.check()
         h["links"] = _lk.ls()
+        # 代校验（纯增量，2026-09-30）：长驻进程可被问「你现在这一代是不是盘面那一代」。
+        # 根因（第4条取证）：升级后长驻进程仍持有启动代模块，与升级后惰性导入的新代
+        # 模块跨代混用（实测 cg 写入 ImportError: cannot import name 'mint_auto_id'
+        # from 'md_cg.mdcg'，而盘面正常）——盘面无从自证，须由进程自报。
+        # 落点＝generation.report()（单点）：code_generation / disk_generation /
+        # stale_on_disk / restart_required / hint。**纯增量**：既有键名、键值、
+        # 嵌套结构一字不动（本行只追加五个新键，键名与既有键无冲突）。
+        # 失败不得把 op=info 拖崩（同为诊断面契约）：异常在此收口成不可用形状。
+        from . import generation as _gen
+        try:
+            h.update(_gen.report())
+        except Exception as _ge:            # noqa: BLE001
+            h.update({"code_generation": None, "disk_generation": None,
+                      "stale_on_disk": None, "restart_required": None,
+                      "hint": "代校验不可用：%s: %s" % (type(_ge).__name__, _ge)})
         return h
 
     if op == "route":
         intent = a.get("intent") or a.get("query") or ""
-        res, meta = cg.search(intent, k=int(a.get("k") or 10),
+        res, meta = cg.search(intent, k=_int_arg(a, "k", 10),
                               context=a.get("context"), record=False,
                               view=a.get("view"))
         knowledge, caps = [], []
@@ -2147,22 +2294,41 @@ def _cg_dispatch(cg, a):
                 # roleviews.ROLE_VIEWS（非法 view 库层 ValueError），与时间算子
                 # 同一透传纪律——本层不做校验也不填默认值。
                 "view": a.get("view")}
-        if a.get("node_id"):
-            return _node_view(cg.get(a["node_id"]),
-                              offset=int(a.get("offset") or 0))
+        # 输入类型闸（2026-09-30）：`node_id` 非 str 时旧行为静默失真——哈希可算的
+        # 非 str（int/float/bool）cg.get() 取不到 → `_node_view(None)` → **裸 null**；
+        # 不可哈希的（list/dict）更会 TypeError 逃出 MCP 面。调用方无从区分
+        # 「id 不存在」与「类型错」。故本层只对**类型错**补结构化 error
+        # `node_id_not_str`（附 got_type；对齐 trust.py:692 的 `node_not_found`
+        # 负路由一族；写面的同族闸见 mdcg.py:1776 的「非法 node_id 类型」ValueError
+        # ——写面 fail-closed 抛异常，读面取负路由）。
+        #
+        # **「节点不存在」有意保持 null**：`md_cg/protocol.py` 的 read 形态表已登记
+        # `node_missing.returns_null = True`（note："不是错误对象——客户端须先判空
+        # 再解析"），反向证据 test_protocol A11/B8/B10 钉住该形态；改它须连带改协议
+        # 真源与那三条断言（不在本次指派文件内）。两态可区分性因此为：类型错 =
+        # `{"ok": False, "error": "node_id_not_str", ...}`，不存在 = `null`。
+        # 判据用 `is not None`（显式 "" 也是显式：旧写法会把它当没传而静默转检索）。
+        if a.get("node_id") is not None:
+            _nid = a["node_id"]
+            if not isinstance(_nid, str):
+                return {"ok": False, "error": "node_id_not_str",
+                        "node_id": _nid, "got_type": type(_nid).__name__,
+                        "hint": "node_id 必须是字符串 id；要按关键词检索请改用 "
+                                "query（本层不再把类型错静默降级为检索）"}
+            return _node_view(cg.get(_nid), offset=int(a.get("offset") or 0))
         q = a.get("query") or a.get("intent") or ""
         # 显式 0 也是「显式」（2026-09-24 修复）：旧写法 `if a.get("budget_tokens")`
         # 把 0 当没传，静默换成 1200 —— 调用方以为「零预算」拿到的是满预算结果。
         if a.get("budget_tokens") is not None:
             return cg.recall(q, budget_tokens=int(a["budget_tokens"]),
-                             k=int(a.get("k") or 20), context=a.get("context"),
+                             k=_int_arg(a, "k", 20), context=a.get("context"),
                              goal_text=a.get("goal"),
                              include_recent=bool(a.get("include_recent")),
                              recent_limit=int(a.get("limit") or 10),
                              session=a.get("session"),
                              validity=a.get("validity"), **_tkw)
         from . import refindex
-        res, meta = cg.search(q, layer=a.get("layer"), k=int(a.get("k") or 20),
+        res, meta = cg.search(q, layer=a.get("layer"), k=_int_arg(a, "k", 20),
                               context=a.get("context"),
                               session=a.get("session"),
                               validity=a.get("validity"), **_tkw)
@@ -2242,8 +2408,11 @@ def _cg_dispatch(cg, a):
     if op == "forget":
         if (a.get("action") or "forget").strip().lower() == "restore":
             return cg.restore(a.get("node_id", ""), force=bool(a.get("force")))
-        return cg.forget(a.get("node_id", ""), a.get("reason", ""),
-                         override=bool(a.get("override")))
+        # 三档自治批次②（设计 §三 D 删除）：工具面经 forget_gated——档位判定在
+        # 既有资格闸（not_found / protect.guard_forget）**之后**，变更确认档
+        # 出变更单且不软删；库层 forget 语义不变（脚本通道不接，本批边界）。
+        return cg.forget_gated(a.get("node_id", ""), a.get("reason", ""),
+                               override=bool(a.get("override")))
 
     if op == "protect":
         return _protect_call(cg, a)
@@ -2288,15 +2457,22 @@ def _cg_dispatch(cg, a):
         check_path_root(a.get("path"), "MDCG_INGEST_ROOT", "index_code")
         if not os.path.isdir(root):
             return {"ok": False, "error": f"目录不存在：{root}"}
+        # 写序（commit=False → add_items 成功后再 save）：水位是**派生物的水位**，
+        # 必须落在「节点已写成功」之后。否则进程在两步之间被杀，会留下
+        # 「水位新 + 节点旧」——下次巡检按水位判「未变、可跳过」，漂移静默漏报。
+        # 反过来（节点新 + 水位旧）只会让下次增量重切该文件，是安全方向。
+        # add/覆写是同步 atomic_write（mdcg.py:1915→2429-2436），故先后真的成立。
+        led = refindex.Ledger(cg.root)
         items, errors, stats = refindex.index_dir(
             root, kind="code_ref", patterns=a.get("patterns"),
             max_files=int(a.get("max_files") or 500),
             max_items=int(a.get("max_items") or 2000),
             incremental=bool(a.get("incremental")),
             skip_dirs=a.get("skip_dirs"),
-            ledger=refindex.Ledger(cg.root))
+            ledger=led, commit=False)
         ids, _sens = refindex.add_items(cg, items, kind="code_ref", root=root,
                                         layer=a.get("layer"))
+        led.save()                       # 节点已落盘 → 水位随后（两步之间被杀即安全方向）
         note = ("只索引注释/接口（AST 已校验），未存完整代码；"
                 "正文用 frontmatter.code_ref + op=ref 指回源文件。"
                 "skipped_suffixes 是扫到但**没有提取器**的后缀，用于审计覆盖缺口")
@@ -2327,15 +2503,18 @@ def _cg_dispatch(cg, a):
         layer = a.get("layer") or "knowledge"
         # 显式改密级时必须全量重切（增量会跳过未变文件、覆盖不生效）。
         incremental = bool(a.get("incremental")) and not a.get("sensitivity")
+        # 写序同 op=index_code：commit=False → 节点写成功后 led.save()。
+        led = refindex.Ledger(cg.root)
         items, errors, stats = refindex.index_dir(
             root, kind="doc_ref", patterns=a.get("patterns"),
             max_files=int(a.get("max_files") or 500),
             max_items=int(a.get("max_items") or 2000),
             incremental=incremental, skip_dirs=a.get("skip_dirs"),
-            ledger=refindex.Ledger(cg.root))
+            ledger=led, commit=False)
         ids, sens_counts = refindex.add_items(
             cg, items, kind="doc_ref", root=root, layer=layer,
             sensitivity=a.get("sensitivity"))
+        led.save()
         note = ("只索引章节（level<=3）的标题与摘要，未存全文；正文用 "
                 "frontmatter.doc_ref + op=ref 回读。layer 与密级按计划 §1.3-3 "
                 "显式声明（默认 knowledge / internal，路径命中私有提示降为 "
@@ -2686,10 +2865,10 @@ def _export_call(cg, a):
 
 # 生效条件：act=(a.get("action") or "stat").strip().lower()，apply=bool(a.get("apply"))，mode=str(a.get("mode") or "").strip().lower()；principal 非 None 时对 act=="rollback"、act in ("importance","separate") 且 apply、act=="longterm" 且 apply、act=="prefeed" 且 a.get("write") 真且无写权、act in ("backfill","cap","exempt") 且 apply、act in ("backfill_rollback","cap_rollback","exempt_rollback")、act=="vision_evidence" 且 apply、act=="vision_evidence_rollback"、act=="refine" 且 apply 分别 require_admin；随后 act=="longterm" 且 mode in ("list","ls","show","read") 时仅以 action/mode/limit/snapshot_id 调 cg.maintain，否则以全部参数调 cg.maintain。
 def _maintain_call(cg, a):
-    """记忆维护（P1）：importance / longterm / prefeed / separate / rollback / stat / propagate。
+    """记忆维护（P1）：importance / longterm / prefeed / separate / rollback / stat / propagate / reload。
 
     权限**按 action 分档**（比整 op 收窄更贴合语义）：
-      · 只读（stat / history / longterm mode=list|show）→ 不额外拦截；
+      · 只读（stat / history / longterm mode=list|show / reload 读面代际刷新）→ 不额外拦截；
       · 写入侧闸门（prefeed write=True）→ 需 can_write；
       · 批量改写（importance / separate / longterm 的 apply，以及 rollback 本身
         即反向写入、无 dry-run 语义）→ require_admin。
@@ -2871,9 +3050,10 @@ def _ref_call(cg, a):
             cg, ledger=refindex.Ledger(cg.root),
             max_nodes=int(a.get("max_nodes") or refindex.MAX_CHECK))
         res["action"] = "check"
-        res["note"] = ("stale=源已改动（区间哈希不匹配）、dangling=源文件已删除。"
-                       "巡检只读、不改源文件；修复：op=index_code / op=index_doc 重建，"
-                       "或 op=sustain action=heal。")
+        res["note"] = ("stale=源已改动（区间哈希不匹配）→ 重跑 op=index_code / "
+                       "op=index_doc 重建；dangling=源已删除 → 走 op=ref action=prune "
+                       "（软删，可 restore）或恢复真源后重建。巡检只读、不改源文件；"
+                       "op=sustain action=heal 只对 stale 自动重建（悬空需人工处置）。")
         return res
     if action in ("prune", "prune_dangling"):
         res = refindex.prune_dangling(
@@ -2912,7 +3092,26 @@ def _ref_call(cg, a):
         os.path.join(a.get("root") or ref.get("root") or "",
                      ref.get("path") or ""),
         "MDCG_INGEST_ROOT", "ref")
-    out = refindex.read_ref(ref, root=a.get("root"), ref_kind=ref_kind)
+    from . import logref
+    if node is not None and isinstance(ref.get("src"), dict) and ref["src"]:
+        # P2：检索命中 → 区间回读。**区间文本仍由 refindex.read_ref 取**（logref.
+        # read_index_node 内部就是它，本分支不另写读取与哈希）；相对此前的差别只有一
+        # 点：日志节点的 root 一律取 **ref 自带的转写根**（path 是相对根写死的，用调用
+        # 方自报的 root 拼会读到别的文件——上面那道 check_path_root 也按同一路径判）。
+        # 另带 span 状态机与再生指路：stale ⇒ 重跑落库、不自动覆写；dangling ⇒ 转写被
+        # 清理，指路离线 `--repair 1`（服务态零写临时目录）。
+        out = logref.read_index_node(node, with_src=bool(a.get("with_src")))
+    else:
+        out = refindex.read_ref(ref, root=a.get("root"), ref_kind=ref_kind)
+        # 真源身份层（zstd 日志本体）按 with_src 显式开——默认关，因为每条命中都
+        # 整读一遍大 zstd 是不可接受的代价；返回带 src_verified:false 明示「本次
+        # 未看真源」。probe_src 内部挂的是与上面**同一条** MDCG_INGEST_ROOT 闸。
+        # 部署前提（评审⑦）：MDCG_INGEST_ROOT 一旦按安全审计建议设置，转写根
+        # （%TEMP%/dsh-log-transcripts）也会被该闸拒 ⇒ 日志节点回读恒 PermissionError
+        # （fail-closed 拒读，不静默降级）。加固部署须把 transcript_root 一并写进
+        # MDCG_INGEST_ROOT（支持 os.pathsep 多根）。
+        if a.get("with_src"):
+            out["src"] = logref.probe_src(ref)
     out["node_id"] = nid or None
     return out
 
@@ -2928,7 +3127,7 @@ def _whitebox_call(cg, a):
     return whitebox.dispatch(cg, a)
 
 
-# 生效条件：op=(a.get("op") or "").strip().lower()；op=="relation" 时返回 stg.relation(cg, a.get("a",""), a.get("b",""), time_axis=axis)；op=="timeline" 时返回 stg.timeline(cg, layer=a.get("layer"), limit=int(a.get("limit") or 50), desc=bool(a.get("desc", True)), time_axis=axis, session=a.get("session"))（session 缺省不过滤读遍所有会话，"*" = 显式跨会话，其它值 = 本会话视图）；op=="anchors" 时返回 stg.anchors(cg, time_window=a.get("time_window"), bbox=a.get("bbox"), layer=a.get("layer"), limit=int(a.get("limit") or 50))；op=="consistency" 时返回 stg.consistency(cg, layer=a.get("layer"), limit=int(a.get("limit") or 50))；op 为空或其它的值抛 ValueError。
+# 生效条件：op=(a.get("op") or "").strip().lower()；op=="relation" 时返回 stg.relation(cg, a.get("a",""), a.get("b",""), time_axis=axis)；op=="timeline" 时返回 stg.timeline(cg, layer=a.get("layer"), limit=int(a.get("limit") or 50), desc=bool(a.get("desc", True)), time_axis=axis, session=a.get("session"))（session 缺省不过滤读遍所有会话，"*" = 显式跨会话，其它值 = 本会话视图）；op=="anchors" 时返回 stg.anchors(cg, time_window=a.get("time_window"), bbox=a.get("bbox"), layer=a.get("layer"), limit=int(a.get("limit") or 50))；op=="consistency" 时返回 stg.consistency(cg, layer=a.get("layer"), limit=int(a.get("limit") or 50))；op 为空或其它的值抛 ValueError；返回体**原样透传**——stg 三接口的 truncated/scanned/kept/hint 读数与修正后的 count 语义（条件命中总数，issue #52）不经本层裁剪或改写，max_scan 本批不开显式入参。
 def _stg_call(cg, a):
     """语义时空图唯一入口。
 
@@ -2937,6 +3136,13 @@ def _stg_call(cg, a):
     的透传策略**相反**——`cg` 侧缺省由库层定（不启用的时间算子），`stg` 侧轴
     决定「排序/关系依据」必须**恒有值**，故在此填默认；非法轴仍由
     `trust.time_axis_of` fail-closed 抛错（本层不预先白名单，避免两套枚举）。
+
+    返回体**原样透传**（issue #52）：timeline/anchors/consistency 新增的
+    `truncated` / `scanned` / `kept` 读数与截断时的 `hint` 随返回值自动带出，
+    本层不裁剪、不改写；`count` 语义已是**条件命中总数**（不再受索引切片影响，
+    在役对照 `timeline(session=…)` 由 25 恢复为 229）。`max_scan` 本批不在
+    MCP 面开显式入参（契约：数值不是修法——需要收窄时细化生效条件/
+    不适用条件，或按设计稿建立条件索引）。
     """
     from . import stg
     op = (a.get("op") or "").strip().lower()
@@ -3039,19 +3245,59 @@ _MDCG_OP_REQUIRE = {
     "mdcg_consistency": "write",
     # 读面
     "mdcg_recall": "read", "mdcg_search": "read", "mdcg_get": "read",
-    "mdcg_review_list": "read", "mdcg_review_records": "read",
-    "mdcg_forgetting_history": "read", "mdcg_identity": "read",
+    "mdcg_review_records": "read",
+    "mdcg_identity": "read",
     "mdcg_metacognition": "read", "mdcg_self_state": "read",
     "mdcg_predict": "read", "mdcg_causal": "read",
-    "mdcg_evolution": "read", "mdcg_health": "read",
+    "mdcg_health": "read",
     "mdcg_whoami": "read", "mdcg_watermarks": "read",
     "mdcg_whitebox": "read",
-    # 裁决面（仅高权角色域含 verify）
+    # 治理/裁决面（仅高权角色域含 verify/review/protect/evolution）
     "mdcg_verify": "verify",
+    # N228（2026-09-28）：写保护面此前被映射到**粗粒度 write**，而 protect 在
+    # cg 面是 designer 专属 op（`cg(op="protect")` 前置 require_op("protect")）
+    # ⇒ 任何 can_write 角色可经工具面 action=snapshot 真落盘 _protected_history
+    # 且（修前）零审计，stats/check 亦回带保护面盘点。两条出口对齐到 protect。
+    "mdcg_protect": "protect",
+    # N227（2026-09-28）：演化账本是治理面（行含节点 id 与自由文本），此前映射
+    # read（guest 可达）而规范出口 `cg(op="evolution")` 要 op "evolution"。
+    "mdcg_evolution": "evolution",
+    # N229（2026-09-28）：遗忘留痕是同族治理台账（行内 actor/verdict/reason 属
+    # 他人写入裁决，行级可见性过滤闭不掉「可见节点上的他人裁决」这一维），而
+    # 规范出口 `cg(op="protect", action="forgetting")` 要 op "protect"。两条
+    # 出口对齐到 protect（库层 `cg.forgetting_history()` 仍按行过滤可用）。
+    "mdcg_forgetting_history": "protect",
+    # N201（2026-09-28）：审核队列属**裁决面**而非普通读面。此前映射 "read"，
+    # 而 read 是 tokens.ROLE_SPECS 全角色（含无令牌访客 guest）都持有的 op ⇒
+    # 细粒度工具 mdcg_review_list 对任何只读身份明文返回全部待审提案正文与
+    # actor/session 归属；同库规范出口 cg(op=review, action=list) 却要
+    # require_op("review")。两条出口口径对齐到 review（库层
+    # MdCGSecure.review_list 另有同款自证闸 + _readable 过滤，两层互不依赖，
+    # 任一层被绕过都仍拦得住）。
+    "mdcg_review_list": "review",
 }
 
 
-# 生效条件：name 为已注册工具名之一（cg / stg / mdcg_whitebox / mdcg_service_info / mdcg_remember 等）；name 属 _MDCG_OP_REQUIRE 且 cg.principal 具 require_op 属性时先 require_op（越权抛 AccessDenied），principal 为 None 或无该方法时跳过；cg 走 _cg_call、stg 走 _stg_call、whitebox 走 _whitebox_call；未识别的 name 返回含 error 的响应字典而不抛异常，进程不因此中断；
+# 生效条件：四个布尔入参任意组合下无条件返回 "max"（当 use_fuzzy 或 use_semantic 或 use_goal 或 use_causal 任一为真）或 None（全为假）；use_temporal 不参与判据；不做 IO、不看环境变量；
+def recall_fusion_default(use_fuzzy, use_semantic, use_goal, use_causal,
+                          use_temporal=False):
+    """`mdcg_recall` 的**缺省融合口径**判据（唯一单点，供守卫断言）。
+
+    P3-遗留 A（2026-10-01 补披露）：`use_causal` **缺省 True** ⇒ 默认 recall 的
+    融合口径由 `sum` 变成 **`max`**（影响**所有**默认召回调用，与库是否有边无关）。
+    该口径符合设计稿 §6.2「因果路融合缺省 max」与既有先例表达式
+    （fuzzy/semantic/goal 同款），故**保留**；本函数只把那个表达式从调用点提为
+    **可断言的名字**——否则「缺省到底是 sum 还是 max」只能靠读表达式，
+    静默漂移（少写一个 `or use_causal`）无守卫可抓。
+
+    `use_temporal` **刻意不入判据**：时间路是**排名项**（§6.3(e)：与 S4 层级
+    激活同类，不是单路独有召回型），它开着也不改变融合口径。
+    """
+    return ("max" if (use_fuzzy or use_semantic or use_goal or use_causal)
+            else None)
+
+
+# 生效条件：name 为已注册工具名之一（cg / stg / mdcg_whitebox / mdcg_service_info / mdcg_remember 等）；name 属 _MDCG_OP_REQUIRE 且 cg.principal 具 require_op 属性时先 require_op（越权抛 AccessDenied），principal 为 None 或无该方法时跳过；cg 走 _cg_call、stg 走 _stg_call、whitebox 走 _whitebox_call；未识别的 name 返回含 error 的响应字典而不抛异常，进程不因此中断；mdcg_forget 走 cg.forget_gated（同 cg(op=forget) 的档位路径）、mdcg_remember 的非 gated 直写分支在同 id 覆写时先过 cg.write_qualify 再按档位判定（三档自治批次②）；
 def _dispatch(cg, name, args):
     a = args or {}
     # P1-1：mdcg_* 面的角色作用域闸（与 cg 工具的 require_op 同一语义——
@@ -3077,13 +3323,21 @@ def _dispatch(cg, name, args):
                 "principal": getattr(cg, "principal", None) and cg.principal.as_dict()}
 
     if name == "mdcg_remember":
-        nid = a.get("node_id") or ("mem_" + str(int(__import__("time").time() * 1000)))
+        # B1（2026-09-30）：自动 id 委托**唯一铸造点**（mdcg.mint_auto_id：
+        # 毫秒位 + 6 位 hex 随机段 + 「已存在则换随机段重生成」的有界存在性闸）。
+        # 原先此处与 writepipe.execute 各写一份裸毫秒形态，同毫秒自动写入
+        # 铸出同一 id → add 的 upsert 语义静默顶替（返回 committed 却 0 命中）。
+        from .mdcg import mint_auto_id
+        nid = a.get("node_id") or mint_auto_id(cg)
         hint = a.get("importance_hint")
         if hint is None and a.get("importance") is not None:
             hint = float(a["importance"])
         if a.get("gated"):
             res = cg.remember_gated(
                 nid, a.get("content", ""), layer=a.get("layer") or "contextual",
+                # B2（2026-09-30）：密级透传（本分支是落盘路径：remember_gated
+                # → add；此前两分支都不传，声明 private 在此静默降级 internal）。
+                sensitivity=a.get("sensitivity"),
                 role=a.get("role"), tags=a.get("tags"),
                 condition_space=a.get("condition_space"),
                 verification_basis=a.get("verification_basis"),
@@ -3095,7 +3349,69 @@ def _dispatch(cg, name, args):
                 relation=a.get("relation"))
             res.setdefault("ok", res.get("verdict") == "ACCEPT")
             return res
-        written = cg.add(nid, a.get("content", ""), layer=a.get("layer") or "knowledge",
+        # ⑥（P-9b）：直写**不去重**是文档化现状（writelimit.py 模块头注 :9-12：
+        # 限流/同构聚合只作用 contextual 层，knowledge 等手动纪律写入不受限）
+        # ——本分支**不改落盘行为、不改 verdict**，只在返回体给出「同内容已存在」
+        # 的提示（dup_of/dup_ratio）与「本次是覆写」的读数（overwrite_of/
+        # overwrite_ratio），由调用方决定是否处理。判据复用主动遗忘闸门的**同一
+        # 实现**（forgetting.redundancy / prior_node / self_coverage），不另写
+        # 一份重复度算法；两个读数都必须在 `cg.add` **之前**取（add 之后索引里
+        # 必有 nid，覆写判据恒真、覆盖度恒 1.0）。
+        from . import forgetting as _forgetting
+        _layer = a.get("layer") or "knowledge"
+        _content = a.get("content", "")
+        _prior = _forgetting.prior_node(cg, nid)
+        _prior_cov = (_forgetting.self_coverage(cg, _prior, _content)
+                      if _prior is not None else None)
+        _dup = _forgetting.redundancy(cg, _content, layer=_layer, exclude=nid)
+        # 三档自治批次②（设计 §三）：本分支是**热写入路径的第二落点**（另两处 =
+        # writepipe 链尾执行器、remember_gated）——同 id 已存在 ⇒ C 改写、
+        # 不存在 ⇒ A 新增，判据复用 forgetting.prior_node（不另写一份存在性判据）。
+        # 位置：既有 `if a.get("gated")` 分支之后、`cg.add` 之前（直写面没有别的
+        # 资格闸；audit/限流属 gated 分支的链）。确认档 ⇒ 出单且不落盘。
+        from . import autonomy_modes as _am
+        _action = _am.C_REWRITE if _prior is not None else _am.A_ADD
+        if _prior is not None:
+            # 资格在先（纯加严）：见 writepipe._gate_autonomy 同款注释——覆写的
+            # 层闸/写保护闸在 cg.add 内部，档位闸不得抢在它们之前把拒绝变成入队。
+            cg.write_qualify(nid, target_layer=_layer,
+                             override=bool(a.get("override")),
+                             actor=getattr(cg, "actor", None))
+        _dec = _am.decide(_action)
+        if _dec["decision"] != _am.ALLOW:
+            _aut = {"mode": _dec["mode"], "action": _dec["action"],
+                    "action_name": _dec["action_name"],
+                    "decision": _dec["decision"]}
+            if _dec["decision"] == _am.FORBID:
+                return {"ok": False, "id": nid, "committed": False,
+                        "moved_to": "autonomy_forbidden",
+                        "error": "autonomy_forbid", "autonomy": _aut,
+                        "hint": _dec["hint"]}
+            _meta = {k: a[k] for k in
+                     ("tags", "condition_space", "verification_basis",
+                      "non_applicable_conditions", "derived_from", "relation",
+                      "role", "importance") if a.get(k) is not None}
+            # 直写面的裁决参数（本分支的 add 会自己跑冲突闸）：随单落进复现 meta，
+            # 否则「确认后落盘」与「直接落盘」两条路径的判据不等价。
+            _meta["consistency"] = bool(a.get("consistency", True))
+            _meta["on_conflict"] = a.get("on_conflict") or "reject"
+            _meta["override"] = bool(a.get("override"))
+            _pay = _am.mutation_payload(
+                _action, nid, after=_content,
+                reason="mdcg_remember 直写（%s）" % _am.ACTION_NAMES[_action],
+                primitive="add", meta=_meta)
+            _pr = _am.propose_mutation(cg, _action, nid, payload=_pay,
+                                       layer=_layer,
+                                       sensitivity=a.get("sensitivity"),
+                                       info=True)
+            return {"ok": True, "id": nid, "committed": False,
+                    "moved_to": "review_queue", "pid": _pr["pid"],
+                    "mutation": _pay, "autonomy": _aut,
+                    "hint": "%s 本次未落盘：变更单已入审核队列（pid=%s，目标 %s）。"
+                            % (_dec["hint"], _pr["pid"], nid)}
+        written = cg.add(nid, _content, layer=_layer,
+                         # B2：同上——落盘面丢字段＝上游声明静默失效。
+                         sensitivity=a.get("sensitivity"),
                          role=a.get("role"), tags=a.get("tags"),
                          condition_space=a.get("condition_space"),
                          importance=float(a.get("importance", 0.5)),
@@ -3109,13 +3425,36 @@ def _dispatch(cg, name, args):
         if written is None:
             return {"ok": False, "id": nid, "verdict": "DEFER",
                     "reason": "节点间冲突检测未通过（on_conflict=defer）"}
-        return {"ok": True, "id": nid}
+        out = {"ok": True, "id": nid}
+        if _prior is not None:
+            out["overwrite_of"] = _prior
+            out["overwrite_ratio"] = _prior_cov
+        if _dup["with"] and _dup["max"] >= _forgetting.DUP_MERGE:
+            out["dup_of"] = _dup["with"]
+            out["dup_ratio"] = round(_dup["max"], 4)
+            out["dup_compared"] = _dup["compared"]
+            out["dup_hint"] = (
+                "同内容已存在于 %s（覆盖度 %.2f≥%.2f）；本路径是直写"
+                "（gated=false：knowledge 层手动纪律写入不受限流/去重约束，"
+                "见 writelimit.py 模块头注），正文已按原样落盘为新节点——"
+                "如需并入既有节点请显式处理"
+                % (_dup["with"], _dup["max"], _forgetting.DUP_MERGE))
+        return out
 
     if name == "mdcg_recall":
         use_fuzzy = bool(a.get("fuzzy"))
         use_semantic = bool(a.get("semantic"))
         use_goal = bool(a.get("goal_path") or a.get("goal"))
-        if use_fuzzy or use_semantic or use_goal:
+        # P3（裁定 9「全进默认检索」）：因果路（chain）/ 时间路（temporal）**进缺省集**，
+        # 但**每路可单独关**——显式传 causal=false / temporal=false 即从本次调用剔除。
+        # 未显式传（None）= 缺省进路；与既有 fuzzy/semantic/goal 的「显式启用」语义相反，
+        # 这是刻意的非对称：这两路在无 edges / 无时间参数的库上自然为空，缺省开不产噪声。
+        use_causal = a.get("causal")
+        use_temporal = a.get("temporal")
+        use_causal = True if use_causal is None else bool(use_causal)
+        use_temporal = True if use_temporal is None else bool(use_temporal)
+        if (use_fuzzy or use_semantic or use_goal
+                or not use_causal or not use_temporal):
             paths = ["lexical", "bucket", "entity", "graph"]
             if use_fuzzy:
                 paths.append("fuzzy")
@@ -3123,13 +3462,22 @@ def _dispatch(cg, name, args):
                 paths.append("semantic")
             if use_goal:
                 paths.append("goal")
+            if use_causal:
+                paths.append("chain")
+            if use_temporal:
+                paths.append("temporal")
             paths = tuple(paths)
         else:
-            paths = None
+            paths = None          # 缺省六路（mdcos.search_rrf 的缺省集）
         # fuzzy 路缺省用 max 融合：实测（memory-bench-1000，870 查询）sum 会把
         # self@1 拉低 10.1%，因为求和奖励「多路共识」、低估「模糊路独有」的目标。
         # semantic 路同理：条件结构命中常是「独有召回」，故一并缺省 max。
-        fusion = a.get("fusion") or ("max" if (use_fuzzy or use_semantic or use_goal) else None)
+        # P3：因果路按设计稿 §6.2「融合口径」同为**单路独有召回型**，照抄本条先例
+        # 形态（同一表达式内追加条件，不另起第二套判据）。
+        # P3-遗留 A（2026-10-01）：表达式提为 `recall_fusion_default` 单点，
+        # 使「缺省口径 = max」可被守卫直接断言（防静默漂移）。
+        fusion = a.get("fusion") or recall_fusion_default(
+            use_fuzzy, use_semantic, use_goal, use_causal)
         # 默认单条上限从 mdcos 取（该模块只在 main() 里惰性导入，模块级没有名字，
         # 直接引用 mdcos.DEFAULT_MAX_ITEM_TOKENS 会 NameError —— 故此处按需导入）。
         from .mdcos import DEFAULT_MAX_ITEM_TOKENS as _DEFAULT_MAX_ITEM
@@ -3140,7 +3488,7 @@ def _dispatch(cg, name, args):
                          max_item_tokens=int(a["max_item_tokens"])
                          if a.get("max_item_tokens") is not None
                          else _DEFAULT_MAX_ITEM,
-                         k=int(a.get("k") or 20), context=a.get("context"),
+                         k=_int_arg(a, "k", 20), context=a.get("context"),
                          include_work=bool(a.get("include_work")),
                          paths=paths, fusion=fusion,
                          goal_text=a.get("goal"),
@@ -3153,7 +3501,7 @@ def _dispatch(cg, name, args):
     if name == "mdcg_search":
         from . import refindex
         res, meta = cg.search(a.get("query", ""), layer=a.get("layer"),
-                              k=int(a.get("k") or 20), context=a.get("context"),
+                              k=_int_arg(a, "k", 20), context=a.get("context"),
                               roles=tuple(a["roles"]) if a.get("roles") else None,
                               include_work=bool(a.get("include_work")),
                               pools=a.get("pools"),
@@ -3176,7 +3524,8 @@ def _dispatch(cg, name, args):
         return _node_view(node, offset=int(a.get("offset") or 0))
 
     if name == "mdcg_reflect":
-        res, _ = cg.search(a.get("query", ""), k=int(a.get("k") or 10), record=False)
+        res, _ = cg.search(a.get("query", ""), k=_int_arg(a, "k", 10),
+                           record=False)
         return cg.reflect(a.get("query", ""), res, a.get("feedback"))
 
     if name == "mdcg_verify":
@@ -3230,8 +3579,9 @@ def _dispatch(cg, name, args):
         return {"records": cg.review_records(pid=a.get("pid"))}
 
     if name == "mdcg_forget":
-        return cg.forget(a.get("node_id", ""), a.get("reason", ""),
-                         override=bool(a.get("override")))
+        # 三档自治批次②：与 cg(op=forget) 同一档位路径（forget_gated，见该分支注释）。
+        return cg.forget_gated(a.get("node_id", ""), a.get("reason", ""),
+                               override=bool(a.get("override")))
 
     if name == "mdcg_restore":
         return cg.restore(a.get("node_id", ""), force=bool(a.get("force")))
@@ -3337,6 +3687,7 @@ def _start_sustain(cg):
     """启动常驻自维持循环（MDCG_SUSTAIN=0 关闭；间隔可用环境变量调）。"""
     if os.environ.get("MDCG_SUSTAIN", "1") in ("0", "false", "False"):
         return None
+    from . import sleep as _sleep
     from . import sustain
     name = os.environ.get("MDCG_SUSTAIN_NAME") or "md_cg"
     lp = sustain.ensure_loop(
@@ -3345,22 +3696,28 @@ def _start_sustain(cg):
                             or sustain.DEFAULT_BEAT_INTERVAL),
         heal_interval=float(os.environ.get("MDCG_SUSTAIN_HEAL")
                             or sustain.DEFAULT_HEAL_INTERVAL),
-        auto_heal=os.environ.get("MDCG_SUSTAIN_AUTOHEAL", "1")
-        not in ("0", "false", "False"),
+        # 四档 auto_* 一律经 sustain 的**单一真源读取器**（P0-2）：缺省值只在
+        # `sustain.AUTO_DEFAULTS` 定义一处，此处不得再写字面量（含 env 键名——
+        # 键名真源是 `sustain.AUTO_ENVS`）。整理巡检缺省开：确定性动作、
+        # 永不删除节点（可逆可审计）；opt-out `MDCG_AUTO_TIDY=0`。
+        auto_heal=sustain.auto_from_env("auto_heal"),
         scrub_interval=float(os.environ.get("MDCG_SCRUB_INTERVAL")
                              or sustain.DEFAULT_SCRUB_INTERVAL),
-        auto_scrub=os.environ.get("MDCG_AUTO_SCRUB", "0")
-        not in ("0", "false", "False"),
+        auto_scrub=sustain.auto_from_env("auto_scrub"),
         evolve_interval=float(os.environ.get("MDCG_EVOLVE_INTERVAL")
                               or sustain.DEFAULT_EVOLVE_INTERVAL),
-        auto_evolve=os.environ.get("MDCG_AUTO_EVOLVE", "0")
-        not in ("0", "false", "False"),
+        auto_evolve=sustain.auto_from_env("auto_evolve"),
         tidy_interval=float(os.environ.get("MDCG_TIDY_INTERVAL")
                             or sustain.DEFAULT_TIDY_INTERVAL),
-        # 整理巡检（contextual 同构组聚合+成员降权）默认开：确定性动作、
-        # 永不删除节点（可逆可审计）；MDCG_AUTO_TIDY=0 关闭
-        auto_tidy=os.environ.get("MDCG_AUTO_TIDY", "1")
-        not in ("0", "false", "False"))
+        auto_tidy=sustain.auto_from_env("auto_tidy"),
+        # 第六档睡眠周期（§4.7）：五个值一律经 `md_cg/sleep.py` 的**单一真源
+        # 读取器**——键名真源是 `sleep.SLEEP_ENV_KEYS`、缺省真源是
+        # `sleep.SLEEP_ENV_DEFAULTS`，本处（与 op 路径）都不得再写字面量。
+        sleep_interval=_sleep.sleep_interval(),
+        auto_sleep=_sleep.sleep_enabled(),
+        sleep_merge=_sleep.sleep_merge_mode(),
+        sleep_window=_sleep.sleep_window(),
+        sleep_scrub_apply=_sleep.sleep_scrub_apply())
     lp.start()
     return lp
 
@@ -3607,9 +3964,132 @@ def _force_utf8_stdio():
             pass
 
 
-# 生效条件：_force_utf8_stdio() 先执行（stdio 三流强制 UTF-8，issue #39）；随后对 mdcg_root()/aux_root() 各探一次，抛 ValueError（Windows 保留设备名末段被 GetFullPathNameW 吞成设备路径，datapath._abs_host_path 守卫）时向 stderr 写一行含原始消息的告警并返回 2；此后 _resolve_root() 返回 err 非空时向 stderr 写冲突说明并返回 2；root 为空写缺少 MDCG_ROOT 并返回 2；root 的 basename 小写以 _md_cg_ 开头返回 2，令牌校验失败返回 3；其余构造 MdCGSecure 并进入 stdin 分派循环。
+# 生效条件：msg 为 json.loads 的产物（任意 JSON 值，可为非对象）；非 dict 时回 id=null 的 -32600 Invalid Request 并返回 False（不抛、不退出）；msg 为 dict 时按 msg.get("method") 分派——initialize 回 protocolVersion/capabilities/serverInfo，notifications/initialized 无响应，tools/list 回 tools_for_surface()，tools/call 在 params 非 dict 时回 -32602 Invalid params 且**不进工具**、params 为 dict 或缺省时经 call_tool 回 content，shutdown 回空结果并返回 True（调用方据此跳出读循环）；其余 method 在 id 非 None 时回 -32601；分派体任何异常都回带 id 的 -32603 并返回 False（fail-closed：单行请求不得杀 server）。
+def _serve_line(cg, msg) -> bool:
+    """处理一行已解析的 JSON-RPC 消息；返回 True 表示请求进程下线（shutdown）。
+
+    入口**类型闸**（N206，2026-09-28 legacy）：此前这条分派链直接写在 main() 的
+    for 循环体里，紧跟 ``json.loads`` 就裸调 ``msg.get(...)``，tools/call 分支又
+    裸调 ``params.get("name")``——而 ``json.loads`` 的产物**不必是对象**：
+    ``[]`` / ``123`` / ``null`` / ``"x"`` / 批量数组都是合法 JSON。任何能写该
+    server stdin 的一方（MCP 宿主 / 被注入的宿主插件 / stdio 管道交错写入者）
+    发一行即得未捕获 ``AttributeError: 'list' object has no attribute 'get'``
+    逃出 main()，整个 stdio 进程退出（实测 rc=1、stdout 只到崩溃前那条）：
+    工具面 tools/list 永无应答，崩溃期间记忆面（含写入）全不可用，且零凭据可达。
+    工具层 try 只包 ``call_tool``，包不到入口解析——这是**入口面**的缺口。
+
+    同族已在位：``hive/hive_mcp/mcp_server.py`` 的 ``_rpc``（-32600/-32602 双闸）
+    + main 入口兜底（2026-09-25 v2-N16 DoS），md_cg 是漏网面。此处按**同一口径**
+    补齐：非对象 → id=null 的 -32600；tools/call 的 params 非 dict → -32602 且
+    不进工具；整体兜底 -32603。fail-closed 的语义是「坏行被拒且进程继续服务」，
+    不是「坏行杀进程」。
+    """
+    if not isinstance(msg, dict):
+        # 非对象无从取 id → 按 JSON-RPC 2.0 回 id=null 的 Invalid Request。
+        _reply(None, error={"code": -32600,
+                            "message": "Invalid Request：请求体必须为 JSON 对象"
+                                       "（收到 %s）" % type(msg).__name__})
+        return False
+    rid = msg.get("id")
+    method = msg.get("method")
+    try:
+        if method == "initialize":
+            _reply(rid, {"protocolVersion": PROTOCOL_VERSION,
+                         "capabilities": {"tools": {}},
+                         "serverInfo": {"name": SERVER_NAME,
+                                        "version": SERVER_VERSION}})
+        elif method in ("notifications/initialized", "initialized"):
+            pass                          # 通知，无响应
+        elif method == "tools/list":
+            _reply(rid, {"tools": tools_for_surface()})
+        elif method == "tools/call":
+            params = msg.get("params")
+            # params 类型闸：非 dict（[1,2] / "x" / 7）时下方 params.get 抛
+            # AttributeError——工具层 try 包不到这里，回 -32602 不进工具。
+            # params 缺省/None 维持原语义（`or {}`，落工具层「未知工具」错误）。
+            if params is not None and not isinstance(params, dict):
+                _reply(rid, error={"code": -32602,
+                                   "message": "Invalid params：params 必须为 "
+                                              "object（收到 %s）"
+                                              % type(params).__name__})
+                return False
+            params = params or {}
+            name = params.get("name")
+            args = params.get("arguments") or {}
+            try:
+                out = call_tool(cg, name, args)
+                _reply(rid, {"content": [{"type": "text", "text": _j(out)}],
+                             "isError": False})
+            except Exception as exc:      # noqa: BLE001 —— 工具错误以 MCP 结果返回
+                # issue #34：失败路径必须带「怎么办」——AccessDenied 的 hint
+                # （guest 配凭据 / 令牌补授权 / 过期重签）随结构化错误透出。
+                err = {"error": f"{type(exc).__name__}: {exc}"}
+                _hint = getattr(exc, "hint", None)
+                if _hint:
+                    err["hint"] = _hint
+                _reply(rid, {"content": [{"type": "text",
+                                          "text": _j(err)}],
+                             "isError": True})
+        elif method == "shutdown":
+            _reply(rid, {})
+            return True
+        elif rid is not None:
+            _reply(rid, error={"code": -32601, "message": f"method not found: {method}"})
+    except Exception as exc:              # noqa: BLE001 —— 入口兜底不崩 server
+        sys.stderr.write("[mdcg-mcp] 主循环兜底（继续服务）: %r\n" % (exc,))
+        _reply(rid, error={"code": -32603,
+                           "message": f"internal error: {type(exc).__name__}"})
+    return False
+
+
+# 生效条件：rep 为 audit.policy_report() 的返回值（或同形 dict）且 rep["available"] 为假时，返回含「⚠ 写入策略不可用」「code=」「写入将 fail-closed」与 hint 的单行文本（以 "\n" 结尾）；available 为真时返回含「写入策略：来源=」「path=」「forbidden=」「required=」的单行文本（以 "\n" 结尾）；rep 为假值或缺键时按空值渲染，恒不抛异常。
+def _policy_stderr_note(rep) -> str:
+    """启动 stderr 的策略来源单行（issue #43 契约④）——内容**单点**。
+
+    为什么单列成函数：守卫要对「启动面报出来源」做定点变异（改成空串即应转红），
+    把渲染收在一处，变异锚点才稳定、也不会与 main() 的大函数纠缠。
+    """
+    rep = rep or {}
+    err = rep.get("error") or {}
+    if not rep.get("available"):
+        return ("[mdcg-mcp] ⚠ 写入策略不可用（来源=%s code=%s）：%s；"
+                "写入将 fail-closed（不落盘、不入审核队列）。%s\n"
+                % (rep.get("source"), err.get("code"), err.get("reason"),
+                   err.get("hint") or ""))
+    return ("[mdcg-mcp] 写入策略：来源=%s path=%s（forbidden=%s required=%s）\n"
+            % (rep.get("source"), rep.get("path"),
+               rep.get("forbidden"), rep.get("required")))
+
+
+# 生效条件：以 audit.resolve_rulebook() 解析策略来源后，把单行 JSON（server/version/policy{source,path,available,forbidden,required,error}）写到 stdout 并返回 0；**恒返回 0**——不可用时 available=false 且 error 非空（含策略自描述自身抛异常的兜底形状），不判是否可用（诊断面不是失败，与 hive serve_start 的 --show-config 同语义）；不解析 root、不建 cg、不落盘、不拉起任何进程。
+def _show_config() -> int:
+    """只读配置诊断面（`python -m md_cg.mcp_server --show-config`）。
+
+    issue #43 契约④：策略来源必须在**可查询面**可见——env(MDCG_POLICY_FILE) /
+    包内默认 / 不可用。读取面与写入闸门读同一个 `audit.resolve_rulebook()`，
+    不另建判据（两套判据必然漂移）。
+
+    为什么**恒退出 0**（issue #43 键类型面补强）：本命令就是用来诊断「策略出
+    什么问题」的，策略畸形（键类型面）时它若自己 rc=1 且 stdout 空，运维手上
+    就只剩一个「看起来像崩了」的诊断器——与「不可用时 available=false」的契约
+    直接相反。故策略自描述的异常在此收口成同形状的不可用自描述；进程退出码
+    只表达「诊断面自身是否跑完」。
+    """
+    from . import audit
+    try:
+        pol = audit.policy_report()
+    except Exception as exc:                      # noqa: BLE001 —— 恒退出 0
+        pol = audit.unavailable_report(exc)
+    doc = {"server": SERVER_NAME, "version": SERVER_VERSION, "policy": pol}
+    sys.stdout.write(json.dumps(doc, ensure_ascii=False) + "\n")
+    return 0
+
+
+# 生效条件：_force_utf8_stdio() 先执行（stdio 三流强制 UTF-8，issue #39）；argv 含 --show-config 时改走只读诊断面 _show_config() 并原样返回其退出码（不解析 root、不起服务）；随后对 mdcg_root()/aux_root() 各探一次，抛 ValueError（Windows 保留设备名末段被 GetFullPathNameW 吞成设备路径，datapath._abs_host_path 守卫）时向 stderr 写一行含原始消息的告警并返回 2；此后 _resolve_root() 返回 err 非空时向 stderr 写冲突说明并返回 2；root 为空写缺少 MDCG_ROOT 并返回 2；root 的 basename 小写以 _md_cg_ 开头返回 2，令牌校验失败返回 3；其余构造 MdCGSecure 并进入 stdin 分派循环——每行经 _serve_line 处理（非对象 JSON 回 -32600 且不崩、tools/call 的非 dict params 回 -32602、分派体异常回 -32603，单行请求不得杀 server），_serve_line 返回 True（shutdown）或 stdin EOF 后脱离循环，随后 sustain.stop_all() 与 cg.close() 并返回 0。
 def main():
     _force_utf8_stdio()
+    if "--show-config" in sys.argv:
+        return _show_config()
     # 启动早期承接受理（Windows 保留设备名守卫）：MDCG_ROOT/MDCG_AUX_ROOT/
     # MDCG_DATA_ROOT 等覆盖值末段若是保留设备名（aux/con/nul/com1-9/lpt1-9…），
     # ntpath.abspath 经 GetFullPathNameW 会把整个路径吞成设备命名空间形态
@@ -3705,6 +4185,18 @@ def main():
     # 通常位于私有运行时仓。加载失败不阻塞启动——失败原因写进 stderr 与
     # service_info，未注入的 content_kind 恒判 DEFER（诚实，不假装通过）。
     from . import audit as _audit
+    # 写入策略来源（issue #43 契约④）：策略不可见时用户只看得到「text 写入进
+    # 审核队列」这一症状，看不到第一因（策略从哪来 / 有没有）。故启动即报来源；
+    # 不可用时写明后续写入会 fail-closed，而不是让写入在暗处降级。
+    # 诊断面**不得让 server 退出**（issue #43 键类型面补强，N225 教训）：这一行
+    # 在 main() 的任何 try 之外，启动期崩＝记忆面整体不可用——策略畸形恰好是
+    # 最需要被看见的处境，不是拒绝启动的理由。策略自描述自身的异常在此收口
+    # （形状闸是第一道防线，本条是第二道），启动继续，写入侧另有 fail-closed。
+    try:
+        sys.stderr.write(_policy_stderr_note(_audit.policy_report()))
+    except Exception as _pol_exc:                 # noqa: BLE001
+        sys.stderr.write("[mdcg-mcp] ⚠ 策略自描述失败（不阻塞启动）：%r\n"
+                         % (_pol_exc,))
     _verifiers = _audit.load_external_verifiers()
     if _verifiers.get("loaded") or _verifiers.get("failed"):
         sys.stderr.write("[mdcg-mcp] 外部验证器: loaded=%s failed=%s\n"
@@ -3722,6 +4214,17 @@ def main():
                                             _rep.get("interrupted")))
     except Exception as _exc:         # 对账故障不得影响服务可用性
         sys.stderr.write("[mdcg-mcp] 两段式对账失败（不阻塞启动）: %r\n"
+                         % (_exc,))
+    # ③' 启动对账 reconcile v0（v0.3 T9 自稳定定理落地，落地清单 P0-3）：两段式
+    # 清账只覆盖「有意图无结果的写入」，这里补全量 diff——索引（派生态）vs 盘面
+    # 真源：多/缺索引条目与内容哈希漂移三类，以盘面为真源**增量**修复索引面；
+    # 真源自身损坏只告警留痕不自动改写（T9 边界：结构合法≠内容正确）。告警与
+    # 留痕由模块发声（diff 非空才输出，干净库零噪声）；MDCG_RECONCILE=0 关闭
+    # （缺省开，开关真源 reconcile.enabled）。失败不阻塞启动，与③同风格。
+    try:
+        cg.reconcile_state()
+    except Exception as _exc:         # 对账故障不得影响服务可用性
+        sys.stderr.write("[mdcg-mcp] 启动对账 v0 失败（不阻塞启动）: %r\n"
                          % (_exc,))
     # 进程自报（诊断设施，fail-safe）：把「md_cg 实际加载源 + render 契约代际」
     # 落成 `<tempdir>/md_cg_servers/<pid>.json`，供 `scripts/mdcg_stale_servers.py`
@@ -3745,6 +4248,32 @@ def main():
                              "该进程的代际将无法被外部机械判定）\n")
     except Exception as _exc:             # noqa: BLE001 —— 自报不得阻塞启动
         sys.stderr.write("[mdcg-mcp] 自报异常（不阻塞启动）: %r\n" % (_exc,))
+    # 代校验（generation 单点，2026-09-30）：stdio 服务**真正开始服务之前**，把盘面
+    # 上所有「函数内延迟导入」在本进程的模块面上试解析一遍（导入目标模块 → getattr
+    # 取名字）。根因（第4条取证）：长驻进程只在模块首次导入时读盘，而 md_cg 内有
+    # 大量写在函数里的延迟导入（AST 实测 328 处，相当一部分是为避开循环导入）——
+    # 升级后旧代已载入模块与新代惰性模块跨代混用，实测表现为 cg 写入返回
+    # `ImportError: cannot import name 'mint_auto_id' from 'md_cg.mdcg'` 而盘面完全
+    # 正常（该延迟导入要到运行期才炸，且报错点离根因很远）。此处提前到启动期显式
+    # 判一次：**名字缺失即拒绝启动**（fail-closed，消息自带「请重启常驻 MCP 进程」
+    # 指引）；外部可选模块缺失（不在盘面的可选降级面，如 whitebox_kb/aeis_core 的
+    # 惰性身体面）非致命，但计数如实上报，不静默。
+    # 调用点必须在**函数体内**：这些延迟导入里相当一部分是为避开循环导入才写在函数
+    # 里的，本校验若放到模块顶层会把避环结构重新咬回来（同族守卫
+    # md_cg/test_generation_guard.py 有 AST 断言钉死这一点）。
+    try:
+        from . import generation as _gen
+        _dep = _gen.verify_delegations()
+    except Exception as _dep_exc:        # noqa: BLE001 —— 未通过即拒绝服务，不带病运行
+        sys.stderr.write("[mdcg-mcp] 代校验未通过（拒绝启动，fail-closed）：%s\n%s\n"
+                         % (type(_dep_exc).__name__, _dep_exc))
+        return 4
+    sys.stderr.write(
+        "[mdcg-mcp] 代校验：延迟导入 %d 项 / 目标模块 %d 个 / 已解析 %d 项 / "
+        "可选缺失 %d 项 · 代 %s\n"
+        % (_dep.get("delegations"), _dep.get("target_modules"),
+           _dep.get("resolved"), len(_dep.get("unavailable") or []),
+           _gen.STARTUP_FINGERPRINT[:12]))
     _start_sustain(cg)
 
     for line in sys.stdin:
@@ -3755,41 +4284,22 @@ def main():
             msg = json.loads(line)
         except ValueError:
             continue
-        method = msg.get("method")
-        rid = msg.get("id")
-
-        if method == "initialize":
-            _reply(rid, {"protocolVersion": PROTOCOL_VERSION,
-                         "capabilities": {"tools": {}},
-                         "serverInfo": {"name": SERVER_NAME,
-                                        "version": SERVER_VERSION}})
-        elif method in ("notifications/initialized", "initialized"):
-            continue                      # 通知，无响应
-        elif method == "tools/list":
-            _reply(rid, {"tools": tools_for_surface()})
-        elif method == "tools/call":
-            params = msg.get("params") or {}
-            name = params.get("name")
-            args = params.get("arguments") or {}
+        # N206：msg 非 dict（`[]`/`123`/`null`/`"x"`/批量数组都是合法 JSON）
+        # 由 _serve_line 的入口类型闸拦下（-32600，不崩）；此处再兜一层——
+        # 兜底件本身失败（stdout 已断等）也只少一条应答，不带走整个 server。
+        try:
+            stop = _serve_line(cg, msg)
+        except Exception as exc:          # noqa: BLE001 —— 入口兜底不崩 server
+            sys.stderr.write("[mdcg-mcp] 主循环兜底（继续服务）: %r\n" % (exc,))
             try:
-                out = call_tool(cg, name, args)
-                _reply(rid, {"content": [{"type": "text", "text": _j(out)}],
-                             "isError": False})
-            except Exception as exc:      # noqa: BLE001 —— 工具错误以 MCP 结果返回
-                # issue #34：失败路径必须带「怎么办」——AccessDenied 的 hint
-                # （guest 配凭据 / 令牌补授权 / 过期重签）随结构化错误透出。
-                err = {"error": f"{type(exc).__name__}: {exc}"}
-                _hint = getattr(exc, "hint", None)
-                if _hint:
-                    err["hint"] = _hint
-                _reply(rid, {"content": [{"type": "text",
-                                          "text": _j(err)}],
-                             "isError": True})
-        elif method == "shutdown":
-            _reply(rid, {})
+                _reply(msg.get("id") if isinstance(msg, dict) else None,
+                       error={"code": -32603,
+                              "message": f"internal error: {type(exc).__name__}"})
+            except Exception:             # noqa: BLE001 —— 回写失败不再叠加异常
+                pass
+            continue
+        if stop:                          # shutdown：跳出读循环，正常下线
             break
-        elif rid is not None:
-            _reply(rid, error={"code": -32601, "message": f"method not found: {method}"})
 
     try:                                  # 正常下线：清戳，对端看到的是 stopped
         from . import sustain

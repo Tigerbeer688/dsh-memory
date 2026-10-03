@@ -11,12 +11,26 @@
               "tool_trace": [...],                       # 仅 spec.tools 时存在
               "finished_ts": ..., "duration_s": ...}
              {"ok": false, "error": "...", ...}
+           H-4 补充键（**仅在有 LLM 重试时出现**，零重试不写此键 ⇒ 产物逐位不变）：
+             "llm_retries": {"attempts": n, "retries": m,
+                             "last_outcome": "ok|recovered|failed",
+                             "events": [{"attempt","kind","status",
+                                         "retry_after_s","wait_s"}, ...]}
+             —— 重试不静默：限流/网关抖动被退避重试吸收这件事，必须留在产物里。
            log.txt —— 详细日志（stdout/stderr 保持安静，不污染 serve 控制台）
     退出码 0 成功 / 2 规格错 / 3 API 错误
 
 API：OpenAI 兼容 chat/completions（GLM 同形）。
-env：HIVE_API_KEY（必填，缺失即 fail）、
+模型密钥与 base 的取值口只有一个（model_endpoint），且**只取自 serve 侧 env**：
+spec 只提供布尔开关 use_subagent_llm，绝不携带密钥或地址——spec 会落盘流转
+（jobs/<id>/spec.json、log/progress、编排链读取方），一旦允许它带值，写 spec 者
+即可让执行器把任意凭据发往任意地址（凭据外发面）。开关只决定「用哪一份 env」。
+env：HIVE_API_KEY（主模型密钥，缺失即 fail）、
      HIVE_API_BASE（默认 https://open.bigmodel.cn/api/paas/v4）、
+     HIVE_SUBAGENT_API_KEY（子代理覆盖密钥：spec.use_subagent_llm 为真时优先，
+       缺失安全回落 HIVE_API_KEY）、
+     HIVE_SUBAGENT_API_BASE（子代理覆盖 base，缺省回落 HIVE_API_BASE；
+       子代理密钥缺失时 base 一并回落主配置——半套配置是跨网关错配）、
      MDCG_ROOT（lingshu_cg 工具的认知图根；缺省该工具返回配置缺失错误）、
      MDCG_HOME（md_cg 包所在仓根；缺省=执行器父目录，同仓分发零配置）、
      HIVE_WEB_SEARCH（web_search 后端：zhipu[默认] | duckduckgo）、
@@ -71,6 +85,7 @@ from __future__ import annotations
 
 import json
 import os
+import random
 import re
 import sys
 import tempfile
@@ -79,7 +94,93 @@ import traceback
 import urllib.error
 import urllib.request
 
+# ---------------------------------------------------------------- 入口自保证 UTF-8
+# 约束（工作纪律第 15 条）：本调用必须在**任何文件/库 I/O 之前**——utf8_boot.ensure_utf8
+# 在解释器未开 UTF-8 模式时以相同 argv 重启自身（-X utf8），早于它的任何 open/stdio
+# 读写都走 locale 编码（Windows 中文机 = cp936：裸 open 抛 UnicodeDecodeError、中文写
+# 落 GBK 字节）。本执行器由 serve 以 `python <exec_py> <job_dir>` 拉起，模块级任何读
+# spec/log 的动作都必须是本行之后。仓库根入 sys.path 的形态照本文件 _md_cg_import 的
+# 最小写法（助手在仓根，不是 md_cg 包目录）。
+# 被 import（本模块非 __main__）时助手只置子进程继承面、绝不重启/退出——F6：静默重启
+# 会吞掉调用方输入。本文件既由 serve 直跑、又被 orch.py 以 `import exec` 拉起。
+_UTF8_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _UTF8_ROOT not in sys.path:
+    sys.path.insert(0, _UTF8_ROOT)
+from utf8_boot import ensure_utf8  # noqa: E402
+
+ensure_utf8(__file__)
+
+
 DEFAULT_API_BASE = "https://open.bigmodel.cn/api/paas/v4"
+
+# ------------------------------------------------------------- 模型端点解析（C3）
+# 模型密钥与 base 的**唯一**取值口：值只取自 serve 侧 env，spec 只提供布尔开关
+# （USE_SUBAGENT_LLM_KEY）。为什么把 spec 限死在布尔：spec 会落盘（spec.json）、
+# 进 log/progress、被编排链与读取方看见；一旦允许携带值，写 spec 者就能让执行器
+# 把任意凭据发往任意地址。开关只决定「用哪一份 env 配置」——凭据外发面为零。
+#   主配置       HIVE_API_KEY（缺失即 fail，可诊断）／HIVE_API_BASE → DEFAULT_API_BASE
+#   子代理覆盖   HIVE_SUBAGENT_API_KEY / HIVE_SUBAGENT_API_BASE（缺省回落主配置）
+USE_SUBAGENT_LLM_KEY = "use_subagent_llm"
+
+# 当前 job 的开关值：exec 是「一进程 = 一个 job」，spec 在 LLM 入口读一次即冻结
+# （同 _CUR_ORCH_JOB 的既有形态）。密钥/base 不进此缓存——每次调用现取 env，
+# 部署侧改 env 即时生效。
+_USE_SUBAGENT_LLM = False
+
+
+# 生效条件：spec 为 dict 或 None，对 spec.get("use_subagent_llm") 做真值判定后返回布尔——该键取到任何形态都只当布尔用，绝不从其中取值。
+def _llm_switch(spec: dict | None) -> bool:
+    """spec → 布尔开关（C3 唯一转换点；spec 只被当成布尔）。"""
+    return bool((spec or {}).get(USE_SUBAGENT_LLM_KEY))
+
+
+# 生效条件：use_subagent 为真且 env HIVE_SUBAGENT_API_KEY 去空白非空时返回 (该值, HIVE_SUBAGENT_API_BASE 去空白非空否则 HIVE_API_BASE 缺键回落 DEFAULT_API_BASE，再去尾斜杠)；否则返回 (env HIVE_API_KEY 去空白, HIVE_API_BASE 缺键回落 DEFAULT_API_BASE，再去尾斜杠)——开关为真但子代理密钥缺失时整组回落主配置。
+def _endpoint_parts(use_subagent: bool) -> tuple:
+    """(api_key, api_base)——密钥与 base 同源解析，杜绝两处口径漂移。"""
+    main_base = os.environ.get("HIVE_API_BASE", DEFAULT_API_BASE)
+    if use_subagent:
+        sub_key = os.environ.get("HIVE_SUBAGENT_API_KEY", "").strip()
+        if sub_key:
+            return sub_key, (
+                os.environ.get("HIVE_SUBAGENT_API_BASE", "").strip() or main_base
+            ).rstrip("/")
+        # 半套覆盖（开关为真、子代理密钥缺失）比缺省更危险：主密钥 + 子代理网关
+        # = 跨网关错配。整组回落主配置——不炸 job、不半套。
+    return os.environ.get("HIVE_API_KEY", "").strip(), main_base.rstrip("/")
+
+
+# 生效条件：use_subagent 为真返回点名 spec.use_subagent_llm / HIVE_SUBAGENT_API_KEY / 回落键 HIVE_API_KEY 与 serve 侧 env 出处的文案，否则返回点名 HIVE_API_KEY 与 serve 侧 env 出处的文案；两文案都不含任何键值。
+def _missing_key_msg(use_subagent: bool) -> str:
+    """缺密钥的错误文案：点名该配哪个 env（可诊断），永不回显键值。"""
+    if use_subagent:
+        return ("子代理模型密钥未设置：spec.use_subagent_llm 为真时应由 serve 侧 "
+                "env 提供 HIVE_SUBAGENT_API_KEY，回落键 HIVE_API_KEY 也未设置"
+                "（密钥只允许来自 serve 的 env，不随 spec 传递）")
+    return ("HIVE_API_KEY 未设置（执行器环境缺模型密钥：应由 serve 侧 env 提供 "
+            "HIVE_API_KEY；密钥只允许来自 serve 的 env，不随 spec 传递）")
+
+
+# 生效条件：spec（dict 或 None）传入，返回 _endpoint_parts(_llm_switch(spec))[1]——只解析 base 不校验密钥（main 的 model↔base 配对闸用它，使错配判定与实际 POST 目标同一口径）。
+def model_base(spec: dict | None = None) -> str:
+    """当前生效的 chat/completions base（不校验密钥，供闸门复用）。"""
+    return _endpoint_parts(_llm_switch(spec))[1]
+
+
+# 生效条件：use_subagent 传入时取 _endpoint_parts(use_subagent)，key 为空串则抛 RuntimeError(_missing_key_msg(use_subagent))，否则返回该 (key, base)；
+def model_endpoint(use_subagent: bool = False) -> tuple:
+    """(api_key, api_base)——模型端点唯一取值口（值只来自 env，缺则 fail）。"""
+    key, base = _endpoint_parts(use_subagent)
+    if not key:
+        raise RuntimeError(_missing_key_msg(use_subagent))
+    return key, base
+
+
+# 生效条件：spec（dict 或 None）传入后把模块态 _USE_SUBAGENT_LLM 置为 _llm_switch(spec)，返回 None。
+def _bind_llm_spec(spec: dict | None) -> None:
+    """绑定当前 job 的端点开关（call_llm / run_with_tools 入口各调一次）。"""
+    global _USE_SUBAGENT_LLM
+    _USE_SUBAGENT_LLM = _llm_switch(spec)
+
 
 # P2-17（批次 30）：响应体读取字节上限——异常/恶意网关返回超大响应
 # 不再能撑爆内存（resp.read(N) 最多读 N 字节，截断 JSON 会在解析层失败）。
@@ -100,9 +201,15 @@ def log(job_dir: str, msg: str) -> None:
         sys.stderr.write(line)
 
 
-# 生效条件：当 job_dir 与 payload 传入后，先 tempfile.mkstemp(prefix="result.json.", suffix=".tmp", dir=job_dir) 建唯一临时文件并 UTF-8 写入 json.dump(payload, ensure_ascii=False)+flush+fsync，再 os.replace 到 job_dir/result.json；Windows 上 replace 撞读者瞬态句柄（WinError 5/PermissionError）时按 10ms×递增重试至多 50 次（约 12.5s）；replace 撞 FileNotFoundError（tmp 被瞬态消费/清理）时重建唯一名重写后重试；任一重试耗尽才向外抛；finally 里 best-effort 清理仍存在的 tmp；成功路径不残留任何 .tmp；
+# 生效条件：当 job_dir 与 payload 传入后，env HIVE_RESULT_ANCHOR 去空白非真时 payload["result_anchor"] = 该值（P11 批次53 执行器契约：serve 对锚预期任务注入此 env，执行器原样回写，值本身由 serve 侧 HMAC 校验——本处不做任何密码学运算）；随后 tempfile.mkstemp(prefix="result.json.", suffix=".tmp", dir=job_dir) 建唯一临时文件并 UTF-8 写入 json.dump(payload, ensure_ascii=False)+flush+fsync，再 os.replace 到 job_dir/result.json；Windows 上 replace 撞读者瞬态句柄（WinError 5/PermissionError）时按 10ms×递增重试至多 50 次（约 12.5s）；replace 撞 FileNotFoundError（tmp 被瞬态消费/清理）时重建唯一名重写后重试；任一重试耗尽才向外抛；finally 里 best-effort 清理仍存在的 tmp；成功路径不残留任何 .tmp；
 def write_result(job_dir: str, payload: dict) -> None:
     """tmp + fsync + rename 原子替换（并发读者不读到截断空窗口）。
+
+    P11 结果完整性锚回写（批次53）：serve 对锚预期任务（status 带 result_nonce）
+    经 env HIVE_RESULT_ANCHOR 注入预期锚；本执行器原样回写 payload.result_anchor，
+    终态判据面（rust classify_result）据此采信 done。env 缺省（旧格式任务/直跑）
+    时不写该字段——产物格式向后兼容。诚实边界：只透传不计算（锚的秘密性归
+    serve 侧密钥，执行器侧无法也不必复算）。
 
     v2 N6：旧实现 open("w") 先截断再写——rust serve 超时/kill 强杀落在写入
     窗口内即留半截文件，且**先毁旧完整结果**（重投第二次执行同路径）；读者
@@ -123,6 +230,18 @@ def write_result(job_dir: str, payload: dict) -> None:
     finally 清理残留 tmp（成功路径零残留，对齐 K1 口径）。
     """
     p = os.path.join(job_dir, "result.json")
+
+    # P11 锚回写（批次53）：env 注入即透传（见头注「诚实边界」）
+    _anchor = (os.environ.get("HIVE_RESULT_ANCHOR") or "").strip()
+    if _anchor:
+        payload["result_anchor"] = _anchor
+
+    # H-4 止血可观测面：**有重试才写账**（重试不静默——LLM 侧的重试计数与最终
+    # 结果进 result.json 的唯一落点；零重试 → 不写该键，无故障路径产物逐位不变）。
+    # 放 write_result 而不是各调用点：main 有 8 个落盘出口，单点注入才不会有漏。
+    _retries = llm_retry_report()
+    if _retries:
+        payload["llm_retries"] = _retries
 
     def _mk_and_dump():
         fd, tmp = tempfile.mkstemp(prefix="result.json.", suffix=".tmp",
@@ -333,7 +452,7 @@ def _webp_size(f) -> tuple:
     return None, None
 
 
-# 生效条件：当 spec 与 job_dir 传入时，若 spec['system_prompt_from'] 去空白非空，则以 ref 绝对路径或 spec['workdir'] or os.getcwd() 拼接路径读取，读取 OSError 抛 SpecError，成功返回 (text.strip(), 'file:'+ref) 并 log job_dir；否则返回 (spec['system_prompt'] or '' 去空白, 'literal' 若该文本非空否则 'none')；
+# 生效条件：当 spec 与 job_dir 传入时，若 spec['system_prompt_from'] 去空白非空，则以 ref 绝对路径或 spec['workdir'] or os.getcwd() 拼接路径求 realpath，先过 read_roots()（HIVE_READ_ROOTS 非空且 real 不在任一根下抛 SpecError），再过 _sensitive_read(real) 命中敏感凭据路径抛 SpecError（均 fail-closed 不回落旧提示词），随后 open 读取 OSError 抛 SpecError，正文过 _redact_pii（内容层兜底，脱敏生效时 log job_dir），成功返回 (redacted.strip(), 'file:'+ref) 并 log job_dir；否则返回 (spec['system_prompt'] or '' 去空白, 'literal' 若该文本非空否则 'none')；
 def resolve_system_prompt(spec: dict, job_dir: str) -> tuple:
     """系统提示词真源（Pi⑦⑥）：声明 system_prompt_from 则**每次执行重建**。
 
@@ -342,25 +461,53 @@ def resolve_system_prompt(spec: dict, job_dir: str) -> tuple:
     唯一偏差窗口是 rust 侧 claimed 重投（崩溃恢复）复用旧 spec——声明 from 后
     该窗口也走真源重建。缺文件 fail-closed（SpecError）：明确失败优于静默用旧
     提示词。→ (prompt, source 标签)
+
+    N173（批次 65，2026-09-27）：第三出口封堵——本通道原先裸 open 读全文置入
+    system 消息外发 HIVE_API_BASE，read_file 的三道防线（HIVE_READ_ROOTS /
+    _sensitive_read / PII 脱敏）一概不生效，spec 作者声明
+    system_prompt_from 指向 id_rsa/.env 即全文外泄。攻击面与 P2-22 的
+    context_files 通道同族，复用同款闸：realpath 规范化 → 白名单 → 黑名单
+    （命中即 SpecError fail-closed，不回落旧提示词），正文过 _redact_pii
+    内容层兜底（与 tool_read_file 同防线）。
     """
     ref = str(spec.get("system_prompt_from") or "").strip()
     if ref:
         path = ref if os.path.isabs(ref) else os.path.join(
             spec.get("workdir") or os.getcwd(), ref)
+        real = os.path.realpath(path)
+        # N173 闸一：部署读白名单（HIVE_READ_ROOTS 非空即收窄，与 read_file
+        # 同语义——未设置 = 放开，部署收窄面覆盖 system_prompt_from 通道）。
+        roots = read_roots()
+        if roots and not any(_under(real, r) for r in roots):
+            raise SpecError(
+                f"system_prompt_from 路径超出 HIVE_READ_ROOTS 白名单"
+                f"（fail-closed，不回落旧提示词）: {real}")
+        # N173 闸二：敏感凭据路径黑名单——真源全文会随首次请求外发外部网关，
+        # 凭据类文件无论部署配置都不进 LLM 上下文（与 read_file / context
+        # 通道同判据；命中即拒读，不回落 spec.system_prompt 旧字面量）。
+        why = _sensitive_read(real)
+        if why:
+            raise SpecError(
+                f"system_prompt_from 命中敏感凭据路径拒读（{why}；"
+                f"fail-closed，不回落旧提示词；如有合法需要请走部署管理员"
+                f"显式通道）: {real}")
         try:
-            with open(path, encoding="utf-8") as f:
+            with open(real, encoding="utf-8") as f:
                 text = f.read()
         except OSError as e:
             raise SpecError(
                 f"system_prompt_from 读取失败（fail-closed，不回落旧提示词）: "
-                f"{path}: {e}")
-        log(job_dir, f"系统提示词重建自 {path}（{len(text)} 字符）")
-        return text.strip(), f"file:{ref}"
+                f"{real}: {e}")
+        redacted = _redact_pii(text)
+        if redacted != text:
+            log(job_dir, "系统提示词 PII 脱敏（N173 内容层兜底，原文不外发）")
+        log(job_dir, f"系统提示词重建自 {real}（{len(text)} 字符）")
+        return redacted.strip(), f"file:{ref}"
     literal = (spec.get("system_prompt") or "").strip()
     return literal, ("literal" if literal else "none")
 
 
-# 生效条件：当传入 rel/path/job_dir/meta 时，先对 os.path.realpath(path) 调 _sensitive_read，命中敏感凭据（目录段/文件名/前缀族/.env 族/密钥扩展）则 meta["notes"] 追加并 log(job_dir,...)，返回 skipped="敏感凭据拒读" 标注块（不读正文、不拒整个 spawn）；未命中且 path 可被 open("rb") 读取首 BINARY_SNIFF_BYTES 字节并用 sniff_kind 分类时，text 分支用 utf-8 errors=replace 读全文并返回文本 context；image: 前缀分支取 image_size(path) 的 w/h（w/h 均为真才显示尺寸并可能 oversize，否则显示“尺寸未知”且 width/height 用“?”），累加 meta["images"]/["image_tokens"]、向 meta["notes"] 追加并 log(job_dir,...)，返回带 w/h/oversize 的图像 context；其余分支累加 meta["binaries"]、log(job_dir,...) 并返回不读正文的二进制 context；
+# 生效条件：当传入 rel/path/job_dir/meta 时，先对 os.path.realpath(path) 求 real：read_roots() 非空且 real 不在任一根下则 meta["notes"] 追加并 log(job_dir,...)，返回 skipped="读权限白名单拒读" 标注块（不读正文、不拒整个 spawn，N175 对照 read_file 同收窄面）；再对 real 调 _sensitive_read，命中敏感凭据（目录段/文件名/前缀族/.env 族/密钥扩展）则 meta["notes"] 追加并 log(job_dir,...)，返回 skipped="敏感凭据拒读" 标注块（不读正文、不拒整个 spawn）；未命中且 path 可被 open("rb") 读取首 BINARY_SNIFF_BYTES 字节并用 sniff_kind 分类时，text 分支用 utf-8 errors=replace 读全文并过 _redact_pii（N175/N174：中文紧邻 PII 同防线）后返回文本 context；image: 前缀分支取 image_size(path) 的 w/h（w/h 均为真才显示尺寸并可能 oversize，否则显示“尺寸未知”且 width/height 用“?”），累加 meta["images"]/["image_tokens"]、向 meta["notes"] 追加并 log(job_dir,...)，返回带 w/h/oversize 的图像 context；其余分支累加 meta["binaries"]、log(job_dir,...) 并返回不读正文的二进制 context；
 def _context_block(rel: str, path: str, job_dir: str, meta: dict) -> str:
     """单个 context 块：文本读全文；图像/二进制只登记（Pi⑦④）。"""
     # P2-22 止血（v8 N69 / v10 / 2026-09-25 三次成立）：context_files 通道
@@ -370,7 +517,19 @@ def _context_block(rel: str, path: str, job_dir: str, meta: dict) -> str:
     # HIVE_API_BASE 外部网关。复用 tool_read_file 同款 _sensitive_read
     # （realpath 规范化后匹配）：命中不拒整个 spawn（其余块照常拼装），
     # 只把该文件替换为 skipped 标注块——诚实留痕可审计。
-    why = _sensitive_read(os.path.realpath(path))
+    # N175（批次 65，2026-09-27）：补齐其余两道——HIVE_READ_ROOTS 白名单
+    # （部署收窄面对照 read_file，越界同样 skip-block 不拒整个 spawn）与
+    # text 分支 _redact_pii 内容层脱敏（N174 修复后中文紧邻形态同防线）。
+    real = os.path.realpath(path)
+    roots = read_roots()
+    if roots and not any(_under(real, r) for r in roots):
+        note = f"context {rel} 超出 HIVE_READ_ROOTS 白名单拒读跳过——全文不进 LLM 上下文"
+        meta["notes"].append(note)
+        log(job_dir, "上下文块 " + note)
+        return (f'<context path="{rel}" skipped="读权限白名单拒读">\n'
+                f"（部署读白名单不含该路径——本块已跳过，不猜内容；"
+                "如有合法需要请由部署管理员将其加入 HIVE_READ_ROOTS。）\n</context>")
+    why = _sensitive_read(real)
     if why:
         note = f"context {rel} 敏感凭据拒读跳过（{why}）——全文不进 LLM 上下文"
         meta["notes"].append(note)
@@ -387,6 +546,9 @@ def _context_block(rel: str, path: str, job_dir: str, meta: dict) -> str:
         # CONTEXT_TEXT_MAX（防 OOM；呈现量仍由预算机制收紧）。
         with open(path, encoding="utf-8", errors="replace") as f:
             content = f.read(CONTEXT_TEXT_MAX)
+        # N175（批次 65，2026-09-27）：本通道文本原先不过 PII 脱敏——中文
+        # 紧邻形态随 user 消息外发外部网关；对照 read_file 同防线补一行。
+        content = _redact_pii(content)
         note = ("\n<!-- truncated: > CONTEXT_TEXT_MAX -->"
                 if size > CONTEXT_TEXT_MAX else "")
         return f'<context path="{rel}">\n{content}{note}\n</context>'
@@ -846,6 +1008,8 @@ def _ws_zhipu(query: str, count: int, backend: str) -> dict:
     # 端点与 LLM base 解耦（实测教训：HIVE_API_BASE 常指向 LLM 中转网关，
     # 只代理 chat/completions——锚上去 web_search 必 404）。搜索端点独立：
     # HIVE_WEB_SEARCH_BASE 缺省智谱官方；key 缺省回落执行器密钥。
+    # C3 有意不改本回落链（HIVE_WEB_SEARCH_KEY → HIVE_API_KEY）：搜索密钥与模型
+    # 端点解耦，子代理覆盖开关不参与——否则搜索面凭据会跟着模型开关漂移。
     api_base = (os.environ.get("HIVE_WEB_SEARCH_BASE", "").strip()
                 or ZHIPU_SEARCH_BASE).rstrip("/")
     api_key = (os.environ.get("HIVE_WEB_SEARCH_KEY", "").strip()
@@ -983,6 +1147,11 @@ def _sensitive_read(real: str) -> str | None:
 # 回喂 LLM，「跳过个人敏感信息不入明文」在**内容层**兜底（路径层由
 # _sensitive_read 把守）。正则模式集 v1（诚实面：正则脱敏是概率防线非
 # 密码学保证，新增类别在此扩展）。
+# N174（批次 65，2026-09-27）：四类文本模式的 \b 改显式 ASCII 边界
+# lookaround——\b 是 Unicode 词边界而 CJK 属 \w，中文紧邻（中文语料默认
+# 书写形态）处无边界即全文漏脱敏（read_file / _redact_deep 同源失效）。
+# 负类刻意不含 )：) 非词字符，旧码对「张三(13800138000)」本命中，纳入负类
+# 即回退——新匹配集为旧集严格超集，零回退。
 _PII_PATTERNS = (
     # 私钥/证书块（整段吞掉，含头尾行）
     ("私钥块", re.compile(
@@ -990,16 +1159,19 @@ _PII_PATTERNS = (
         r"PRIVATE KEY( BLOCK)?-----", re.S)),
     # 通用 API key 样式（OpenAI sk- / GitHub ghp_·gho_ / AWS AKIA / Bearer）
     ("API密钥", re.compile(
-        r"\b(?:sk-[A-Za-z0-9_-]{16,}|gh[pousr]_[A-Za-z0-9]{20,}|"
-        r"AKIA[0-9A-Z]{16}|Bearer\s+[A-Za-z0-9._-]{20,})\b")),
+        r"(?<![0-9A-Za-z])(?:sk-[A-Za-z0-9_-]{16,}|"
+        r"gh[pousr]_[A-Za-z0-9]{20,}|AKIA[0-9A-Z]{16}|"
+        r"Bearer\s+[A-Za-z0-9._-]{20,})(?![0-9A-Za-z])")),
     # 身份证（18 位含校验位 X）——先于手机号（避免 17 位段被手机号误吃）
-    ("身份证号", re.compile(r"\b\d{6}(?:19|20)\d{2}"
-                           r"(?:0[1-9]|1[0-2])(?:[0-2]\d|3[01])\d{3}[\dXx]\b")),
+    ("身份证号", re.compile(r"(?<![0-9A-Za-z])\d{6}(?:19|20)\d{2}"
+                           r"(?:0[1-9]|1[0-2])(?:[0-2]\d|3[01])"
+                           r"\d{3}[\dXx](?![0-9A-Za-z])")),
     # 手机号（大陆号段）
-    ("手机号", re.compile(r"\b1[3-9]\d{9}\b")),
+    ("手机号", re.compile(r"(?<![0-9A-Za-z])1[3-9]\d{9}(?![0-9A-Za-z])")),
     # 邮箱
     ("邮箱", re.compile(
-        r"\b[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}\b")),
+        r"(?<![0-9A-Za-z])[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+"
+        r"\.[A-Za-z]{2,}(?![0-9A-Za-z])")),
 )
 
 
@@ -1260,30 +1432,191 @@ def build_body(spec: dict, messages: list, tools: list = None) -> dict:
     return body
 
 
-# 生效条件：当 body 与 timeout 传入时，api_key=os.environ.get('HIVE_API_KEY','')，若假值（未设或空串）抛 RuntimeError('HIVE_API_KEY 未设置...')；否则 api_base=os.environ.get('HIVE_API_BASE', DEFAULT_API_BASE).rstrip('/')，仅缺键时回落 DEFAULT_API_BASE，键存在空串不回落；POST {api_base}/chat/completions 并以 timeout 请求，返回 json.loads(resp.read(RESP_MAX_BYTES).decode('utf-8'))；
+# ---------------------------------------------------------------- LLM 重试（H-4 止血）
+# 缺陷（H-4c）：`_post_chat` 单发 urlopen，对 429/5xx **不重试**——网关一次
+# 瞬时抖动（限流 / 网关 5xx / 连接瞬断）就把任务判死（main 顶层落 EXIT_API +
+# ok=false），而这类抖动的正确处置是稍后重来。
+#
+# 边界（只做止血，不做根治）：
+#   * **有界**：尝试次数与单次等待都封顶（RETRY_MAX_ATTEMPTS / RETRY_BACKOFF_MAX
+#     / RETRY_AFTER_MAX）——重试预算不能吃掉整个 job 的 timeout；
+#   * **不静默**：每次重试记进模块级账（`_LLM_RETRY`），有重试时随 result.json
+#     的 `llm_retries` 出栈（零重试不写该键 ⇒ 无故障路径产物逐位不变）；
+#   * **非可重试错误一次都不重试**：4xx 语义类（401/403/404/422 等）重试不会
+#     改变结果，只会白烧配额与时间；
+#   * **签名不变**：仍是 `(body, timeout)`（mock 面即接口面，见 docstring）。
+#
+# 不做（属设计级，须单独立项）：模型端点故障转移 / 多网关轮询、请求级去重、
+# job 级超时预算分配、把重试决策上移到调度层。
+
+#: 总尝试次数（含首次）。
+RETRY_MAX_ATTEMPTS = 3
+#: 第 1 次失败后的退避基准（秒）；第 n 次为 base×2^(n-1)。
+RETRY_BACKOFF_BASE = 0.5
+#: 单次退避上限（秒）——指数不放大到卡死 job。
+RETRY_BACKOFF_MAX = 8.0
+#: 尊重 Retry-After 的上限（秒）——网关让等 600s 也不照单全收（否则等于挂死）。
+RETRY_AFTER_MAX = 30.0
+#: 账本事件条数上限（有界样本：重试账不许无限长）。
+RETRY_EVENTS_MAX = 20
+
+#: 可重试 HTTP 状态码：语义即「稍后再来」。5xx 另行按区间判（见 _retryable_http）。
+RETRYABLE_HTTP_STATUS = frozenset({408, 425, 429})
+
+#: 单次等待的唯一出口（测试接缝：守卫替换成记录器以免真等；生产恒 = time.sleep）。
+_RETRY_SLEEP = time.sleep
+
+#: 重试账（模块态；exec 一进程一 job，故进程内即 job 内）。
+_LLM_RETRY = {"attempts": 0, "retries": 0, "events": [], "last_outcome": None}
+
+
+# 生效条件：调用即把账本清回初值（attempts=0/retries=0/events=[]/last_outcome=None），无返回值；exec 一进程一 job 时正常无需调用，供守卫与进程内多 job 复用方使用。
+def reset_llm_retry_state() -> None:
+    """清空重试账（守卫 / 进程内多 job 复用方使用）。"""
+    _LLM_RETRY["attempts"] = 0
+    _LLM_RETRY["retries"] = 0
+    _LLM_RETRY["events"] = []
+    _LLM_RETRY["last_outcome"] = None
+
+
+# 生效条件：账本 retries 为 0 时返回 None（零重试＝无故障路径，产物不得多出任何键）；否则返回 {"attempts", "retries", "last_outcome", "events"} 的浅拷贝（events 为逐条 dict 拷贝，调用方改动不回写账本）。
+def llm_retry_report():
+    """重试报告：零重试 → None（产物逐位不变），有重试 → 可落盘账。"""
+    if not _LLM_RETRY["retries"]:
+        return None
+    return {
+        "attempts": _LLM_RETRY["attempts"],
+        "retries": _LLM_RETRY["retries"],
+        "last_outcome": _LLM_RETRY["last_outcome"],
+        "events": [dict(e) for e in _LLM_RETRY["events"]],
+    }
+
+
+# 生效条件：code 属 RETRYABLE_HTTP_STATUS（408/425/429）或落在 500–599 区间时返回 True，其余（含 4xx 语义类）返回 False；
+def _retryable_http(code: int) -> bool:
+    """HTTP 状态是否可重试：只放行「稍后再来」类与全部 5xx。"""
+    return code in RETRYABLE_HTTP_STATUS or 500 <= code <= 599
+
+
+# 生效条件：e 为 urllib HTTPError 时按 _retryable_http(e.code) 判定；为 URLError（含 HTTPError 之外的网络层瞬时：连接重置/读超时/DNS 瞬断）时 True；为 TimeoutError/ConnectionError 时 True；其余（缺密钥 RuntimeError、响应体解析 ValueError、编程错误等确定性错误）一律 False；
+def _retryable_exc(e: BaseException) -> bool:
+    """异常是否属「瞬时、重试有意义」一类。"""
+    if isinstance(e, urllib.error.HTTPError):
+        return _retryable_http(int(e.code or 0))
+    if isinstance(e, urllib.error.URLError):
+        return True
+    return isinstance(e, (TimeoutError, ConnectionError))
+
+
+# 生效条件：headers 为映射且含可解析的 Retry-After（数字秒或 HTTP-date）时返回其秒数（负值归 0），缺失/不可解析/头对象形态不合约时返回 None；
+def _parse_retry_after(headers):
+    """解析 Retry-After：数字秒（常见）或 HTTP-date；不可解析 → None。"""
+    if not headers:
+        return None
+    try:
+        raw = (headers.get("Retry-After") or "").strip()
+    except Exception:                     # noqa: BLE001 —— 头对象非映射：当没有
+        return None
+    if not raw:
+        return None
+    try:
+        v = float(raw)
+        return v if v >= 0 else None
+    except ValueError:
+        pass
+    try:
+        from email.utils import parsedate_to_datetime
+        import datetime as _dt
+        dt = parsedate_to_datetime(raw)
+        if dt is None:
+            return None
+        now = _dt.datetime.now(dt.tzinfo) if dt.tzinfo else _dt.datetime.now()
+        return max(0.0, (dt - now).total_seconds())
+    except Exception:                     # noqa: BLE001 —— 解析失败即「没这个头」
+        return None
+
+
+# 生效条件：attempt≥1 时返回 (等待秒数, retry_after 原值或 None)——退避 = min(base×2^(attempt-1), BACKOFF_MAX) 上取 [delay/2, delay) 的 jitter，再与 min(Retry-After, RETRY_AFTER_MAX) 取大，整体封顶 RETRY_AFTER_MAX；
+def _retry_wait(attempt: int, headers) -> tuple:
+    """第 attempt 次（1 起）失败后的等待：(秒, 头里的 Retry-After 原值或 None)。
+
+    jitter 取半开区间 [delay/2, delay)：多 job 同时被限流时不齐步重试（惊群）。
+    Retry-After 取大（尊重网关排期）但封顶——否则一个让等 600s 的头等于挂死 job。
+    """
+    delay = min(RETRY_BACKOFF_BASE * (2 ** (attempt - 1)), RETRY_BACKOFF_MAX)
+    wait = random.uniform(delay / 2.0, delay)
+    ra = _parse_retry_after(headers)
+    if ra is not None:
+        wait = max(wait, min(ra, RETRY_AFTER_MAX))
+    return min(wait, RETRY_AFTER_MAX), ra
+
+
+# 生效条件：把一次重试记进账本——retries 自增、events 未满 RETRY_EVENTS_MAX 时追加 {attempt, kind, status, retry_after_s, wait_s}（满了只计数不再追加，样本有界），无返回值；
+def _record_retry(attempt: int, e: BaseException, wait_s: float, ra) -> None:
+    """记一次重试（可观测面：重试不静默——有重试必然出现在 result.json）。"""
+    _LLM_RETRY["retries"] += 1
+    if len(_LLM_RETRY["events"]) < RETRY_EVENTS_MAX:
+        is_http = isinstance(e, urllib.error.HTTPError)
+        _LLM_RETRY["events"].append({
+            "attempt": attempt,
+            "kind": "http" if is_http else type(e).__name__,
+            "status": int(e.code) if is_http else None,
+            "retry_after_s": ra,
+            "wait_s": round(float(wait_s), 3),
+        })
+
+
+# 生效条件：当 body 与 timeout 传入时，api_key/api_base 取 model_endpoint(_USE_SUBAGENT_LLM)（值只来自 env：主 HIVE_API_KEY / HIVE_API_BASE → DEFAULT_API_BASE；开关为真且有 HIVE_SUBAGENT_API_KEY 时取 HIVE_SUBAGENT_API_KEY / HIVE_SUBAGENT_API_BASE），密钥缺失抛 RuntimeError(可诊断文案、不含键值)；否则最多 RETRY_MAX_ATTEMPTS 次 POST {api_base}/chat/completions——可重试失败（429/408/425/5xx/网络瞬时）按指数退避+jitter 与 Retry-After 等待后重试，不可重试失败（4xx 语义类等）与末次失败原样抛出；成功返回 json.loads(resp.read(RESP_MAX_BYTES).decode('utf-8'))；
 def _post_chat(body: dict, timeout: float) -> dict:
-    """裸 POST chat/completions，返回原始响应 dict。HTTP 异常向上传播。"""
-    api_base = os.environ.get("HIVE_API_BASE", DEFAULT_API_BASE).rstrip("/")
-    api_key = os.environ.get("HIVE_API_KEY", "")
-    if not api_key:
-        raise RuntimeError("HIVE_API_KEY 未设置（执行器环境缺密钥）")
+    """裸 POST chat/completions，返回原始响应 dict。HTTP 异常向上传播。
+
+    签名保持 (body, timeout)：既有测试以**定参桩**（lambda body, t）mock 本
+    函数，加参数会连带破坏桩调用面（mock 面即接口面）。端点开关经模块态
+    _USE_SUBAGENT_LLM 传入（见「模型端点解析」段），密钥/base 每次现取 env。
+
+    H-4 止血：可重试失败按**有界指数退避 + jitter** 重试（见上方常量块），
+    尊重 Retry-After；非可重试错误一次即抛；每次重试记进 `_LLM_RETRY`（有重试
+    时随 result.json 的 llm_retries 出栈）。零重试路径与历史行为逐位一致。
+    """
+    api_key, api_base = model_endpoint(_USE_SUBAGENT_LLM)
     url = f"{api_base}/chat/completions"
-    req = urllib.request.Request(
-        url,
-        data=json.dumps(body, ensure_ascii=False).encode("utf-8"),
-        headers={
-            "Content-Type": "application/json",
-            "Authorization": f"Bearer {api_key}",
-        },
-        method="POST",
-    )
-    with urllib.request.urlopen(req, timeout=timeout) as resp:
-        return json.loads(resp.read(RESP_MAX_BYTES).decode("utf-8"))
+    payload = json.dumps(body, ensure_ascii=False).encode("utf-8")
+    last: BaseException | None = None
+    for attempt in range(1, RETRY_MAX_ATTEMPTS + 1):
+        req = urllib.request.Request(
+            url,
+            data=payload,
+            headers={
+                "Content-Type": "application/json",
+                "Authorization": f"Bearer {api_key}",
+            },
+            method="POST",
+        )
+        _LLM_RETRY["attempts"] += 1
+        try:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
+                data = json.loads(resp.read(RESP_MAX_BYTES).decode("utf-8"))
+        except Exception as e:                 # noqa: BLE001 —— 先分类再决定重试
+            if attempt >= RETRY_MAX_ATTEMPTS or not _retryable_exc(e):
+                # 不可重试或已用尽：原样抛出（不吞错、不冒充成功），但把
+                # 「最终结果」写进账（有重试时 result.json 才看得见这一段）。
+                _LLM_RETRY["last_outcome"] = "failed"
+                raise
+            wait, ra = _retry_wait(attempt, getattr(e, "headers", None))
+            _record_retry(attempt, e, wait, ra)
+            last = e
+            _RETRY_SLEEP(wait)
+            continue
+        _LLM_RETRY["last_outcome"] = "recovered" if attempt > 1 else "ok"
+        return data
+    # 循环内要么 return 要么 raise，此处不可达；保留兜底（不静默返回 None）
+    raise last if last is not None else RuntimeError("_post_chat 重试循环异常退出")
 
 
-# 生效条件：当 spec 与 messages 传入时，以 build_body(spec,messages) 与 float(spec.get('timeout_s') or 300) 调 _post_chat；返回的 message 为空助手轮（_empty_turn：content 与 tool_calls 双空——含 choices 缺/空、content 空串或 null）时返回 {'_error': '模型返回空助手轮…'}，否则返回 content=message.content or ''、usage=data.get('usage') or {}、model=data.get('model') or spec['model']；
+# 生效条件：当 spec 与 messages 传入时，先 _bind_llm_spec(spec) 绑定模型端点开关（C3），再以 build_body(spec,messages) 与 float(spec.get('timeout_s') or 300) 调 _post_chat；返回的 message 为空助手轮（_empty_turn：content 与 tool_calls 双空——含 choices 缺/空、content 空串或 null）时返回 {'_error': '模型返回空助手轮…'}，否则返回 content=message.content or ''、usage=data.get('usage') or {}、model=data.get('model') or spec['model']；
 def call_llm(spec: dict, messages: list) -> dict:
     """单发调 chat/completions（无工具历史路径）；返回归一化 result。"""
+    _bind_llm_spec(spec)
     data = _post_chat(build_body(spec, messages),
                       float(spec.get("timeout_s") or 300))
     msg = _choice(data).get("message") or {}
@@ -1402,7 +1735,7 @@ def _handoff(spec: dict, job_dir: str | None, trace: list, usage: dict, rnd: int
     }
 
 
-# 生效条件：spec/messages/job_id 给定即进入 while rnd <= max_rounds（max_rounds=max(1, int(spec.get("max_tool_rounds") or DEFAULT_MAX_TOOL_ROUNDS))，budget 取 spec.get("context_budget_tokens")）：超预算且 spec.get("context_strict") 为真返回 {"_error": over, "tool_trace": trace}、否则转 _handoff；API 异常或空助手轮返回 {"_error", "tool_trace"}；模型无 tool_calls 返回 content/usage/model/tool_trace；rnd >= max_rounds 仍要求工具则去掉 tools 强制终答（forced_final=True）。
+# 生效条件：spec/messages/job_id 给定即先 _bind_llm_spec(spec) 绑定模型端点开关（C3），再进入 while rnd <= max_rounds（max_rounds=max(1, int(spec.get("max_tool_rounds") or DEFAULT_MAX_TOOL_ROUNDS))，budget 取 spec.get("context_budget_tokens")）：超预算且 spec.get("context_strict") 为真返回 {"_error": over, "tool_trace": trace}、否则转 _handoff；API 异常或空助手轮返回 {"_error", "tool_trace"}；模型无 tool_calls 返回 content/usage/model/tool_trace；rnd >= max_rounds 仍要求工具则去掉 tools 强制终答（forced_final=True）。
 def run_with_tools(spec: dict, messages: list, job_id: str,
                    job_dir: str | None = None, base_tokens: int = 0) -> dict:
     """agent loop：模型回 tool_calls → 执行 → tool 消息回喂 → 循环至终答。
@@ -1414,7 +1747,11 @@ def run_with_tools(spec: dict, messages: list, job_id: str,
 
     上下文档位：base_tokens=图像等非文本块折算（Pi⑦④）+ messages 文本估算；
     超预算默认交回续跑（见 _handoff），spec.context_strict=true 保持旧 fail fast。
+
+    模型端点开关（C3）：入口先 _bind_llm_spec(spec)——本函数内两处 _post_chat
+    与单发路 call_llm 同源解析，工具路与单发路不会用上不同配置。
     """
+    _bind_llm_spec(spec)
     _vis = all_schemas()
     names = [t for t in (spec.get("tools") or []) if t in _vis]
     schemas = [_vis[t] for t in names]
@@ -1575,12 +1912,14 @@ def main() -> int:
     _CUR_ORCH_JOB = str(spec.get("orch_job") or "").strip()
 
     try:
-        # model↔base 配对前置校验（标准 §1）：错配即刻 SPEC 错，不触网不烧调度
+        # model↔base 配对前置校验（标准 §1）：错配即刻 SPEC 错，不触网不烧调度。
+        # base 取**生效值**（model_base：开关为真且有子代理覆盖时即子代理 base）——
+        # 与实际 POST 目标同口径，避免闸门放行一个实际会跨网关错配的请求。
         _mismatch = model_base_mismatch(
             str(spec.get("model") or ""),
-            os.environ.get("HIVE_API_BASE", DEFAULT_API_BASE))
+            model_base(spec))
         if _mismatch:
-            write_error_result(job_dir, {"ok": False, "error": f"model 与 HIVE_API_BASE 错配：{_mismatch}"})
+            write_error_result(job_dir, {"ok": False, "error": f"model 与模型 base 错配：{_mismatch}"})
             log(job_dir, f"spec 错（模型错配）: {_mismatch}")
             progress(job_dir, kind="error", error=_mismatch[:300], where="spec")
             return EXIT_SPEC

@@ -33,10 +33,11 @@ import secrets
 import sys
 import time
 from collections import OrderedDict
+from contextlib import contextmanager
 
 from .datapath import aux_root
-from .fsutil import publish
-from .security import Principal, _rank
+from .fsutil import FileLock, atomic_write
+from .security import Principal, TenantRegistry, _rank
 
 TOKEN_ENV = "MDCG_TOKEN"
 TOKEN_FILE_ENV = "MDCG_TOKEN_FILE"
@@ -249,6 +250,14 @@ ORCH_OPS_ALLOW = ("route", "read", "write", "review", "recent", "consistency")
 ORCH_LAYERS_ALLOW = tuple(ROLE_SPECS[ORCH_ROLE]["layers_allow"])
 
 
+# 三面口径（2026-09-28 使用者裁定，勿把其中的差异当疏漏「统一」掉）：
+#   · **入参面（本函数）＝识别宽容**：角色/单元名入参（role=、as_unit=）允许大写，
+#     strip + lower + 别名归一后照常受理——存量大写写法不动，存量断言
+#     `test_p46_unit_scope.py::test_c_failclosed` 的「C2 大小写归一（RECORD -> record）」
+#     就是这条口径的凭据；收窄只减不增（narrowed_principal 恒 can_admin=False），无提权面。
+#   · **令牌字符串面＝凭据从严**：parse_token 对 role/token_id 含大写即拒（见该函数注释）
+#     ——凭据形态本身是安全边界，允许变形等于给伪造串留门。
+#   · **写面统一小写**：新产出（issue 签发的令牌、文档与示例）一律小写形态。
 # 生效条件：role 为假值（None/空串）时按 "" 处理，经 strip().lower() 得 r，r 命中 ROLE_ALIASES 键时返回别名，否则返回 r 本身。
 def normalize_role(role: str) -> str:
     r = (role or "").strip().lower()
@@ -284,29 +293,105 @@ def token_file(path: str = None) -> str:
     return path or os.environ.get(TOKEN_FILE_ENV) or DEFAULT_TOKEN_FILE
 
 
-# 生效条件：p=token_file(path) 的 os.path.exists(p) 为真且 json.load 得到 dict 时，setdefault("tokens", {}) 后返回该 dict；路径不存在、解析结果非 dict 或抛 OSError/ValueError 时返回 {"schema": SCHEMA, "tokens": {}}。
+# 令牌库跨进程写锁的等待上限（秒）；超时即 fail-closed（见 _store_lock）。
+TOKEN_LOCK_TIMEOUT = 10.0
+
+
+# 生效条件：yield token_file(path) 的归一结果 p 之前，以 FileLock(p, timeout=TOKEN_LOCK_TIMEOUT, strict=True) 取跨进程排它锁；__enter__ 超时（TimeoutError）时转抛 TokenError（fail-closed），其余异常原样传播。
+@contextmanager
+def _store_lock(path: str = None):
+    """令牌库「读-改-写」的**单一临界区**（N199）。
+
+    三条写路径（issue / derive / revoke）原先是「_load → 改 → _save」无锁三步：
+    两进程交错时，后写者拿陈旧快照整份覆盖盘面——并发新增的凭据无痕消失
+    （调用方拿到明文却永远验不过），且固定共享临时名 `p + ".tmp"` 让两个写者
+    互截内容、把库撕成不可解析（叠加 N198 写前对账后即永久不可写，全库令牌
+    失效）。这里把三步收进同一把 OS 级锁，并镜像 crypto.provision_dek 的
+    N184 口径：strict=True 超时抛错，绝不静默放行退化成无锁并发。
+
+    FileLock **非重入**（同进程对同一锁文件的二次加锁同样拿不到），故递归调用
+    者（revoke 级联）走 `_revoke_locked` 复用同一临界区，不得再取锁。
+    """
+    p = token_file(path)
+    try:
+        with FileLock(p, timeout=TOKEN_LOCK_TIMEOUT, strict=True):
+            yield p
+    except TimeoutError as e:
+        raise TokenError(
+            f"令牌库写锁（{p}.lock）竞争超时：并发签发/派生/吊销未在 "
+            f"{TOKEN_LOCK_TIMEOUT:.0f}s 内获得互斥——fail-closed 拒绝写入"
+            f"（无锁整份写回会无痕抹除并发新增的凭据，N199）。请稍后重试。"
+        ) from e
+
+
+# 生效条件：p 不存在时返回 ({"schema": SCHEMA, "tokens": {}}, None)；否则 json.load 结果为 dict 且其 "tokens"（缺键先 setdefault 为 {}）是映射时返回 (该 dict, None)；解析抛 OSError/ValueError、顶层非 dict、或 "tokens" 非映射时返回 (空骨架, 损坏描述字符串)。
+def _load_raw(p: str):
+    """(令牌库快照, 损坏描述)——「可解析性」判据的**唯一**生产者。
+
+    N198：此前 `_load` 只有「解析失败 → 回落空表」这一半，没有「解析失败」
+    这个判据本身，于是写面无法区分「空库」与「损坏库」，一路「读空表 →
+    改 → 整份写回」把盘上全部令牌记录无痕抹除（同型 crypto/_keys.json 的
+    N139 已 fail-closed）。写面（`_save`）按下述 err 拒写，读面（`_load`）
+    仍按原口径回落空表——两态由此可区分。
+    """
+    if not os.path.exists(p):
+        return {"schema": SCHEMA, "tokens": {}}, None
+    try:
+        with open(p, encoding="utf-8") as f:
+            d = json.load(f)
+        if isinstance(d, dict):
+            t = d.setdefault("tokens", {})
+            if isinstance(t, dict):
+                return d, None
+            return ({"schema": SCHEMA, "tokens": {}},
+                    "顶层 tokens 不是映射（版本漂移？）")
+        return ({"schema": SCHEMA, "tokens": {}},
+                "顶层不是对象（版本漂移？）")
+    except (OSError, ValueError) as e:
+        return {"schema": SCHEMA, "tokens": {}}, f"{type(e).__name__}: {e}"
+
+
+# 生效条件：p=token_file(path)。_load_raw(p) 无损坏描述时原样返回其快照；有损坏描述（不可解析/顶层非对象/tokens 非映射）时向 stderr 写「令牌库损坏/不可读」告警（N198，2026-09-28：静默回落会让 issue/derive/revoke 据空表整份写回，既有令牌记录被无痕抹除、旧令牌一律验签失败，使用者只见「令牌不存在」——告警必须开口）并返回带 load_error 标记的空结构；_save 见 load_error 即拒绝写回。
 def _load(path: str = None) -> dict:
     p = token_file(path)
-    if os.path.exists(p):
-        try:
-            with open(p, encoding="utf-8") as f:
-                d = json.load(f)
-            if isinstance(d, dict):
-                d.setdefault("tokens", {})
-                return d
-        except (OSError, ValueError):
-            pass
-    return {"schema": SCHEMA, "tokens": {}}
+    data, err = _load_raw(p)
+    if err is None:
+        return data
+    sys.stderr.write(
+        f"[mdcg-tokens] ⚠ 令牌库损坏/不可读（{err}）：{p}"
+        f"——按回落口径返回空表并置损坏标记（load_error）；签发/派生/吊销在"
+        f"标记下拒绝写回（静默写回会把空表覆盖落盘、无痕抹除全部既有令牌"
+        f"记录，N198）。请修复或恢复该文件后重试。\n")
+    return {"schema": SCHEMA, "tokens": {}, "load_error": err}
 
 
-# 生效条件：以 data 为内容、p=token_file(path) 为目标，先对 os.path.dirname(p) or "." 做 makedirs(exist_ok=True)，写 p+".tmp" 后 publish（带 Windows 短重试的 os.replace）覆盖 p，再尝试 chmod 0600（仅吞 OSError）。
+# 生效条件：p=token_file(path)，先以 _load_raw(p) 做写前对账——盘面有损坏描述、或本次 data 带 load_error 标记（载入时损坏而写前被人为修复的窗口）时抛 TokenError 拒绝整份写回；data["tokens"] 非映射时同样抛 TokenError（拒写类型混淆的快照）；否则把盘面**独有**的令牌记录逐键并入 data["tokens"]（同名键以本次为准），再经 fsutil.atomic_write 整文件替换 p（同目录唯一临时名 mkstemp + 带 Windows 短重试的 replace，失败即清理临时文件），最后尝试 chmod 0600（仅吞 OSError）。调用方一般须已持有 _store_lock(path)（issue/derive/_revoke_locked 持锁调用）。
 def _save(data: dict, path: str = None):
     p = token_file(path)
-    os.makedirs(os.path.dirname(p) or ".", exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=1)
-    publish(tmp, p)
+    # N198 写前对账（镜像 crypto._save_keys 的 N139/N184 口径）：issue/derive/
+    # revoke 三条写路径共用本单点，闸在这里等于三面同时收口——解析不出来的
+    # 既有记录一概不能被写掉（旧令牌一旦被抹除即永久失效，且原实现零告警）。
+    _disk, err = _load_raw(p)
+    if err is None and data.get("load_error"):
+        err = data["load_error"]
+    if err is not None:
+        raise TokenError(
+            f"令牌库损坏/不可读（{err}）：{p}"
+            f"——拒绝整份写回（静默写回会无痕抹除全部既有令牌记录，N198）。"
+            f"请先手工处理该文件（备份/修复/移除）再重试。")
+    _tk = data.setdefault("tokens", {})
+    if not isinstance(_tk, dict):
+        raise TokenError(
+            f"令牌库快照类型异常（tokens 非映射：{type(_tk).__name__}）：{p}"
+            f"——拒绝写回（N199）。请检查调用方传入的快照。")
+    # N199 纵深防御（镜像 crypto._save_keys 的 N184 写前合并）：本次快照里没有、
+    # 盘面上有的记录一律带回。正常路径下锁已保证快照不陈旧，此处的意义是兜住
+    # 「未持锁的直接 _save 调用」以及锁语义将来被误用时的整份覆盖——原子替换
+    # 只防撕裂不防丢失更新。令牌记录只增不改（无删除路径），故带回恒为安全。
+    for _tid, _rec in ((_disk or {}).get("tokens") or {}).items():
+        if _tid not in _tk:
+            _tk[_tid] = _rec
+    atomic_write(p, json.dumps(data, ensure_ascii=False, indent=1))
     try:
         os.chmod(p, 0o600)          # 令牌摘要文件不可被其他用户读
     except OSError:
@@ -340,7 +425,7 @@ def make_token(role: str, token_id: str, secret: str) -> str:
     return f"{PREFIX}.{role}.{token_id}.{secret}"
 
 
-# 生效条件：token 为假值时按 "" 处理，split(".") 后长度不为 4 或 parts[0] != PREFIX 即抛 TokenError；长度与前缀合规后 role/token_id/secret 任一为空再抛 TokenError；否则返回 (role.lower(), token_id, secret)。
+# 生效条件：token 为假值时按 "" 处理，split(".") 后长度不为 4 或 parts[0] != PREFIX 即抛 TokenError（前缀只认小写，故 `MDCG1.*` 在这一步就已拒）；role/token_id 含大写即抛 TokenError（**只认小写**，2026-09-28 使用者裁定：不再把小写化当归一，变形一律拒收），secret 不受此限（`secrets.token_urlsafe` 产 base64url、必含大写）；长度与前缀合规后 role/token_id/secret 任一为空再抛 TokenError；否则返回 (role, token_id, secret)。
 def parse_token(token: str):
     parts = (token or "").strip().split(".")
     if len(parts) != 4 or parts[0] != PREFIX:
@@ -348,14 +433,23 @@ def parse_token(token: str):
     _, role, token_id, secret = parts
     if not role or not token_id or not secret:
         raise TokenError("令牌字段缺失")
-    return role.lower(), token_id, secret
+    # 识别面宽、受理面窄：检测表（policy.forbidden / hooks.SENSITIVE_PATTERNS）认全形态
+    # 是为了「拦得住」，此处只认小写是为了「说得准」——签发面（issue 经 normalize_role +
+    # secrets.token_hex(6)）只产小写 role/token_id，大写形态没有任何合法来源，故一律视为
+    # 伪造或手抄变形，不再静默小写化后放行。（旧实现返回 role.lower() 恰是「受理面比识别面
+    # 更宽」的反例：大写十六进制 id 在 hooks.ts 的 `[0-9a-f]` 检测面上漏过、却被受理面接受。）
+    # 与 normalize_role 的分工见该函数上方「三面口径」——入参面容忍大写是解析友好，令牌面
+    # 拒大写是凭据从严，两处**有意**不同。
+    if role != role.lower() or token_id != token_id.lower():
+        raise TokenError("令牌形态非法：role/token_id 只认小写，含大写即拒（不做小写化归一）")
+    return role, token_id, secret
 
 
 # --------------------------------------------------------------------------
 # 签发 / 校验 / 派生 / 吊销
 # --------------------------------------------------------------------------
 
-# 生效条件：role 经 normalize_role+role_spec（未知角色抛 TokenError），clearance 为假值时取 spec["clearance_cap"] 再经 _clamp_level 收窄到该 cap，layers_allow/ops_allow 经 _narrow 与 spec 默认求交，actor 为假值时取 role，delegable is None 时取 spec["delegable"]、否则按所传值取 bool，ttl 为真值时 expires_at=now+float(ttl)、为假值（None/0）时 None，记录写入 token_file(path) 后返回含明文 token 的字典。
+# 生效条件：role 经 normalize_role+role_spec（未知角色抛 TokenError），clearance 为假值时取 spec["clearance_cap"] 再经 _clamp_level 收窄到该 cap，layers_allow/ops_allow 经 _narrow 与 spec 默认求交，actor 为假值时取 role，delegable is None 时取 spec["delegable"]、否则按所传值取 bool，ttl 为真值时 expires_at=now+float(ttl)、为假值（None/0）时 None，随后在 _store_lock(path) 临界区内把记录写入 token_file(path)（N199：读-改-写无锁会被并发写者用陈旧快照整份覆盖）并返回含明文 token 的字典。
 def issue(role: str, actor: str = None, clearance: str = None,
           tenant: str = "default", ttl: float = None, label: str = "",
           issued_by: str = "root", parent: str = None, delegable: bool = None,
@@ -380,17 +474,20 @@ def issue(role: str, actor: str = None, clearance: str = None,
         "expires_at": (now + float(ttl)) if ttl else None,
         "revoked_at": None, "label": label, "hash": _hash(secret),
     }
-    data = _load(path)
-    data["tokens"][token_id] = rec
-    data["schema"] = SCHEMA
-    _save(data, path)
+    # N199：读-改-写整段收进令牌库跨进程临界区——无锁时后写者用陈旧快照整份
+    # 覆盖，并发签发的新凭据无痕消失（调用方拿到明文却永远验不过）。
+    with _store_lock(path):
+        data = _load(path)
+        data["tokens"][token_id] = rec
+        data["schema"] = SCHEMA
+        _save(data, path)
     return {"ok": True, "token": make_token(role, token_id, secret),
             "token_id": token_id, "role": role, "actor": rec["actor"],
             "clearance": clearance, "layers_allow": layers, "ops_allow": ops,
             "expires_at": rec["expires_at"], "token_file": token_file(path)}
 
 
-# 生效条件：token 先经 parse_token（格式非法即抛 TokenError），其后 _load(path) 的 tokens 中该 token_id 无记录、rec 的 role 与解析出的 role 不等、revoked_at 为真、hash 与 _hash(secret) 经 hmac.compare_digest 不等、expires_at 为真且小于当前时间、或沿 parent 链上溯（seen 集合防环；链上父记录缺失时仅向 stderr 告警不阻断——吊销已由 revoke 级联物化，此处只补过期维度，文件写权不在令牌威胁模型内）任一祖先 expires_at 为真且小于当前时间中任一成立即抛 TokenError；否则返回 Principal，tenant=tenant or rec.get("tenant") or "default"、actor=rec.get("actor") or role、clearance=rec.get("clearance") or "internal"、can_write/can_admin 取对应 rec 值的 bool；返回前 rec["tenant"] 与非空形参 tenant 去空白后不等时先向 stderr 写「租户绑定被入参覆盖」告警（仅告警零闸变，对照 _build_principal 的 MDCG_CLEARANCE 先例；租户强校验与 clearance_cap 夹紧接线另行 deferred）。
+# 生效条件：token 先经 parse_token（格式非法即抛 TokenError），其后 _load(path) 的 tokens 中该 token_id 无记录、rec 的 role 与解析出的 role 不等、revoked_at 为真、hash 与 _hash(secret) 经 hmac.compare_digest 不等、expires_at 为真且小于当前时间、或沿 parent 链上溯（seen 集合防环；链上父记录缺失时仅向 stderr 告警不阻断——吊销已由 revoke 级联物化，此处只补过期维度，文件写权不在令牌威胁模型内）任一祖先 expires_at 为真且小于当前时间中任一成立即抛 TokenError；否则返回 Principal，tenant=tenant or rec.get("tenant") or "default"、actor=rec.get("actor") or role、clearance=rec.get("clearance") or "internal"、can_write/can_admin 取对应 rec 值的 bool；返回前 rec["tenant"] 与非空形参 tenant 去空白后不等时先向 stderr 写「租户绑定被入参覆盖」告警；rec["tenant"] 与非空形参 tenant 去空白后不等时抛 TokenError 拒绝（N62②，2026-09-27 第 5 轮：告警改 fail-closed——原告警文案已定性「若非有意迁移请校正 MDCG_TENANT」），clearance 先取 rec 值再按登记租户上限夹紧（N62①：MDCG_TENANT_REGISTRY 登记表（与 _resolve_root 同源）在册租户 _rank(clearance) 高于其 clearance_cap 时夹紧为 cap；未登记租户/登记表缺失或损坏零闸变）。
 def verify_token(token: str, tenant: str = None, path: str = None) -> Principal:
     """校验令牌 → Principal。任何异常都抛 TokenError（fail-closed）。"""
     role, token_id, secret = parse_token(token)
@@ -430,24 +527,40 @@ def verify_token(token: str, tenant: str = None, path: str = None) -> Principal:
             raise TokenError(
                 f"令牌已失效：派生链祖先 {pid} 已过期（过期沿派生链传播）")
         pid = ancestor.get("parent")
-    # 租户绑定被 env 覆盖必须开口（2026-09-25 止血，v8 N62/v9/第15轮三次
-    # 成立）：形参 tenant（MCP 侧来自 MDCG_TENANT）非空且与令牌记录
-    # rec["tenant"] 不同时，形参值静默顶替令牌租户——tenantA 签发的
-    # secret/designer 令牌在 MDCG_TENANT=tenantB 下以原权限对 tenantB 登记根
-    # 运行且零痕迹。对照 MDCG_CLEARANCE 先例（mcp_server._build_principal）：
-    # 只告警不改闸（租户绑定强校验 + clearance_cap 夹紧接线另行 deferred）。
+    # ② N62（第 5 轮成立，2026-09-27）：租户绑定被入参覆盖由告警改 fail-closed
+    # 拒绝——形参 tenant（MCP 侧来自 MDCG_TENANT）非空且与令牌记录
+    # rec["tenant"] 不同时抛 TokenError（v8 N62 首报→v9/v15/v16 历轮成立，
+    # warn-only 五轮证明告警不构成闸门；原告警文案已定性「若非有意迁移请
+    # 校正」）。有意迁移的正道：校正 MDCG_TENANT 或为该租户重新签发令牌。
     _rec_tenant = str(rec.get("tenant") or "").strip()
     _arg_tenant = str(tenant or "").strip()
     if _arg_tenant and _rec_tenant and _arg_tenant != _rec_tenant:
-        sys.stderr.write(
-            f"[mdcg-tokens] ⚠ 租户绑定被入参覆盖：令牌按 {_rec_tenant} 签发，"
-            f"但入参 tenant={_arg_tenant}（MCP 侧来自 MDCG_TENANT）优先生效"
-            f"——令牌将以原 clearance/can_admin 对 {_arg_tenant} 运行。"
-            f"若非有意迁移，请校正 MDCG_TENANT 或为该租户重新签发令牌。\n")
+        raise TokenError(
+            f"[mdcg-tokens] 租户绑定被入参覆盖，拒绝校验（fail-closed，"
+            f"N62 第 5 轮）：令牌按 {_rec_tenant} 签发，但入参 "
+            f"tenant={_arg_tenant}（MCP 侧来自 MDCG_TENANT）——令牌不得以原 "
+            f"clearance/can_admin 对 {_arg_tenant} 运行。若非有意迁移，请校正 "
+            f"MDCG_TENANT；若为有意迁移，请为该租户重新签发令牌"
+            f"（python -m md_cg.tokens issue …）。\n")
+    # ① N62 接线：令牌路径 clearance 按登记租户上限夹紧（principal_for/cap_of
+    # 现成，纯收紧不改宽）——仅登记租户收紧；未登记租户/登记表缺失或损坏
+    # 零闸变（fresh install 无 _tenants.json 行为不变，守卫 R3 钉住；登记表
+    # 损坏回落与 _resolve_root 的 N124 先例同口径）。登记表路径经
+    # MDCG_TENANT_REGISTRY（与 mcp_server._resolve_root 同源）。
+    _eff_tenant = tenant or rec.get("tenant") or "default"
+    _clearance = rec.get("clearance") or "internal"
+    try:
+        _reg = TenantRegistry(os.environ.get("MDCG_TENANT_REGISTRY") or None)
+        if _reg.get(_eff_tenant):
+            _cap = _reg.cap_of(_eff_tenant)
+            if _rank(_clearance) > _rank(_cap):
+                _clearance = _cap
+    except Exception:                     # noqa: BLE001 —— 登记表缺失/损坏按未登记（零闸变）
+        pass
     return Principal(
-        tenant=tenant or rec.get("tenant") or "default",
+        tenant=_eff_tenant,
         actor=rec.get("actor") or role,
-        clearance=rec.get("clearance") or "internal",
+        clearance=_clearance,
         can_write=bool(rec.get("can_write")),
         can_admin=bool(rec.get("can_admin")),
         role=role, token_id=token_id, parent=rec.get("parent"),
@@ -455,53 +568,66 @@ def verify_token(token: str, tenant: str = None, path: str = None) -> Principal:
         ops_allow=rec.get("ops_allow"), auth_mode="token")
 
 
-# 生效条件：parent_token 经 verify_token(parent_token, path=path) 成功且父记录 delegable 为真才继续，否则抛 TokenError；role 经 normalize_role+role_spec，clearance 为假值时取 spec["clearance_cap"] 再 _clamp_level，若仍高于 parent.clearance 则降为 parent.clearance 并向 clamped 追加 "clearance"；layers/ops 先与 spec 求交再与父记录求交；can_write/can_admin 取 spec 与父对应值的与；ttl 为真值时过期候选=now+float(ttl)、为假值（None/0）时沿用父记录 expires_at，候选与父记录 expires_at 均非空时取 min（N123：派生在时间维度同样只能收窄，父无界时取候选），被父夹紧时向 clamped 追加 "expires_at"；新记录 delegable 恒 False、parent/issued_by 为 parent.token_id，返回含明文 token 与 clamped 的字典。
+# 生效条件：parent_token 经 verify_token(parent_token, path=path) 成功，随后在 _store_lock(path) 临界区内复核父令牌**落盘态**：父记录 delegable 为假抛 TokenError，父记录已并发吊销（revoked_at 为真，N199）同样抛 TokenError；role 经 normalize_role+role_spec，clearance 为假值时取 spec["clearance_cap"] 再 _clamp_level，若仍高于 parent.clearance 则降为 parent.clearance 并向 clamped 追加 "clearance"；layers/ops 先与 spec 求交再与父记录求交；can_write/can_admin 取 spec 与父对应值的与；ttl 为真值时过期候选=now+float(ttl)、为假值（None/0）时沿用父记录 expires_at，候选与父记录 expires_at 均非空时取 min（N123：派生在时间维度同样只能收窄，父无界时取候选），被父夹紧时向 clamped 追加 "expires_at"；新记录 delegable 恒 False、parent/issued_by 为 parent.token_id，_save 后返回含明文 token 与 clamped 的字典。
 def derive(parent_token: str, role: str, actor: str = None, ttl: float = None,
            label: str = "", path: str = None, clearance: str = None,
            layers_allow=None, ops_allow=None):
     """设计者令牌派生受限子令牌：权限只能收窄，子令牌默认不可再派生。"""
     parent = verify_token(parent_token, path=path)
-    data = _load(path)
-    prec = (data.get("tokens") or {}).get(parent.token_id) or {}
-    if not prec.get("delegable"):
-        raise TokenError(f"令牌 {parent.token_id} 不可派生（role={parent.role}）")
-    role = normalize_role(role)
-    spec = role_spec(role)
-    clamped = []
-    want_clear = clearance or spec["clearance_cap"]
-    final_clear = _clamp_level(want_clear, spec["clearance_cap"])
-    if _rank(parent.clearance) < _rank(final_clear):
-        final_clear = parent.clearance
-        clamped.append("clearance")
-    layers = _narrow(_narrow(layers_allow, spec["layers_allow"]),
-                     prec.get("layers_allow"))
-    ops = _narrow(_narrow(ops_allow, spec["ops_allow"]), prec.get("ops_allow"))
-    can_write = bool(spec["can_write"]) and bool(parent.can_write)
-    can_admin = bool(spec["can_admin"]) and bool(parent.can_admin)
-    # N123（2026-09-25 止血）：「派生只能收窄」补上时间维度——子令牌有效期
-    # 不得超过父令牌（revoke 有级联，过期原先没有：父过期后子令牌仍以原密级
-    # 通过 verify_token，授权回收被长 TTL 子令牌旁路）。父无界（expires_at
-    # 为 None）时不夹紧，取请求值；子未指定 ttl 时沿用父界（含无界）。
-    now = time.time()
-    pexp = prec.get("expires_at")
-    want_exp = (now + float(ttl)) if ttl else pexp
-    final_exp = want_exp
-    if want_exp is not None and pexp is not None \
-            and float(want_exp) > float(pexp):
-        final_exp = pexp
-        clamped.append("expires_at")
-    token_id, secret = "tk_" + secrets.token_hex(6), secrets.token_urlsafe(32)
-    rec = {
-        "role": role, "actor": actor or role, "tenant": parent.tenant,
-        "clearance": final_clear, "can_write": can_write, "can_admin": can_admin,
-        "layers_allow": layers, "ops_allow": ops,
-        "delegable": False, "parent": parent.token_id,
-        "issued_by": parent.token_id, "issued_at": now,
-        "expires_at": final_exp,
-        "revoked_at": None, "label": label, "hash": _hash(secret),
-    }
-    data["tokens"][token_id] = rec
-    _save(data, path)
+    # N199：本函数的「读-改-写」必须与父令牌的**落盘态复核**同处一个临界区
+    # （原先无锁，并发 revoke 与之交错时会产出「父已吊销、子仍有效」的凭据：
+    # 吊销级联只覆盖它落锁那一刻盘上已存在的子令牌）。持锁后 revoke 只能落在
+    # 本函数之前（则下方 prec["revoked_at"] 判据拒绝派生）或之后（则级联能看见
+    # 这枚新子令牌并一并吊销）——两向都收口。
+    with _store_lock(path):
+        data = _load(path)
+        prec = (data.get("tokens") or {}).get(parent.token_id) or {}
+        if not prec.get("delegable"):
+            raise TokenError(
+                f"令牌 {parent.token_id} 不可派生（role={parent.role}）")
+        if prec.get("revoked_at"):
+            raise TokenError(
+                f"父令牌 {parent.token_id} 已被并发吊销，拒绝派生（N199）")
+        role = normalize_role(role)
+        spec = role_spec(role)
+        clamped = []
+        want_clear = clearance or spec["clearance_cap"]
+        final_clear = _clamp_level(want_clear, spec["clearance_cap"])
+        if _rank(parent.clearance) < _rank(final_clear):
+            final_clear = parent.clearance
+            clamped.append("clearance")
+        layers = _narrow(_narrow(layers_allow, spec["layers_allow"]),
+                         prec.get("layers_allow"))
+        ops = _narrow(_narrow(ops_allow, spec["ops_allow"]),
+                      prec.get("ops_allow"))
+        can_write = bool(spec["can_write"]) and bool(parent.can_write)
+        can_admin = bool(spec["can_admin"]) and bool(parent.can_admin)
+        # N123（2026-09-25 止血）：「派生只能收窄」补上时间维度——子令牌有效期
+        # 不得超过父令牌（revoke 有级联，过期原先没有：父过期后子令牌仍以原密级
+        # 通过 verify_token，授权回收被长 TTL 子令牌旁路）。父无界（expires_at
+        # 为 None）时不夹紧，取请求值；子未指定 ttl 时沿用父界（含无界）。
+        now = time.time()
+        pexp = prec.get("expires_at")
+        want_exp = (now + float(ttl)) if ttl else pexp
+        final_exp = want_exp
+        if want_exp is not None and pexp is not None \
+                and float(want_exp) > float(pexp):
+            final_exp = pexp
+            clamped.append("expires_at")
+        token_id, secret = ("tk_" + secrets.token_hex(6),
+                            secrets.token_urlsafe(32))
+        rec = {
+            "role": role, "actor": actor or role, "tenant": parent.tenant,
+            "clearance": final_clear, "can_write": can_write,
+            "can_admin": can_admin,
+            "layers_allow": layers, "ops_allow": ops,
+            "delegable": False, "parent": parent.token_id,
+            "issued_by": parent.token_id, "issued_at": now,
+            "expires_at": final_exp,
+            "revoked_at": None, "label": label, "hash": _hash(secret),
+        }
+        data["tokens"][token_id] = rec
+        _save(data, path)
     return {"ok": True, "token": make_token(role, token_id, secret),
             "token_id": token_id, "role": role, "actor": rec["actor"],
             "clearance": final_clear, "layers_allow": layers, "ops_allow": ops,
@@ -547,18 +673,26 @@ def narrowed_principal(p: Principal, unit: str) -> Principal:
         theory_ok=p.theory_ok, theory_version=p.theory_version)
 
 
-# 生效条件：token_id 在 _load(path) 的 tokens 中无记录时抛 TokenError；有记录则将其 revoked_at 置为 time.time() 并 _save，再对 tokens 中 parent 等于 token_id 的每个子令牌递归 revoke(c, path)，返回 {"ok": True, "token_id": token_id, "revoked_children": children}。
+# 生效条件：先以 _store_lock(path) 取令牌库跨进程写锁（超时抛 TokenError），再在临界区内执行 _revoke_locked(token_id, path) 并返回其结果。
 def revoke(token_id: str, path: str = None):
+    """吊销令牌（级联派生链）。整个「读-改-写 + 级联」在同一临界区内完成。"""
+    with _store_lock(path):
+        return _revoke_locked(token_id, path)
+
+
+# 生效条件：调用方**已持** _store_lock(path)（FileLock 非重入，递归不得再取锁）；token_id 在 _load(path) 的 tokens 中无记录时抛 TokenError；有记录则将其 revoked_at 置为 time.time() 并 _save，再对 tokens 中 parent 等于 token_id 的每个子令牌递归 _revoke_locked(c, path)，返回 {"ok": True, "token_id": token_id, "revoked_children": children}。
+def _revoke_locked(token_id: str, path: str = None):
     data = _load(path)
     rec = (data.get("tokens") or {}).get(token_id)
     if not rec:
         raise TokenError(f"令牌不存在：{token_id}")
     rec["revoked_at"] = time.time()
     _save(data, path)
-    # 级联吊销派生链
+    # 级联吊销派生链（同一临界区内递归：N199 保证「落锁期间不会有新子令牌
+    # 悄悄挂到本令牌下」，否则那枚子令牌会绕过级联、在父已吊销后仍有效）
     children = [t for t, r in data["tokens"].items() if r.get("parent") == token_id]
     for c in children:
-        revoke(c, path)
+        _revoke_locked(c, path)
     return {"ok": True, "token_id": token_id, "revoked_children": children}
 
 
@@ -603,17 +737,13 @@ def _csv_list(v):
     return [x.strip() for x in str(v).split(",") if x.strip()] or None
 
 
-# 生效条件：path 经 os.path.abspath 得 p，其 dirname 非空时 makedirs(exist_ok=True)，text 原样写入 p+".tmp" 后 publish（带 Windows 短重试的 os.replace）覆盖 p，再尝试 chmod 0600（仅吞 OSError）。
+# 生效条件：path 经 os.path.abspath 得 p（不含共享固定临时名），text 经 fsutil.atomic_write 整体替换写入 p（同目录唯一临时名 mkstemp + 带 Windows 短重试的 replace，失败即清理），再尝试 chmod 0600（仅吞 OSError）。
 def _write_secret(path: str, text: str) -> None:
     """把令牌明文写入文件（0600，原子替换）——供 HIVE_ORCH_TOKEN_FILE 读取。"""
     p = os.path.abspath(path)
-    d = os.path.dirname(p)
-    if d:
-        os.makedirs(d, exist_ok=True)
-    tmp = p + ".tmp"
-    with open(tmp, "w", encoding="utf-8") as f:
-        f.write(text)
-    publish(tmp, p)
+    # N199：原先写 p + ".tmp"（固定共享名）再 publish——两进程同写一个目标时
+    # 互截内容（半截文件可能被 rename 到位）。atomic_write 用唯一临时名。
+    atomic_write(p, text)
     try:
         os.chmod(p, 0o600)
     except OSError:

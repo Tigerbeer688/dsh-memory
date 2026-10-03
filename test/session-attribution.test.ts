@@ -12,7 +12,12 @@
  * 被守卫的不变量
  * --------------
  *   ① 写入带身份：三路 remember 的 extra.session 来自宿主会话标识（`id` / `sessionId`）；
- *   ② 不编造：宿主未给出标识 → 不塞 session 键，回落内核进程身份（退回旧行为）；
+ *   ② 不编造：宿主未给出标识 → **显式 `unassigned`**（H2③，2026-09-30）——不塞
+ *      伪造的宿主会话 id，也不退回「不传 session」（那会让 md_cg 的 Principal 生成
+ *      **进程级随机** `sess_*` 兜底桶，见 md_cg/security.py:117：一个进程内所有
+ *      无标识会话共用一桶、审计上不可辨认）；
+ *   ②′ 语义召回显式带会话槽（H2③）：`read(query, {k, session})`——不传则读侧归一
+ *      一生效就等价于跨会话（全库）召回；
  *   ③ 读取隔离：autoRecall 的 timeline 只带本会话；
  *   ④ **取值每步稳定**：本块按 v0.4.8 契约每步都 push，session 取值若中途翻转会白付
  *      两份快照 → 优先取 ctx 上的会话，其次回落「最近一次 session/event 的会话」；
@@ -33,7 +38,7 @@ interface TimelineCall { limit?: number; extra: Record<string, unknown> }
 interface RememberCall { content: string; extra: Record<string, unknown> }
 interface ReadCall { query: string; extra: Record<string, unknown> }
 
-/** 最小 MdcgClient 形态：只实现 hooks 用到的方法，并记录调用。 */
+/** 最小 MdcgClient 形态：只实现 hooks 用到的几个方法，并记录调用。 */
 function makeGraph() {
   const timelineCalls: TimelineCall[] = []
   const rememberCalls: RememberCall[] = []
@@ -51,7 +56,8 @@ function makeGraph() {
       rememberCalls.push({ content, extra })
       return { ok: true }
     },
-    async recall() { return { ok: true } },
+    // H2③：hooks 的语义召回走 `read(query, {k, ...sessionTag})`（与 recall 同一条
+    // MCP 出口 cg(op=read)，差别只在能带会话槽）——故 stub 必须提供 read 并留痕。
     /** 镜像 MCP `cg(op=read)` → `cg.search(q, layer=...)`：不传 layer 搜全部层，
      *  于是刚写入 contextual 的同一句话按自匹配高分排在知识教训之前。 */
     async read(query: string, extra: Record<string, unknown> = {}) {
@@ -60,6 +66,7 @@ function makeGraph() {
       const echo = { node: { content: '下单前要不要检查交易时段？' }, score: 0.82 }
       return { results: extra['layer'] === 'knowledge' ? [lesson] : [echo, lesson] }
     },
+    async recall() { return { ok: true } },
   }
   return { graph, timelineCalls, rememberCalls, readCalls }
 }
@@ -106,7 +113,7 @@ const toolEvent = (text: string) => ({
 })
 
 test('① 写入带会话身份：user/assistant/tool 三路都打上 session 归属', async () => {
-  const { graph, rememberCalls } = makeGraph()
+  const { graph, rememberCalls, readCalls } = makeGraph()
   const { send } = makeHarness(graph)
 
   send({ id: 'sess_A' }, userEvent('我喜欢猫'))
@@ -121,16 +128,26 @@ test('① 写入带会话身份：user/assistant/tool 三路都打上 session �
   // 归因与授权正交：session 不得挤掉既有 role 归属
   assert.equal(rememberCalls[0]!.extra['role'], 'user')
   assert.equal(rememberCalls[2]!.extra['role'], 'tool-output')
+  // ②′（H2③）：user 路那次语义召回必须显式带会话槽，且与写入同一取值
+  assert.equal(readCalls.length, 1, 'user 路各发起一次语义召回')
+  assert.equal(readCalls[0]!.extra['session'], 'sess_A', '语义召回显式带会话（H2③）')
+  assert.equal(readCalls[0]!.extra['k'], 3, '召回条数语义不变')
 })
 
-test('② 宿主未给出会话标识：不编造 session（退回旧行为）', async () => {
-  const { graph, rememberCalls, timelineCalls } = makeGraph()
+test('② 宿主未给出会话标识：不编造宿主 id → 显式 unassigned（不落进程随机 sess_*）', async () => {
+  const { graph, rememberCalls, readCalls, timelineCalls } = makeGraph()
   const { send, assemble } = makeHarness(graph)
 
   send({}, userEvent('没有会话标识的消息'))
   await Promise.resolve()
   assert.equal(rememberCalls.length, 1)
-  assert.ok(!('session' in rememberCalls[0]!.extra), '无标识不得编造 session 键')
+  // H2③（2026-09-30）：此处由「不塞 session 键」改为「显式 unassigned」——
+  // 不塞键会让 md_cg 的 Principal 生成进程级随机 sess_* 兜底桶（所有无标识会话
+  // 共用、不可辨认）；unassigned 是显式常量，跨进程一致且可审计。
+  assert.equal(rememberCalls[0]!.extra['session'], 'unassigned',
+    '无标识 → 显式 unassigned（不编造宿主会话 id）')
+  assert.equal(readCalls[0]!.extra['session'], 'unassigned',
+    '语义召回同样显式带 unassigned（H2③：不因无标识而变成全库召回）')
 
   await assemble(undefined)
   assert.deepEqual(timelineCalls[0]!.extra, {}, '自动召回无标识 → 不加过滤（向后兼容）')
@@ -195,7 +212,9 @@ test('⑦ 教训召回限定 knowledge 层：查询词是刚落盘的同一句�
   await Promise.resolve()
   const a = await assemble({ agent: { session: { id: 'sess_A' } } })
 
-  assert.deepEqual(readCalls[0]!.extra, { k: 8, layer: 'knowledge' },
+  const knowledgeRead = readCalls.find((c) => c.extra['layer'] === 'knowledge')
+  assert.ok(knowledgeRead, '应发起 layer=knowledge 的语义召回')
+  assert.deepEqual(knowledgeRead!.extra, { k: 8, layer: 'knowledge' },
     'cg(op=read) 必须显式带 layer：缺省搜全部层会返回用户原话的自匹配回声')
   const block = a.contexts.find((c) => c.name === 'lingshu:knowledge-recall')
   assert.ok(block, '应注入【灵枢交易教训】块')

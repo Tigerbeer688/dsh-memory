@@ -273,8 +273,17 @@ class HiveJobsSource(Source):
       result.json 终态 → **权威确认事件**（progress 可能因强杀缺失 final）：
                           done → 「任务完成(job=…)」；error/timeout/killed → 「任务失败(job=…)」
 
-    排序：job_id 名升序 = 时间升序（job.rs 命名保证 h<unix_ms>_<pid>），
-    跨 job 全序成立；seq 由本源按枚举顺序递增（ingest 去重键 = (session, seq)）。
+    排序：**job_id 名升序**（`sorted(listdir)`，确定性），**不是**时间序——
+    契约 v2（`docs/plans/全中文编码与蜂巢任务标识契约_v2.0.md` §四.5）起 id 改为
+    语义四槽 `h_<身份>_<任务>_<单元>_<编号>`，名序不再等于提交时序：旧形态
+    `h<unix_ms>_<pid>` 才是「名序 = 时间序」的**巧合代理**。据实订正（C2：本仓
+    禁止把代理当结构保证）——本源的时序由来源行自带的 ts 承载，排序只求
+    **跨 job 全序且确定**（seq 由本源按枚举顺序递增，ingest 去重键 = (session, seq)，
+    名序的确定性保证该键跨轮稳定）。
+    诚实边界（**已发现、未在本批动码**）：本源的 `_jobs()` 若需要**真时间序**，
+    应改走与 Rust 侧同判据的 created_ts 真值（`hive/src/job.rs::list_jobs_by_created`
+    的语义，Python 侧对应 `mcp_server._list_jobs_by_created`）——契约 §四.5 的消费者
+    清单未列本源，且改动牵动 md_cg 摄入链语义与其守卫，故留待单独裁决，不静默改。
     解析失败的行/条目计入 self.skipped，不终杀批次。
     """
 
@@ -626,11 +635,14 @@ class FileDispatcher:
 
     # ---- stat：看水位与支持面 ----
 
-# 生效条件：from . import refindex 与 refindex.Ledger(self.cg.root).stat() 均不抛异常时返回该 stat 结果，抛任何异常时返回 {}。
+# 生效条件：from . import refindex 与 refindex.Ledger(self.cg.root).summary() 均不抛异常时返回该 summary 结果，抛任何异常时返回 {}。
     def _ledger_stat(self):
+        # `Ledger` 只有 `summary()`、**没有** `stat()`：此前写 `.stat()` 撞
+        # AttributeError 被下面的 except 吞成 `{}`，于是 `ingest stat` 的水位面
+        # 永远是空且无人知晓（唯一实现面是 `refindex.Ledger.summary`）。
         try:
             from . import refindex
-            return refindex.Ledger(self.cg.root).stat()
+            return refindex.Ledger(self.cg.root).summary()
         except Exception:                                  # noqa: BLE001
             return {}
 
@@ -702,7 +714,7 @@ class FileDispatcher:
                 "counts": counts,
                 "note": "预演：仅统计各链文件数，未做任何写入"}
 
-# 生效条件：root 非目录时返回 ok=False 的「目录不存在」；dry_run 为真时返回 _dry_dir(root)；否则对 doc_ref/code_ref 两链各以 patterns/max_files/max_items/incremental/ledger 调 refindex.index_dir 与 add_items，并把 root 下 **/*.jsonl 前 max_files 个逐个 ingest_jsonl 后返回 out。
+# 生效条件：root 非目录时返回 ok=False 的「目录不存在」；dry_run 为真时返回 _dry_dir(root)；否则对 doc_ref/code_ref 两链各以 patterns/max_files/max_items/incremental/ledger 调 refindex.index_dir(commit=False) 与 add_items 后 ledger.save()，并把 root 下 **/*.jsonl 前 max_files 个逐个 ingest_jsonl 后返回 out。
     def ingest_dir(self, root, layer=None, sensitivity=None, patterns=None,
                    max_files=500, max_items=2000, incremental=False,
                    dry_run=False):
@@ -716,13 +728,18 @@ class FileDispatcher:
         for ref_kind, key in (("doc_ref", "doc"), ("code_ref", "code")):
             items, errors, stats = refindex.index_dir(
                 root, kind=ref_kind, patterns=patterns, max_files=max_files,
-                max_items=max_items, incremental=incremental, ledger=ledger)
+                max_items=max_items, incremental=incremental, ledger=ledger,
+                commit=False)
             ids, sens = refindex.add_items(self.cg, items, kind=ref_kind,
                                            root=root, layer=layer,
                                            sensitivity=sensitivity)
+            # 写序（同 op=index_code/index_doc）：节点先落盘，水位随后——
+            # 中途被杀只会留下「节点新 + 水位旧」，下次增量重切，不会静默漏漂移。
+            ledger.save()
             out["chains"][key] = {
                 "indexed": len(ids), "errors": len(errors),
                 "files": stats.get("files"), "truncated": stats.get("truncated"),
+                "empty_scan": stats.get("empty_scan"),
                 "skipped_unchanged": stats.get("skipped_unchanged", 0),
                 "skipped_suffixes": stats.get("skipped_suffixes", []),
                 "sensitivity": sens}

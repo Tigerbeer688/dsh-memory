@@ -7,6 +7,7 @@
   ③ maintain.importance：dry-run 报表 → apply → 留痕 → rollback 复原
   ④ maintain.longterm：dry-run → 断面落盘 → 幂等 → list/show
   ⑤ maintain.prefeed：预演不写 → write 时 ACCEPT 新增 / MERGE 并入不新增
+     （2026-09-30 补强：MERGE 落点的新正文聚合去向 + 新写入方归属并列落 fm）
   ⑥ maintain.separate：相似而条件不同 → 候选 → apply 写对称边 → 幂等
   ⑦ consolidate.promote：dry-run 分流 → 迁移 → 追溯 → 回滚
   ⑧ 权限分档：写层可 stat/prefeed、不可 importance/separate/rollback
@@ -18,6 +19,7 @@
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -39,11 +41,13 @@ SEP_B = ("# 功能名：连接池选择\n# 生效条件：多租户在线服务\
          "# 不适用条件：嵌入式设备\n")
 PROMO_HOT = ("# 功能名：重试退避策略\n# 生效条件：网络抖动且请求幂等\n"
              "# 子功能：在瞬时故障下限制重试次数\n# 执行：指数退避重试至多三次\n"
+             "# 验证方式：编译器/静态检查通过\n"
              "# 不适用条件：非幂等写操作\n")
 PROMO_COLD = ("# 功能名：日志轮转策略\n# 生效条件：磁盘占用超过阈值\n"
               "# 子功能：按大小切分历史日志\n# 执行：达到上限即滚动归档\n"
+              "# 验证方式：编译器/静态检查通过\n"
               "# 不适用条件：只读挂载卷\n")
-# 反复命中但四要素不全（缺「不适用条件」）
+# 反复命中但六要素不全（缺「不适用条件」+「验证方式」）
 PROMO_BAD = ("# 功能名：缓存穿透保护\n# 生效条件：高频查询未命中\n"
              "# 子功能：用空值占位挡住穿透\n# 执行：写空对象并设短 TTL\n")
 NOVEL = ("# 观察：本机固定使用 Windows 与 cmd\n# 生效条件：本机开发环境\n"
@@ -201,6 +205,33 @@ def main():
               p2.get("decision") == "reinforce" and bool(p2.get("reinforced")),
               f"decision={p2.get('decision')}")
         check("MERGE 后节点数不变", len(cg.index["nodes"]) == n1)
+        # 2026-09-30 补强：prefeed(write=True) 的 MERGE 落点接线——mdcos.py:2891
+        # 调 forgetting.reinforce 时传 `content=content, session=_writer_session(self)`。
+        # 复核员实测抽掉该接线后各守卫静默全绿（此前无断言覆盖）。断言打在
+        # 可观察结果上：新正文按聚合口径进目标正文 + 新写入方归属并列落目标 fm。
+        _prev_sess = getattr(cg, "session", None)
+        cg.session = "sess_p30"
+        NOVEL2 = NOVEL.replace("cmd.exe", "cmd.exe/powershell")
+        p3 = call_tool(cg, "cg", {"op": "maintain", "action": "prefeed",
+                                  "content": NOVEL2, "layer": "contextual",
+                                  "write": True})
+        rein3 = p3.get("reinforced") or {}
+        tgt3 = rein3.get("node_id")
+        full3 = (cg.get(tgt3) or {}) if tgt3 else {}
+        sink3 = rein3.get("content_sink") or {}
+        check("prefeed 落点①：近重复判 MERGE，新正文按聚合口径进目标正文",
+              p3.get("decision") == "reinforce" and bool(tgt3)
+              and "powershell" in (full3.get("content") or "")
+              and sink3.get("action") == "appended"
+              and "powershell" in (sink3.get("line") or ""),
+              f"decision={p3.get('decision')} sink={sink3}")
+        srcs3 = [(x.get("session"), x.get("actor")) for x in
+                 ((full3.get("frontmatter") or {}).get("merge_sources") or [])]
+        check("prefeed 落点②：新写入方 session/actor 归属并列落目标 fm",
+              bool(srcs3) and srcs3[-1] == ("sess_p30", "p30"),
+              json.dumps((full3.get("frontmatter") or {}).get("merge_sources"),
+                         ensure_ascii=False))
+        cg.session = _prev_sess
 
         # ---------------------------------------------- ⑥ separate
         print("\n【6】maintain.separate：候选 → 对称边 → 幂等")
@@ -242,7 +273,7 @@ def main():
         r1 = call_tool(cg, "cg", {"op": "consolidate", "action": "promote"})
         check("dry-run 未写盘", r1.get("dry_run") and r1.get("written") == 0)
         check("命中热节点", r1.get("targeted", 0) >= 1, f"targeted={r1.get('targeted')}")
-        check("剔除四要素不全", r1.get("skipped_incomplete", 0) >= 1)
+        check("剔除六要素不全", r1.get("skipped_incomplete", 0) >= 1)
         check("剔除不热节点", r1.get("skipped_not_hot", 0) >= 1)
         r2 = call_tool(cg, "cg", {"op": "consolidate", "action": "promote",
                                   "apply": True})

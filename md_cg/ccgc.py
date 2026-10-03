@@ -17,7 +17,8 @@ LLM 若参与，只能经 `parser=` 注入（能力外置，与 compiler 的 llm
 纠正）：①身份归一比较（大小写/空白/括号注记归一）拦截同源字符串变体；
 ②根本保障是 `verifier_token` 凭据通路——验证方身份经 mdcg 令牌 HMAC 验签
 （与 narrowed_principal 同一信任源），不依赖自报诚实度；无令牌时结果标
-`verifier_identity="self-reported"`（诚实降级，可被下游策略识别）。
+`verifier_identity="self-reported"`（诚实降级；下游已兑现消费——
+link(apply=true) 对无凭据签章一律 E052 拒绝落库，N176）。
 
 对齐既有实现（零发明）：
     · 验证能力外置 / 缺能力恒不通过  → md_cg/audit.py（CONTENT_KINDS + register_verifier）
@@ -37,7 +38,7 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any, Dict, List, Optional
 
-from . import nodefile
+from . import nodefile, protect
 from .readcache import direct_read
 
 # ---- 四态：复用 audit / judge_qualification 的裁决语汇（不新造状态机） ----
@@ -68,6 +69,13 @@ E_CODES = {
     "E050": ("依赖声明缺失：正文以 `@<节点 id>` 声明了跨节点依赖（「# 子功能：」行），"
              "但 depends_on 未给出可解析目标——依赖必须是可解析的字段，不能只是散文"),
     "E051": "依赖目标不存在：depends_on 指向的节点不在库中（悬空依赖）",
+    # N176：兑现「下游策略可据此拒绝」——self-reported 签章不构成落库准入
+    "E052": ("无凭据签章：验证方身份未经 mdcg 令牌验签（verifier_identity="
+             "self-reported）——自报名不构成编外复核凭据，落库须令牌验证方"
+             "（verifier_token）签章"),
+    # N208：换行注入——ccg 行值是单行契约，换行会拆出伪造的独立正文行
+    "E022": ("值含换行：ccg 行值/四槽值必须是单行——换行会注入伪造的独立"
+             "正文行（`ccg_field_value` 取首个命中行，正文读面即被顶替）"),
 }
 
 # ---- 候选来源标识（写进留痕，可溯源到「谁说的」） ----
@@ -174,18 +182,32 @@ def _as_cg(x):
     return MdCGOS(x)
 
 
-# 生效条件：content 为字符串（None 视作空串）时，若其中含 "# " + field_name + "：" 或 "# " + field_name + ":" 则返回 True，否则 False。
+# 生效条件：委托 nodefile.ccg_mark_present——content 中含标题行 "# " + field_name（冒号可有可无）则返回 True，否则 False。
 def _has_ccg_line(content: str, field_name: str) -> bool:
-    text = content or ""
-    return ("# " + field_name + "：") in text or ("# " + field_name + ":") in text
+    # 判据单点在 nodefile（2026-09-28 收口径）：冒号可有可无，与写入闸门同一语义。
+    return nodefile.ccg_mark_present(content, field_name)
 
 
-# 生效条件：在 `(content or "").split("\n")` 中命中首个 strip 后以 "#" 开头、含 field_name、且去 "#" 后按全角或半角冒号切出的名字等于 field_name 的行→替换为 "# field_name：value" 并返回；否则若有行 strip 后以 "# 功能名" 开头→在该行后插入新行并返回；否则返回 `"# field_name：value\n" + (content or "")`。
+# 生效条件：委托 nodefile.ccg_value_has_break——v 的 str 形态含换行（"\n"/"\r"）则返回 True，否则 False。ccg 行值必须单行，换行会拆出伪造的独立正文行。
+def _has_line_break(v) -> bool:
+    return nodefile.ccg_value_has_break(v)
+
+
+# 生效条件：在 `(content or "").split("\n")` 中命中首个 strip 后以 "#" 开头、含 field_name、且去 "#" 后按全角或半角冒号切出的名字等于 field_name 的行→替换为 "# field_name：value" 并返回；否则若有行 strip 后以 "# 功能名" 开头→在该行后插入新行并返回；否则返回 `"# field_name：value\n" + (content or "")`；value 含换行时抛 ValueError（fail-closed：换行会把值拆成伪造的独立正文行，正文读面 ccg_field_value 取首个命中行 ⇒ 被顶替）。
 def _upsert_ccg_line(content: str, field_name: str, value: str) -> str:
     """写入/替换 `# <字段>：<值>`，优先插在「# 功能名」之后。
 
     与 consolidate._upsert_ccg_line 同款语义（就近实现，避免 import 环）。
+    唯一加严：**值必须是单行**（N208，2026-09-28）——此前 `value` 原样拼进
+    `"# " + field_name + "：" + value`，含 `\\n` 的值即可注入一行独立的
+    `# <任意字段>：<任意值>`：`ccg_field_value` 取首个命中行，正文读面据此
+    被顶替（伪造「功能名/生效条件」而调用方以为自己只改了四槽）。
     """
+    if _has_line_break(value):
+        raise ValueError(
+            "ccg 行值含换行：%r——值必须是单行（换行会注入伪造的独立正文行，"
+            "正文读面按首个命中行取值即被顶替）。N208 fail-closed 拒写。"
+            % (str(value)[:80],))
     lines = (content or "").split("\n")
     for i, ln in enumerate(lines):
         s = ln.strip()
@@ -482,6 +504,10 @@ def compile_dialog(dialog: str, node_id: str, actor: str, *,
             if nodefile.is_placeholder_text(value):
                 res.err("E021", "槽 " + key + " 空值或待填充占位：" + repr(value))
                 continue
+            # N208：槽值是单行契约——换行会在合成出的生效条件行里拆出伪造行
+            if _has_line_break(value):
+                res.err("E022", "槽 " + key + " 值含换行：" + repr(value)[:60])
+                continue
             if not exempt and not _value_grounded(src, value):
                 res.err("E011", "槽 " + key + " 值非原文子串：" + repr(value))
                 res.ungrounded.append({"field": "condition_space." + key,
@@ -514,6 +540,10 @@ def compile_dialog(dialog: str, node_id: str, actor: str, *,
         value, span, basis, _synthetic = _field(cand_marks[field_name])
         if nodefile.is_placeholder_text(value):
             res.err("E021", "要素 " + field_name + " 空值或待填充占位：" + repr(value))
+            continue
+        # N208：要素行同样是单行契约（link 会把它拼成 `# <要素>：<值>` 一行）
+        if _has_line_break(value):
+            res.err("E022", "要素 " + field_name + " 值含换行：" + repr(value)[:60])
             continue
         if not exempt:
             if not _value_grounded(src, value):
@@ -611,7 +641,8 @@ def attest(node_id: str, verdict: str, verifier: str, compiled_by: str, *,
         E041 比较令牌 principal.actor 与 compiled_by——结构性阻断；
       · 未提供时：回退自报字符串 + 归一化比较（大小写/空白/括号注记
         归一），拦截已知同源变体；verifier_identity="self-reported"
-        如实标注，下游策略可据此拒绝。
+        如实标注，下游已兑现消费——link(apply=true) 据此拒绝落库
+        （E052，N176），自报名无法冒充编外复核。
     DEFER 不构成签章（未定 = 未通过）。
     """
     res = AttestResult(node_id=str(node_id or "").strip(),
@@ -705,13 +736,14 @@ def _check_deps(_cg, node_id: str) -> List[str]:
     return errs
 
 
-# 生效条件：依次判 compiled.success 为假→返回带错误；attestation 为 None→E040；attestation.node_id 不等于 compiled.node_id 的取值→目标不一致拒绝；attestation.verifier 为真值且 == `(actor or compiled.actor)`→E041；attestation.ok 为假→E042；_as_cg(cg) 为 None→E002；节点不在 cg.index 的 nodes 中→E002；依赖声明闸门（E050/E051）不通过→拒绝写入；apply 为假→ok=True 的 dry-run 返回；否则 apply 为真时写入（fm 为 None 或 content 加密→E004），basis 为假值则回落 compiled.sources.get("verification_basis") 或 "other"，成功后 out.written=len(compiled.lines)。
+# 生效条件：依次判 compiled.success 为假→返回带错误；attestation 为 None→E040；attestation.node_id 不等于 compiled.node_id 的取值→目标不一致拒绝；attestation.verifier 为真值且 == `(actor or compiled.actor)`→E041；attestation.ok 为假→E042；_as_cg(cg) 为 None→E002；节点不在 cg.index 的 nodes 中→E002；依赖声明闸门（E050/E051）不通过→拒绝写入；attestation.verifier_identity != "token" 时 apply 为真→E052 拒绝写入（dry-run 不拦，仅附 E052 预告 warning）；apply 为假→ok=True 的 dry-run 返回；否则 apply 为真时写入（fm 为 None 或 content 加密→E004），basis 为假值则回落 compiled.sources.get("verification_basis") 或 "other"，成功后 out.written=len(compiled.lines)。
 def link(compiled: CompileResult, attestation: Optional[AttestResult], *,
          cg: Any = None, apply: bool = False, actor: str = "",
          basis: str = "") -> LinkResult:
     """把编译产物写入节点。**准入条件 = 有效签章**（裁定 A）。
 
-    E040 无签章 / E041 自证 / E042 未通过 —— 任一命中即拒绝写入，
+    E040 无签章 / E041 自证 / E042 未通过 / E052 无凭据签章（self-reported
+    不落库，N176 兑现下游消费）—— 任一命中即拒绝写入，
     对齐 audit.py「缺能力返回 DEFER，绝不假装通过」。
     """
     node_id = getattr(compiled, "node_id", "") or ""
@@ -749,6 +781,18 @@ def link(compiled: CompileResult, attestation: Optional[AttestResult], *,
     if _dep_errs:
         out.errors.extend(_dep_errs)
         return out
+    # N176：兑现 verifier_identity 的下游消费——无令牌签章（验证方身份纯自报，
+    # E041 只拦同源变体，编造他名即可冒充编外复核）不构成 knowledge 层落库准入；
+    # dry-run 不拦，附 E052 预告供调用方提前换令牌验证方。fail-closed：字段缺失
+    # 或未知取值一律按无凭据处理。
+    if getattr(attestation, "verifier_identity", "") != "token":
+        if not apply:
+            out.warnings.append("E052 预告：签章为 self-reported（无令牌验签）"
+                                "——apply=true 将拒绝写入，请换令牌验证方复核")
+        else:
+            out.errors.append("E052 " + E_CODES["E052"]
+                              + "（verifier=" + attestation.verifier + "）")
+            return out
     if not apply:
         out.ok = True
         out.warnings.append("dry-run（apply=False）：未写入；签章 token=" + attestation.token)
@@ -782,6 +826,14 @@ def link(compiled: CompileResult, attestation: Optional[AttestResult], *,
     if compiled.lines.get("生效条件"):
         comment["生效条件"] = compiled.lines["生效条件"]
 
+    # N208（2026-09-28）：本面是**既有节点的覆写**（正文六行 + condition_space +
+    # state_attributes），原先直调 `_write_node` 零闸：与同层 `add` 待遇相反
+    # （层白名单不含该层的身份照样改得动），self/anchor/immutable 节点被无痕
+    # 覆写（无快照、无审计）。统一走 protect.guard_overwrite（层闸 + 保护闸，
+    # 与 N131 merge 面同序同错型）。
+    protect.guard_overwrite(_cg, node_id, layer=fm.get("layer"),
+                            sensitivity=fm.get("sensitivity"),
+                            actor=actor or compiled.actor)
     _cg._write_node(node_id, os.path.join(_cg.root, entry["path"]), fm,
                     new_content, durable=True)
     _append_jsonl(_log_path(_cg), {
@@ -828,6 +880,14 @@ def recalibrate(node_id: str, corrections: Dict[str, Any], verifier: str,
     if bad:
         out.errors.append("E043 " + E_CODES["E043"] + "（非法键 " + ",".join(bad) + "）")
         return out
+    # N208（2026-09-28）：四槽值是**单行契约**——换行会在合成出的
+    # `# 生效条件：…` 行里拆出一行伪造的独立正文行（`_upsert_ccg_line` 已拒，
+    # 这里在更早的入口给出结构化 E022，不留半改状态）。dry-run 同样拒：
+    # 「预演能过、apply 才炸」的口径分裂比早拒更坏。
+    lb = [k for k, v in corrections.items() if _has_line_break(v)]
+    if lb:
+        out.errors.append("E022 " + E_CODES["E022"] + "（槽 " + ",".join(lb) + "）")
+        return out
 
     _cg = _as_cg(cg)
     if _cg is None:
@@ -858,6 +918,11 @@ def recalibrate(node_id: str, corrections: Dict[str, Any], verifier: str,
 
     new_content = _upsert_ccg_line(content, "生效条件", new_text)
     fm["condition_space"] = new_cs
+    # N208（2026-09-28）：与 link 同款——本面也是**既有节点的覆写**，原先直调
+    # `_write_node` 零闸（层白名单不含该层的身份照样改得动 self/anchor 层与
+    # immutable 节点，且无快照无审计）。统一走 protect.guard_overwrite。
+    protect.guard_overwrite(_cg, out.node_id, layer=fm.get("layer"),
+                            sensitivity=fm.get("sensitivity"), actor=verifier)
     _cg._write_node(out.node_id, os.path.join(_cg.root, entry["path"]), fm,
                     new_content, durable=True)
     _append_jsonl(_log_path(_cg), {

@@ -12,6 +12,14 @@ import subprocess
 import sys
 import tempfile
 
+# 三档自治批次②（2026-10-02）**夹具隔离**：本守卫考的不是档位面（档位守卫 =
+# md_cg/test_autonomy_modes.py），故显式置 full 档——回到改动前「动作直落」的
+# 行为（本套的 forget/restore/review_decide 用例都假定软删真的发生），使断言
+# 意图逐条不变。子进程继承本进程 environ，故被拉起的 MCP server 同档。
+# env 键名从唯一真源表取（本文件不构成第二处字面量）。
+from md_cg import autonomy_modes as _autonomy_modes
+os.environ[_autonomy_modes.AUTONOMY_ENV_KEYS["mode"]] = "full"
+
 PASS = FAIL = 0
 FAILS = []
 
@@ -257,7 +265,18 @@ def main():
 
         # 11. 基元暴露面（kernel）：默认只暴露 cg / stg 两个认知基元
         print("\n【11】基元暴露面（kernel 默认）")
-        kc = McpClient(root, actor="kernel", extra_env={"MDCG_MCP_SURFACE": "kernel"})
+        # 迁移（issue #43，2026-09-29）：未设 MDCG_POLICY_FILE 时不再等于「无规则
+        # 可判」——修后回落到**包内默认** data/policy.json，下方「未验证的写入」
+        # 因此由 DEFER 变 REJECT。本断言考的是 **review_queue 通路**（非 ACCEPT/
+        # REJECT 出口）仍可达且不落盘，与策略来源无关，故显式给一份**空规则库**
+        # 保持原口径；「默认安装的真实行为（REJECT）」由
+        # md_cg/test_issue43_default_policy.py 钉住。
+        _empty_pol = os.path.join(root, "policy_empty.json")
+        with open(_empty_pol, "w", encoding="utf-8") as f:
+            json.dump({"forbidden": [], "required": []}, f)
+        kc = McpClient(root, actor="kernel",
+                       extra_env={"MDCG_MCP_SURFACE": "kernel",
+                                  "MDCG_POLICY_FILE": _empty_pol})
         try:
             kc.send("initialize", {"protocolVersion": "2024-11-05", "capabilities": {},
                                    "clientInfo": {"name": "k", "version": "0"}})

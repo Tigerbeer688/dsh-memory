@@ -32,8 +32,11 @@
     L1 反思    ：一次条件级冲突检测（自否定 / 纪律违反 / 条件互斥）→ 四态
     L2 递归反思：L1 未决 → 沿关系链递归找「区分条件」；受深度/节点数/循环/增益门槛约束
 
-冲突自动触发飞轮：verdict ∈ {REJECT, DEFER, BLINDSPOT} 且 auto_flywheel →
+冲突自动触发飞轮：verdict == REJECT（**真冲突**）且 auto_flywheel →
     `cg.flywheel_step({query, expected_state:"ACCEPT", actual_state:verdict, missing})`
+    （H11⑥ 2026-09-30：DEFER/BLINDSPOT 不再自动建单——DEFER 是「待确认」、
+    BLINDSPOT 是「检测前提不存在（无可比对节点，空库上恒成立）」，二者都不是
+    已判定的冲突；把待确认写成待办工单只是把误判固化。判定本身仍如实返回。）
 
 留痕 `_consistency.jsonl`（append-only）：每条判定可审计「为什么冲突 / 为什么放行」。
 
@@ -70,6 +73,10 @@ SAME_COND_HIGH = 0.75   # 同侧条件重合 → 判定「同一条件空间」
 # 实测结论槽（子功能）：同槽 1.0 / 同主语异属性 0.14 / 异主题 0.0 → 0.6 可分
 SLOT_HIGH = 0.6         # 结论槽（功能名/子功能）重合 → 判定「同一件事」
 # 实测：逐字重复 1.0 / 同槽不同值 0.61 / 同值异措辞 0.74 → 0.95 只排除逐字重复
+# H8（2026-09-30）：两侧先过同一套空白归一化（`_norm_ws`）再比；且去空白后逐字
+# 相同者直接短路为「重复」。阈值本身**不动**——纯空白差异（探针实测未归一化时
+# 0.9145~0.9436）曾把「同条件·同槽」压到 0.95 以下造成假冲突，修法是消除口径
+# 不对称，不是放宽 0.95（放宽到 0.9436 以下才能救，会一并吞掉真分歧）。
 CONCLUSION_SAME = 0.95  # 正文几乎逐字相同 → 属「重复」（该合并），不算冲突
 
 EMO_AVOID = 0.70     # 冲突强度 ≥ 此值 → avoiding
@@ -79,6 +86,12 @@ EMO_APPROACH = 0.30  # 冲突强度 ≤ 此值 → approaching
 DISCIPLINE_TAGS = ("discipline", "纪律", "work_discipline", "rule", "规则", "戒律")
 
 VERDICTS = ("ACCEPT", "REJECT", "DEFER", "BLINDSPOT")
+
+#: 自动建单（飞轮）**唯一**的触发态——只有真冲突才落 unresolved（H11⑥，2026-09-30）。
+#: 改前是 ("REJECT","DEFER","BLINDSPOT")：DEFER=「条件互斥/部分覆盖、待确认」、
+#: BLINDSPOT=「无节点可比对（检测前提不存在）」——都不是「已判定的冲突」。
+#: 单点：`check()` 与 `catalog()` 都读本元组。
+FLYWHEEL_TRIGGERS = ("REJECT",)
 
 
 # 生效条件：以 verdict 与 reason 构造异常（消息 `[{verdict}] {reason}`），conflicts 传假值（None/空容器等，源码 `conflicts or []`）时 self.conflicts 为 []，传真值时原样保留；
@@ -243,6 +256,37 @@ def _body_text(content):
     return "\n".join(out)
 
 
+# 生效条件：text 假值时按空串处理，返回把任意连续空白（半角/全角空格、\t、\r、\n）折叠为单个半角空格并去掉首尾空白后的字符串；纯空白文本返回空串 "";
+def _norm_ws(text):
+    """空白归一化（仓内既有惯用法 `" ".join(x.split())`，见 writelimit.py:233
+    与 tool_face.py:136）——结论比对**两侧必须同一套**。
+
+    为什么需要（H8）：结论文本是被 `expand_query_terms_weighted` 当作**一个整段
+    加权词**（`mdcg.py` 整句 `put(q, 1.0)`）+ 若干分词来比对的，而 `_term_degree`
+    对「非整段命中」只给子串回退分 `0.5·L/n`。两侧若只差空白（`\r\n`↔`\n`、尾部
+    多换行、行首缩进（半角/全角）、插空行、行尾空格、词间多空格），整段词就只能
+    拿到部分分，`conclusion_overlap` 掉到 0.95 以下 → 被误判成「同条件·同槽·取值
+    不同」（假冲突 + 假 unresolved 工单）。两侧先经同一归一化，纯空白差异不再进入
+    结论比对。
+    """
+    return " ".join((text or "").split())
+
+
+# 生效条件：text 假值时按空串处理，返回去掉全部空白字符（半角/全角空格、\t、\r、\n 等 str.split() 认可的空白）后的字符串；纯空白文本返回空串 "";
+def _nows(text):
+    """去掉**全部**空白——只用于「两侧差异是不是只在空白」的相等短路判定。
+
+    与 `_norm_ws` 的分工：`" ".join(x.split())` 只折叠空白，**词内插空白**
+    （「指数退避重连」↔「指数 退避重连」）归一化后仍非逐字相同（探针实测该情形
+    归一化覆盖率 0.9388 < 0.95，仍会判分歧）；去掉空白才判得出「差异只在空白」。
+
+    安全性：它只用于**相等**判定（相等 ⇒ 必判重复），不参与覆盖率计算，故不会
+    放宽「同槽不同值 / 同值异措辞」这两类真分歧——它们的差异不是空白，去空白后
+    仍不相等，照旧走 `conclusion_overlap < CONCLUSION_SAME` 的判据。
+    """
+    return "".join((text or "").split())
+
+
 # 生效条件：content 给出时（假值按空串）解析 CCG 的 `# 功能名` 与 `# 子功能` 字段并返回两者；
 def _slot_text(content):
     """结论槽：CCG 声明的 `# 功能名` / `# 子功能`（结构字段，非正文词面）。
@@ -382,7 +426,7 @@ def _recursive_reflect(cg, seeds, tw_pos, tw_neg, max_depth=MAX_DEPTH,
 # 主入口：三级决策
 # --------------------------------------------------------------------------
 
-# 生效条件：以 cg.index.nodes 为既有节点、content（假值按 ""）经 _new_terms 得 pos/neg 并算 tw_pos/tw_neg，按循环中 hard（自否定或纪律命中）→ divergences（同条件槽且 concl < CONCLUSION_SAME）→ strength ≥ CLASH_HIGH → strength ≥ CLASH_LOW → comparable==0 且 (pos or neg) → 否则 ACCEPT 的顺序定 verdict；DEFER 且 int(depth)>0 且 emo["bias"] != "approaching" 时调 _recursive_reflect 补 recursion，auto_flywheel 且 verdict∈{REJECT,DEFER,BLINDSPOT} 时加 unresolved_id，最后 log 并返回 rec；
+# 生效条件：以 cg.index.nodes 为既有节点、content（假值按 ""）经 _new_terms 得 pos/neg 并算 tw_pos/tw_neg（non_applicable_conditions 入参先按 mdcos._is_null_condition 剔除空值语义哨兵——⑧ 漏斗单点），按循环中 hard（自否定或纪律命中）→ divergences（同条件槽且 concl < CONCLUSION_SAME）→ strength ≥ CLASH_HIGH → strength ≥ CLASH_LOW → comparable==0 且 (pos or neg) → 否则 ACCEPT 的顺序定 verdict；DEFER 且 int(depth)>0 且 emo["bias"] != "approaching" 时调 _recursive_reflect 补 recursion，auto_flywheel 且 verdict == REJECT 时加 unresolved_id，最后 log 并返回 rec；
 def check(cg, content, layer=None, condition_space=None,
           non_applicable_conditions=None, tags=None, exclude=None,
           limit=MAX_SCAN, depth=MAX_DEPTH, auto_flywheel=False,
@@ -398,17 +442,35 @@ def check(cg, content, layer=None, condition_space=None,
       REJECT    硬冲突：自否定 / 违反纪律
       DEFER     条件互斥但可能可分辨（交给 L2 递归或飞轮）
       BLINDSPOT 有条件声明，但既有节点全无声明 → 无法建立比对路径（不假装确定）
+
+    non_applicable_conditions（⑧ 2026-09-30）：入参里的**空值语义哨兵**
+    （`["无"]` / `["（无）"]` / `[""]`…）在本函数的入口统一剔除——判据复用
+    `mdcos._is_null_condition`（仓内唯一哨兵表，**不新造第二张词表**）。
+    为何修在漏斗而不是各调用点：本函数是全部入口（`MdCG.add` 直连
+    `consistency.check`、`MdCGOS.check_consistency`、写链 `writepipe`）的
+    公共汇聚点，只改一处即可同口径；此前 mdcos 侧已在 `_ccg_field` 与
+    `check_consistency` 两处收口，而 `mdcg.add` 的直连绕过了它们——实测
+    `consistency.check(..., non_applicable_conditions=["无"])` 仍判
+    DEFER/strength=1.0 并建工单，同一内容不传该列表则 ACCEPT/0.0/无工单。
     """
     _ccg_field, _declared, _neg_hit, _cov = _prims()
     content = content or ""
+    # ⑧：哨兵剔除单点（延迟导入，避免 consistency ← mdcos 的模块级循环依赖）。
+    if non_applicable_conditions:
+        from .mdcos import _is_null_condition
+        non_applicable_conditions = [x for x in non_applicable_conditions
+                                     if not _is_null_condition(x)]
     pos, neg = _new_terms(content, condition_space, non_applicable_conditions)
     tw_pos = expand_query_terms_weighted(" ".join(pos)) if pos else {}
     tw_neg = expand_query_terms_weighted(" ".join(neg)) if neg else {}
     # 结论文本词权（结论比对专用）：**去 CCG 声明行**。模板行（`# 功能名` /
     # `# 子功能` 等）在两条节点间逐字相同，若混入会稀释结论覆盖率——实测
     # 逐字重复仅 0.32、同槽不同值 0.61，与异属性（0.62）不可分。去模板才可判。
-    tw_content = (expand_query_terms_weighted(_body_text(content))
-                  if content else {})
+    # H8：**两侧还要同一套空白归一化**（`_norm_ws`）——见 `_norm_ws` 说明；
+    # `n_body_tight` 是去全部空白的形态，只供 L1-c 的相等短路用。
+    n_body = _body_text(content)
+    tw_content = expand_query_terms_weighted(_norm_ws(n_body)) if n_body else {}
+    n_body_tight = _nows(n_body)
     # 结论槽（CCG 结构字段）——「是否同一件事」的代理，见 _slot_text 说明
     n_fn, n_sb = _slot_text(content)
 
@@ -431,7 +493,7 @@ def check(cg, content, layer=None, condition_space=None,
     # ---- L1-b 与既有节点的条件级比对（反题） ----
     nodes = ((getattr(cg, "index", None) or {}).get("nodes") or {})
     seeds = []
-    for nid, e in nodes.items():
+    for nid, e in list(nodes.items()):
         if exclude and nid == exclude:
             continue
         if layer and e.get("layer") != layer:
@@ -478,8 +540,17 @@ def check(cg, content, layer=None, condition_space=None,
                 _cov(expand_query_terms_weighted(n_sb), e_sb)
                 if (n_sb and e_sb) else 0.0)
             if slot >= SLOT_HIGH:
-                # 同口径比对（正文↔正文）；tw_content 已去模板行，见上文
-                concl = _cov(tw_content, _body_text(body)) if tw_content else 0.0
+                # 同口径比对（正文↔正文）：tw_content 已去模板行 + 两侧同一套
+                # 空白归一化（H8），见上文与 `_norm_ws` / `_nows` 说明。
+                e_body = _body_text(body)
+                if n_body_tight == _nows(e_body):
+                    # 差异只在空白（\r\n↔\n / 缩进 / 空行 / 行尾空格 / 词内插空白）
+                    # ⇒ 归一化后逐字相同，必判**重复**（该合并），不判分歧。
+                    # 这不是放宽真分歧判据：取值真不同者去空白后仍不相等。
+                    concl = 1.0
+                else:
+                    concl = (_cov(tw_content, _norm_ws(e_body))
+                             if tw_content else 0.0)
                 if concl < CONCLUSION_SAME:
                     divergences.append({
                         "type": "same_condition_divergence", "with": nid,
@@ -564,7 +635,13 @@ def check(cg, content, layer=None, condition_space=None,
            "actor": getattr(cg, "actor", "unknown")}
 
     # ---- 冲突自动触发飞轮（误差 → 补条件 → 结构更新） ----
-    if auto_flywheel and verdict in ("REJECT", "DEFER", "BLINDSPOT"):
+    # H11⑥（2026-09-30）：**只对真冲突（REJECT）建单**。改前是
+    # verdict ∈ {REJECT, DEFER, BLINDSPOT} 全建——DEFER 是「条件互斥/部分覆盖、
+    # 待确认」，BLINDSPOT 是「既有节点全无声明 ⇒ 检测前提不存在」（空库上恒
+    # 成立），两者都不是「已判定的冲突」；自动落 unresolved 等于把待确认与
+    # 无法比对写成待办工单，污染裁决队列（实测：哨兵形态误判出的 DEFER 直接
+    # 固化成工单 unr_9af4803381）。判定本身照旧返回，缺的只是「自动建单」。
+    if auto_flywheel and verdict in FLYWHEEL_TRIGGERS:
         rec["unresolved_id"] = _fire_flywheel(cg, query or content, verdict,
                                               reason, missing, allc)
     log(cg, rec)
@@ -694,6 +771,9 @@ def catalog():
                     "same_condition_divergence": "同侧比对（新正↔旧正 / 新负↔旧负）"
                                                  "＋ CCG 结论槽 = 同条件空间内的取值分歧（矛盾）",
                 },
+                "conclusion_normalization": "结论比对两侧同一套空白归一化"
+                                            "（' '.join(x.split())）+ 去空白后逐字"
+                                            "相同 ⇒ 必判重复（H8）",
                 "verdicts": list(VERDICTS),
                 "thresholds": {"high": CLASH_HIGH, "low": CLASH_LOW,
                                "same_condition": SAME_COND_HIGH, "slot": SLOT_HIGH,
@@ -710,7 +790,15 @@ def catalog():
         },
         "auto_flywheel": {
             "theory": "知识飞轮：误差 → 补条件 → 结构更新（智能论 :725）",
-            "triggers_on": ["REJECT", "DEFER", "BLINDSPOT"],
+            # H11⑥（2026-09-30）：建单只限**真冲突**（REJECT）。DEFER 是
+            # 「条件互斥/部分覆盖、待确认」，BLINDSPOT 是「检测前提不存在
+            # （无节点可与比对）」——两者都不是「已判定冲突」，自动落 unresolved
+            # 会把待确认项与无法比对项写成待办工单（且 BLINDSPOT 在空库上恒成立，
+            # 即每写第一条内容就建一张工单）。可复核的现场：本轮
+            # `consistency.check(..., non_applicable_conditions=["无"])` 实测
+            # DEFER/strength=1.0 → 建单 unr_9af4803381，而同一内容不传该列表
+            # 则 ACCEPT/0.0/无单——自动建单把「误判」直接固化成了待办。
+            "triggers_on": list(FLYWHEEL_TRIGGERS),
         },
         "discipline_detection": {"tags": list(DISCIPLINE_TAGS),
                                  "id_prefixes": ["discipline_", "work_discipline"]},

@@ -208,6 +208,20 @@ export class LingshuBridge {
     this.proc = proc
     this.rl = createInterface({ input: proc.stdout!, crlfDelay: Infinity })
 
+    // N119（v13 留档 deferred → 本轮落地）：stdin 在途冲刷失败必须有人接住。
+    // writeRaw 的大消息（超管道缓冲）会滞留在 Node 写缓冲区背压，此刻子进程
+    // 恰好死亡（崩溃 / kill / 换代 end()），滞留数据冲刷即以 'error' 事件发射
+    // （实测形态 'write EPIPE' / 'write EOF'）——无监听时按 uncaughtException
+    // 上抛，直接打崩 DSH 宿主进程。下方 writeRaw 的 writable 守卫只挡调用瞬间，
+    // 挡不住在途冲刷失败；本监听 spawn 时挂一次即覆盖 writeRaw 全部写与
+    // dispose/killStaleProc 的 end()。吞错后无需额外状态迁移：子进程死亡由
+    // 既有 exit 分支收尾（rejectAll + 状态迁移 + 重试/冷却），stdin 写失败仅
+    // 留痕日志与探针。
+    proc.stdin?.on('error', (err: Error) => {
+      console.error(`[lingshu-bridge] stdin 写入失败（子进程可能已退出）: ${err.message}`)
+      probe(`stdin error: ${String(err)}`)
+    })
+
     proc.stderr?.on('data', (chunk: Buffer) => {
       // stderr 透传日志（灵枢把日志写在 stderr，避免污染协议流）
       const text = chunk.toString('utf8').trim()
@@ -216,13 +230,22 @@ export class LingshuBridge {
 
     this.rl.on('line', (line: string) => {
       if (!line.trim()) return
-      let msg: Record<string, unknown>
+      // N219：parse 结果必须**校验类型**——JSON.parse 只挡「非 JSON」，
+      // 一行 `null`（崩溃残留 / 第三方写管道 / 新版打印）解析合法，随后读
+      // msg['id'] 即抛 TypeError；抛出点在事件回调内且无 try → 逃逸为进程级
+      // uncaughtException，宿主 DSH 进程整体死亡（每行都在监听、无需凭据）。
+      let parsed: unknown
       try {
-        msg = JSON.parse(line)
+        parsed = JSON.parse(line)
       } catch {
         console.error(`[lingshu-bridge] 非 JSON 输出: ${line.slice(0, 200)}`)
         return
       }
+      if (typeof parsed !== 'object' || parsed === null || Array.isArray(parsed)) {
+        console.error(`[lingshu-bridge] 非对象 JSON 输出: ${line.slice(0, 200)}`)
+        return
+      }
+      const msg = parsed as Record<string, unknown>
       if (typeof msg['id'] === 'number') {
         this.settle(msg['id'] as number, msg)
       }

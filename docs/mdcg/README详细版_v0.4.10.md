@@ -559,6 +559,94 @@ npm install && npm run build     # 构建插件本身（tsc → lib/）
 
 完整示例见 [`cordis.yml.example`](../../dsh/cordis.yml.example)。
 
+### ♻️ 升级后须重启长驻 MCP 进程（代校验 · `generation`）
+
+> **运维前提（一句话）**：**代码换代 ⇒ 重启常驻 MCP 进程**。本条不是「可选优化」，是使用前提。
+
+#### 根因（已定因，第 4 条条件层）
+
+灵枢的大脑（`md_cg`）以 **stdio 长驻进程**形态接入（`python -m md_cg.mcp_server`），而
+CPython 只在模块**首次导入**时读盘：此后进程一直用内存里的模块对象。与此同时，`md_cg`
+内有**大量写在函数体内的延迟导入**（AST 实测函数内跨模块相对导入 328 处；其中相当一部分
+是**为避开循环导入**才写在函数里的）。
+
+两者叠加 ⇒ **升级后跨代混用**：升级**前**已载入的模块停留在旧代，升级**后**才被惰性导入
+的模块是新代，同一个进程里两代并存。实测症状（0.6.1 发版轮）：
+
+```
+cg 写入返回 ImportError: cannot import name 'mint_auto_id' from 'md_cg.mdcg'
+```
+
+而此刻**盘面完全正常**——新解释器导入同一模块成功、`md_cg/mdcg.py` 里就是
+`def mint_auto_id(...)`。也就是说：**报错点（延迟导入被执行的那一刻）离根因（进程停在旧代）
+很远**，不重启的话重试多少次都一样。
+
+#### 自检：对运行中的 serve 调 `cg(op=info)`
+
+响应里以**纯增量**方式多出五个键（既有键名/键值/嵌套结构一字未动），字段表如下
+（真源＝`md_cg/generation.py` 的 `generation.report()`）：
+
+| 键 | 类型 | 含义 |
+|---|---|---|
+| `code_generation` | string | 本进程**启动那一刻**的代码指纹前 12 位（＝进程实际持有的那一代） |
+| `disk_generation` | string \| null | **此刻盘面**上代码的指纹前 12 位；盘面读不到时为 `null` |
+| `stale_on_disk` | bool | 两者不同 ⇒ 磁盘代码已换代（`true`） |
+| `restart_required` | bool | 是否需要重启本进程（与 `stale_on_disk` 同真值） |
+| `hint` | string | 中文一句话处置指引（`stale_on_disk` 为真时给出「重启常驻 MCP 进程」） |
+
+判读：`stale_on_disk: true` 即「**这个进程停在旧代上**，盘面已经是新代」——重启即可。
+
+**指纹口径**（`generation.fingerprint()`）：对 `md_cg/**/*.py`（跳过 `__pycache__` 与
+`test_*.py`）按**排序后的（相对路径, 文件字节）**算 sha256，取十六进制串。用**内容哈希**
+而不是 `mtime`/`size`：打包 / 解压 / 校验回写造成的「无改动重写」会变 mtime 而不变内容，
+用 mtime 会**假报换代**、把使用者引向无谓的重启。开销（本机实测）：指纹实际只读
+**197 个非 `test_` 的 `.py`，约 10ms/次**；即使对全量 418 个 `.py` / 约 11.7 MB 做同类
+内容哈希也只需约 17ms——因此可以挂在每次 `op=info` 上。
+
+#### 启动闸：延迟导入自检（`verify_delegations()`）
+
+服务**真正开始服务之前**（`md_cg/mcp_server.py::main()` 内，非模块顶层——顶层调用会与
+函数内延迟导入的避环设计冲突），对盘面上每个「函数内相对导入」逐项做「**导入目标模块 →
+取名字**」（`importlib.import_module` 对已加载模块直接返回内存实例，所以查的是**本进程实际
+持有的那个模块**）。判定三分：
+
+| 形态 | 判定 | 处置 |
+|---|---|---|
+| 目标模块可导入、但**没有这个名字** | **致命** | 抛 `GenerationError`：拒绝启动（非零退出），stderr 点名**目标子模块 + 名字 + 引用处** |
+| 名字是**包内子模块名**而该子模块不在盘面 | 非致命 | 记入 `unavailable`（`whitebox_kb/aeis_core` 的「身体/世界模型」面就属此类：其 docstring 明写「不带走…缺失即自动降级」） |
+| **目标模块本身**不在盘面 / 导入失败 | 非致命 | 记入 `unavailable`（外部可选模块未装） |
+
+启动 stderr 会打一行读数：`代校验：延迟导入 N 项 / 目标模块 M 个 / 已解析 K 项 / 可选缺失 J 项 · 代 <12位>`。
+于是「半升级」（引用方已是新代、被引用模块还是旧代或缺文件）会在**启动期**就暴露，而不是等到
+某次写入才以 `ImportError` 的面目炸出来。注意这条自检**只查名字存在性**：不执行被导入者、
+不校验签名与行为，也不覆盖 `import x.y` 绝对导入与 `importlib.import_module("…")` 字符串形态。
+
+#### 处置
+
+**重启常驻 MCP 进程即可，记忆数据无损**：
+
+- DSH 侧：重启 DSH（或刷新 Web UI，让插件重拉大脑子进程）；
+- 其它宿主（CodeBuddy / ZCode / Codex CLI / Claude Code 等）：重连该 MCP server。
+
+盘面真源（认知图 md）一个字都没动——重启只是让进程**重新只读一代代码**。**不做热重载**：
+热重载会与函数内延迟导入的避环设计冲突，还会把已加载模块的类身份打散。
+
+#### 守卫（改这条链路必须跑）
+
+```bash
+python -X utf8 -m md_cg.test_generation_guard      # 退出码 0 ＝ 全绿
+```
+
+五项：①对当前树（逐字节临时副本）`verify_delegations()` 全绿并打印委托项数/目标模块数；
+②定点变异（临时副本里把 `mdcg.py` 的 `mint_auto_id` 定义改名）必须抛 `GenerationError`
+且消息逐字点名 `md_cg.mdcg` + `mint_auto_id`；③改一个源文件后 `is_stale()` 必须为
+`True`、恢复后必须为 `False`；④AST 断言 `generation.verify_delegations(` 的调用不在
+`mcp_server.py` 模块顶层；⑤`cg(op=info)` 键集对拍（五个新键齐备、既有 18 键一字未动）。
+守卫全程在 `tempfile.mkdtemp()` 临时目录内进行，不写工作区、不碰在役记忆库。
+
+**不适用条件**：本代校验不回答「哪一代更正确」（只回答盘面与进程是否同代，跨代一律重启）；
+不构成「所有延迟导入都能跑通」的完备证明；同一进程内改盘不会自动重载——这正是要重启的原因。
+
 ## 配置项
 
 | 字段 | 类型 | 默认值 | 说明 |
@@ -598,6 +686,12 @@ npm install && npm run build     # 构建插件本身（tsc → lib/）
 
 - `user/message`（仅 `source.kind === 'user'` 的真实用户消息）→ `MdcgClient.remember()`（`mdcg_remember(gated=true)`，importance 0.6，落层 contextual，tags `dsh`）
 - 插件注入的系统上下文（AGENTS.md、文件变更通知等 `kind: 'plugin'`）**不写入**，防止记忆噪音
+- **来源判定：子代理委派不写成本人记忆**（H1，2026-09-30）——两条判据，**都是「字段在场且取值匹配才拦」**：
+  - **会话级**（`SessionHeader`）：`origin === 'subagent'` 或 `delegationDepth > 0` ⇒ 该**子会话整条**的自动记忆都拦掉（不写、也不发起语义召回）。拦点取在会话事件回调的**最前面**，因此子代理会话也不会刷掉 `lastSession`（否则顶层会话的自动召回会拿子代理的会话去读）。
+  - **消息级**（`MessageSourceMap`）：`source.form === 'relay'`（DSH 类型面注释原文「A message another agent addressed to this one」）⇒ 该条不写，判据先于既有的 `kind !== 'user'`（不把委派判定押在 `source.kind` 单点上——若委派指令以子会话首轮提示形态进入，其 `source.kind` 就是 `'user'`，与真人输入不可分，只有会话级判据能拦）。
+  - **默认行为（显式声明）**：判据命中时**默认拦**（委派指令不是用户的长期记忆）；**字段缺失时默认放行**（不做半吊子猜测，宁可多记，不可因宿主字段缺失而静默丢真人记忆）——`header` 缺失 / 非对象、`delegationDepth` 不是数字或 ≤0、`origin` 是别的值、`source` 无 `form`，一律不拦且不报错。字段来源只在 DSH 类型面成立：`@deepseek-ai/dsh-session` 的 `types.d.ts`（`origin` / `delegationDepth`）与 `@deepseek-ai/dsh-llm` 的 `message.d.ts`（`ContextForm` 的 `'relay'`）。
+  - ⚠️ **未验证项（如实标注，勿读成「已验证委派会被拦住」）**：本机未装 DSH harness，**真实宿主是否真给子代理子会话写 `origin` / `delegationDepth`**、**委派消息是否真带 `form: 'relay'`** 这两点**只在类型面成立、未在真实会话事件上观测过**。守卫证明的是「判据在场即拦、缺失即不拦」这一可机械判定的性质（`test/h1-source-filter.test.ts`），不是真实委派行为已被观测。
+  - **已知仍可能漏的形态**（不扩大判据范围，如实记录）：若宿主既不写 `origin` / `delegationDepth`、也不给委派消息标 `form: 'relay'`，而委派指令以子会话**首轮用户提示**进入，则该条在消息面上与真人输入不可分、会话面上也没有信号 ⇒ **当前判据拦不住**（只能等宿主补齐字段）。
 - **去重 / 遗忘由 md_cg 主动遗忘闸门负责**（`mdcg_remember(gated=true)` → `MdCG.remember_gated`）：三问 → 四态 ACCEPT 落盘 / MERGE 并入既有（= 去重强化，不新增节点）/ DROP 低熵 / DEFER 待定，四种结果都写 `_forgetting.jsonl` 可审计
 - **写入通道为何走 `mdcg_remember` 而非 `cg(op=write)`**：`cg(op=write)` 先过 `audit.audit(content_kind)` —— 未声明 `content_kind`（且未配置 `MDCG_POLICY_FILE`）时恒判 BLINDSPOT/DEFER，**只进审核队列、永不落盘**；即便声明了 `content_kind`，还要再过一致性检查与 `gated` 三问四态。**落盘的充要条件是最终判定 ACCEPT**（MERGE 并入既有、DROP/DEFER/REJECT 均不新增落盘点）。插件自动记忆选 `mdcg_remember(gated=true)`，即绕开 `cg(op=write)` 的 audit 前置门、直接进入三问四态。详见「本轮修复与验证 ②」
 - **记忆以 md 文档落盘**（`mdcg.root`，默认用户级 `~/.dsh/.dsh-memory/data/mdcg`；旧版包内 `data/mdcg` 由首启一次性**复制**接手，见 `src/lib/datapath.ts` 的 `migrateLegacyData()`）；⚠️ **写权限默认关闭**——不配凭据时以只读 guest 运行：读 / 召回 / 时间线照常，写入不落盘（插件启动会告警）。打开方式见配置表 `env.MDCG_TOKEN`
@@ -606,6 +700,12 @@ npm install && npm run build     # 构建插件本身（tsc → lib/）
   - **快照去重语义（改注入方式前必读）**：注入块落在 `assembly.contexts` 里，宿主会把它渲染成一段「运行时上下文快照」，并**按渲染后的整段文本去重**——文本与上一份已提交的快照相同则不提交任何东西，不同才在会话里 `append` 一条 `user/message`（append 语义，旧快照不会被替换或移除）。
   - 因此本插件**每步都照旧 push**，内容没变也不跳过：跳过会让渲染文本在「有块 / 无块」之间跳变，反而每步各追加一份（实测 ~250 tok/份），长会话里每请求 `inject` 会随步数线性涨到 30k+ tok。
   - 压缩归档后的自愈交给宿主：宿主检测到上一份快照已被替换掉（`retained` 置空）时会重新投影当前快照，注入块自然跟着回来——不需要插件自己数步数做强制刷新。
+  - **读侧会话过滤值与写侧同尺**（H2，2026-09-30）：自动召回传给 `stg(op=timeline, session=…)` 的会话值，会先过**与写侧同一个** `_normalize_session`（单点消费：`md_cg/stg.py::_view_session`，真源仍是 `md_cg/mcp_server.py::_normalize_session`，**不重写实现**）——写侧落盘时已把 DSH 形态的会话 id 归一（`session-<uuid4>` 在会话根下**不存在**时落 `anonymous`；根不可读则 fail-soft 保原值），读侧若拿**未归一的原值**做等值比较，就会出现「同一条记忆写进去查不出」（实测 `stg(op=timeline, session=<原值>)` 恒 `count=0`，换 `session='anonymous'` 才命中）。修复只作用于「具体会话值」这一态：缺省 / `""` / `"*"` 三态语义逐位不变（跨会话视图），返回体的 `session` 回带**归一后**的生效值。守卫与端到端断言：`md_cg/test_h2_session_view_norm.py`（`python -m md_cg.test_h2_session_view_norm`）。
+  - ⚠️ **不属于本项的错位面**：`cg` 侧读路径（`search` / `recall` / `cg(op=read)`）的请求 `session` 走身份判定（issue #35 定稿「身份不可自报」，`MdCGSecure._candidates` 传 `session=None`），**不经** `_view_session`——两者不是同一个过滤，不得互相「对齐」（对齐即等于开一条按请求 session 读 private 的越权通道）。
+  - ⚠️ **残余边界（如实标注）**：部署侧用 `MDCG_SESSION` / `DSH_SESSION_ID` 把会话固定在进程 env 时，**写侧归属由 env 决定**、请求声明被否决（既有「来源优先级」语义，见 `_declared_session`），此时插件若仍拿宿主会话 id 去读本会话视图，归一后是 `anonymous` 而落盘是 env 值 ⇒ 该形态下仍读不到本会话写入；此类部署的本会话视图应传 env 会话 id（或不传，走跨会话视图）。这一条是既有「来源优先级」语义的推论，**不在本次修复范围**。
+  - **插件侧两处会话槽收口**（H2③，2026-09-30）：
+    - 宿主**未给会话标识**时，写入不再是「留空」——留空会让 md_cg 的 `Principal.__init__` 生成**进程级随机** `sess_*` 兜底桶（`md_cg/security.py:117`）：一个进程内所有无标识会话共用一桶、跨进程对不上、审计上不可辨认。改为**显式 `unassigned`** 常量：跨进程一致、可辨认、可审计，且不是伪造的宿主会话 id（非 DSH 形态，`_normalize_session` 原样采用）。要读这个桶：`stg(op=timeline, session="unassigned")`。
+    - T4 的语义召回**显式带会话槽**：调用形态由 `recall(q, 3)` 改为等价的 `read(q, {k: 3, session})`（同一条 MCP 出口 `cg(op=read)`，见 `src/lib/mdcg_client.ts` 的 recall → read）。此前不传 session，靠服务端「cg 读路径丢弃请求 session」侥幸不串台；一旦读侧归一化在召回链路上生效，不传就等价于**跨会话（全库）召回**。带上它不构成越权：cg 读路径的 session 是归因/视图维度，不参与任何授权（issue #35 定稿）。守卫：`test/h1-source-filter.test.ts` 的 E1/E2 与 `test/session-attribution.test.ts` ①②。
 
 ## 🛟 DSH 看门狗（scripts/）
 

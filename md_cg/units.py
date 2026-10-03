@@ -19,7 +19,15 @@ crosscheck 同款 verdicts 通道回填）。理由：使用者的复核是昂�
                   （同 hive/serve_start.serve_alive；四路口径由
                    hive/test_serve_entry.py 机械守卫）
     job 目录    = jobs/<job_id>/{spec.json,status.json,result.json,kill}
-    job_id      = h<java_ms>_<uuid6>                             （同 _submit）
+    job_id      = 本模块自造旧形态 h<java_ms>_<uuid6>（`_job_id`，**不是** `_submit` 同款）；
+                  hive 提交面自 id 契约 v2（B8）起为四槽 h_<身份>_<任务>_<单元>_<编号>，由
+                  Rust 侧 `hive alloc-id` 分配——两形态都过 job.rs::valid_job_id（存量零迁移）
+    id 字符判据 = **区块白名单**：唯一真源 hive/id_charset_blocks.txt 的区间并集
+                  （[`_valid_job_id`]；本模块**读这份数据文件**、不 import hive，
+                  与 job.rs / mcp_server.py 三处共读同一份 ⇒ 不查任何 Unicode 属性库，
+                  两侧版本差结构性不可能）。本闸**有意保留**两处放宽（既有对外契约）：
+                  不要求 h 前缀、允许 `-`；拒收面（零宽/双向控制/控制字符/路径成分/尾点/
+                  首尾空白/Windows 保留设备名）逐条显式断，不靠「白名单外顺带拒」。
     result.json = {"ok":true,"content":...} | {"ok":false,"error":...}
     终态        = done | error | timeout | killed
     拉起 serve  = <repo>/hive/target/release/hive serve --jobs <jobs>（detached）
@@ -269,8 +277,187 @@ def plan(jobs: str = "", model: str = "", fresh_s: float = FRESH_S,
 
 # 生效条件：无入参，恒返回 "h"+int(time.time()*1000)+"_"+uuid.uuid4().hex 前 6 位组成的字符串。
 def _job_id() -> str:
-    """同 _submit：serve 侧按 'h' 前缀识别任务目录。"""
+    """本地 id 生成（旧形态 `h<毫秒>_<uuid 前 6 位>`）：serve 侧按 'h' 前缀识别任务目录。
+
+    诚实边界（id 契约 v2 · C2 同类措辞订正）：**本函数已不是 `_submit` 的同款实现**
+    ——`hive/hive_mcp/mcp_server.py::_submit` 自 B8 起调 Rust 侧 `hive alloc-id` 分配
+    `h_<身份>_<任务>_<单元>_<编号>`，**不再自造 id**；本模块是 md_cg 的复核派发面，
+    **不在 B8 点名的改动面**（契约只列 CLI / MCP 提交面 / orch 透传），故保留旧形态。
+    旧形态 id 在新契约下**仍然合法**（存量零迁移：`job.rs::valid_job_id` 收），故此处
+    不闯闸、不破坏 serve 领取；但它绕过了分配器的独占创建与五单元闭集 ⇒ 与「分配器
+    唯一实现在 Rust 侧」（契约 §五 裁决 3）不齐，宜单独裁决（牵动 md_cg 派发/等待链
+    语义与其守卫 `md_cg/test_units_poll.py`，不在本批「只论证订正」的范围内）。
+    """
     return "h%d_%s" % (int(time.time() * 1000), uuid.uuid4().hex[:6])
+
+
+# ------------------------------------------------ id 字符判据（区块白名单 · 唯一真源）
+
+#: 区块表数据文件（**唯一真源**，与 `hive/src/job.rs` / `hive/hive_mcp/mcp_server.py`
+#: **共读同一份数据**；本模块**读数据文件**而不是 import hive ⇒ 不破零依赖家法）。
+_CHARSET_BLOCKS_REL = "hive/id_charset_blocks.txt"
+_MAX_CP = 0x10FFFF
+
+
+# 生效条件：text 为表文件全文时返回区间列表 [(起, 止)]——**唯一解析配方**（与 Rust
+# `job.rs::parse_id_charset_blocks`、`mcp_server._parse_charset_blocks` 同一条，不许各写
+# 一套）：每行取 `#` 之前部分后 strip；空行跳过；余下 split('-') 两段 int(x, 16)。
+# 任一行不合形态 / 越界 / 逆序 / 未归并到最小 / 空表 → 抛 ValueError（fail-closed：
+# 绝不静默跳过坏行——跳过一行的表是另一张表，三处读者随即不同判）。
+def _parse_charset_blocks(text: str) -> list:
+    """区块表解析（唯一配方）。"""
+    out: list = []
+    for lineno, line in enumerate(text.split("\n"), 1):
+        body = line.split("#", 1)[0].strip()
+        if not body:
+            continue
+        parts = body.split("-")
+        if len(parts) != 2:
+            raise ValueError("区块表第 %d 行不是 LO-HI 形态：%r" % (lineno, line))
+        lo, hi = int(parts[0], 16), int(parts[1], 16)
+        if not (0 <= lo <= hi <= _MAX_CP):
+            raise ValueError("区块表第 %d 行区间非法：%r" % (lineno, line))
+        if out and lo <= out[-1][1] + 1:
+            raise ValueError("区块表第 %d 行未归并到最小（相邻/相交/乱序）：%r"
+                             % (lineno, line))
+        out.append((lo, hi))
+    if not out:
+        raise ValueError("区块表解析出空区间集（fail-closed：空表绝不放行）")
+    return out
+
+
+# 生效条件：无入参，返回 (区间表, 错误说明)——文件可读且解析通过 → (tuple 区间表, None)；
+# 表缺失 / 不可读 / 解析失败 → ((), 原因)。后两者让判据 fail-closed（对一切字符 False）。
+def _load_charset_blocks() -> tuple:
+    """**模块导入时读一次**（不做每调用 I/O）；路径基准 = 本文件上溯两级（= 仓根）。"""
+    path = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+                        "hive", "id_charset_blocks.txt")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return (), "%s 不可读：%s" % (_CHARSET_BLOCKS_REL, exc)
+    try:
+        return tuple(_parse_charset_blocks(text)), None
+    except ValueError as exc:
+        return (), "%s 解析失败：%s" % (_CHARSET_BLOCKS_REL, exc)
+
+
+#: 判据数据（模块导入时求值一次）：区间表 + 读取/解析错误（错误非 None ⇒ 判据一律 False）。
+CHARSET_BLOCKS, CHARSET_BLOCKS_ERROR = _load_charset_blocks()
+
+
+# 生效条件：c 为单字符且其码点落在区间表内 → True；表缺失 / 坏行 / 空表 → False
+# （fail-closed：绝不放行）。
+def _charset_member(c: str) -> bool:
+    u = ord(c)
+    return any(lo <= u <= hi for lo, hi in CHARSET_BLOCKS)
+
+
+# Windows 保留设备名（B4 拒收项；与 `job.rs::RESERVED_DEVICE_NAMES`、
+# `mcp_server.RESERVED_DEVICE_NAMES` 逐项同集——md_cg 只复制这 22 个常量，**还是读数据
+# 而不是 import hive**）。Win32 对**单个路径分量**做设备名解析且**忽略扩展名**
+# （`CON.txt` 与 `CON` 同指设备），故比对的是「首个 `.` 之前」部分；比对**ASCII 大小写
+# 不敏感**（不用 str.upper()：它的 Unicode 折叠面比 Rust 的 eq_ignore_ascii_case 宽，
+# 会让两侧分叉）。
+RESERVED_DEVICE_NAMES = (
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
+    "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9",
+)
+_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz",
+                             "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+# 生效条件：s 的「首个 `.` 之前」部分与任一保留设备名 **ASCII 大小写不敏感**相等 → True
+# （含 `CON.txt` 这类带扩展名形态）——与 rust `job::is_reserved_device_name` 同判。
+def _is_reserved_device_name(s: str) -> bool:
+    base = s.split(".")[0].translate(_ASCII_UPPER)
+    return base in RESERVED_DEVICE_NAMES
+
+
+# 生效条件：jid 为 str、长度 1..128、strip() 前后无差异（首尾无空白）、首尾字符都不是
+# "."（拒 "."/".."/"..." 与 Win32 会剥尾点的 "abc." 形态）、逐字符过显式拒收集合后落在
+# **区块白名单**（[`_charset_member`]，唯一真源 `hive/id_charset_blocks.txt`，与 hive 两侧
+# 共读同一份数据）或属结构字符 `_` `-` `.`，且整 id 与其按 `_` 分段的任一段都不是
+# Windows 保留设备名、且按 `_` 分段的**任一段都不等于** `.` 或 `..`（c7 段级）时返回 True，
+# 否则 False。
+def _valid_job_id(jid) -> bool:
+    r"""job_id 结构闸（N178，2026-09-28；2026-09-30 字符集判据换面为**区块白名单**）。
+
+    同族家法：`hive/hive_mcp/mcp_server.py::_valid_job_id`、
+    `hive/src/job.rs::valid_job_id`（三处**共读同一份区块表**，不是三套常量）。
+    本闸**保留**的既有放宽（都是既有对外契约，**不得**为「同口径」收紧）：
+      · **不要求 "h" 前缀**——`md_cg/test_units_poll.py` 的 "j_empty"/"j_good"/
+        "j_fail" 是本模块对外契约（poll 面向任意宿主派发器写出的 job 目录），前缀
+        收紧会误杀；
+      · 允许 `-`（hive 侧拒它：不在区块表内、也不是它的结构字符）；
+      · 长度上限 128、首尾无空白、首尾非点（拒 "."/".."/"..." 与 "x." 尾点形态）
+        一并保留。
+    非 str 一律拒（**不** str() 归一：与 legacy P3 同纪律，未校验的强制转换会把对象
+    形态洗成合法路径成分）。
+    字符类判据 = **区块白名单**（与 hive 两侧同源）——白名单外的一切字符一律拒。
+    放宽带来的静默风险**逐条显式挡住**（c9：「isalpha」类判据下 Cf/Cc 天然不入，但
+    **不能靠这个**）：零宽 U+200B..U+200F/U+2060/U+FEFF、双向控制
+    U+202A..U+202E/U+2066..U+2069、控制字符（C0/DEL/C1）**逐条显式判**；`/` `\` `:`
+    与 NUL 同样显式拒（路径成分：相对父段 "../outside"、分隔符、盘符/ADS、绝对路径
+    会被 os.path.join 吸附）；Windows 保留设备名（CON/PRN/AUX/NUL/COM1..9/LPT1..9，
+    含 `CON.txt` 带扩展名形态与 ASCII 大小写变体）**整 id 与按 `_` 分段的任一段**逐名
+    显式拒——旧 ASCII 白名单下 `CON` 这类全字母 id 是**放行**的，故这是本闸换面时
+    **收紧**的那一面（与 hive 两侧同集同判，语料 80-84 行逐例钉死）。
+    表缺失 / 坏表 ⇒ 判据一律 False（fail-closed，绝不放行）。
+    本闸本批**新增收紧**（c7，2026-09-30）：按 `_` 分段的**任一段**等于 `.` 或 `..` 即拒
+    ——整串口径下 `h_.._x` / `h_a_.._b` 是被收的；段级是面向重构的纵深加固（段可能被当
+    父目录段用），与 hive 两侧同判。范围只加这一条：空段（`h__x`）等形态不动。
+    """
+    if not isinstance(jid, str) or not jid or len(jid) > 128:
+        return False
+    if jid != jid.strip():
+        return False
+    if jid[0] == "." or jid[-1] == ".":
+        return False
+    for c in jid:
+        u = ord(c)
+        if u <= 0x1F or 0x7F <= u <= 0x9F or c in "/\\:":
+            return False      # 控制字符（C0/DEL/C1，含 NUL）与路径成分（显式判，c9）
+        if "\u200b" <= c <= "\u200f" or c in ("\u2060", "\ufeff"):
+            return False      # 零宽/不可见注入载体（显式判，c9）
+        if "\u202a" <= c <= "\u202e" or "\u2066" <= c <= "\u2069":
+            return False      # 双向控制（显式判，c9）
+        if c in "_.-":
+            continue          # 结构字符：槽分隔符 / 点（首尾点已在上方拒）/ 既有放宽的 `-`
+        if not _charset_member(c):
+            return False
+    # Windows 保留设备名（显式判，c7/c9）：整 id（首个 `.` 之前部分，Win32 忽略扩展名）
+    # 与按 `_` 分段的**任一段**（Win32 的设备名解析是按路径分量做的）——与
+    # `job.rs::valid_job_id` / `mcp_server._job_id_reject_reason` 同集同判。
+    if _is_reserved_device_name(jid):
+        return False
+    if any(_is_reserved_device_name(seg) for seg in jid.split("_")):
+        return False
+    # 「. / ..」的**段级**判据（c7，2026-09-30 加固）：按 `_` 分段，任一段等于 `.` 或 `..`
+    # 即拒——与 `job.rs::valid_job_id` / `mcp_server._job_id_reject_reason` **三处同判**。
+    # 段级而非整串（本面原有的「首尾非点」只挡整串与尾点形态）：id 的段可能被宿主当
+    # **目录名**或**父目录段**用（契约 §四.4「目录可作它的父段」）。现场定性：`h_.._x` /
+    # `h_a_.._b` 这类「含 `..` 段但不以点结尾」的 id 拼出的路径停在池内、不构成穿越 ⇒
+    # 面向重构的纵深加固。范围**只加这一条**：不拒空段（`h__x`）等未被裁定的形态。
+    if any(seg in (".", "..") for seg in jid.split("_")):
+        return False
+    return True
+
+
+# 生效条件：无入参，返回 job_id 非法的结构化拒绝 dict（ok=False、state="invalid_job_id"、terminal=False、job_dir/content/status 均为 None、error 含非法 id 与本闸口径），字段集与 poll 的返回同构。
+def _bad_job_id(job_id, *, where: str) -> dict:
+    """非法 job_id 的统一拒答（poll/wait/submit 同构，便于调用方机械判别）。"""
+    return {"job_id": job_id, "job_dir": None, "state": "invalid_job_id",
+            "terminal": False, "ok": False, "content": None, "status": None,
+            "error": ("job_id 非法：%r（%s）——job_id 须为**单个路径分量**：区块白名单"
+                      "（hive/id_charset_blocks.txt）内的字母/数字，或结构字符 `_` `-` `.`；"
+                      "首尾非点，不含 / \\ : 与控制/零宽/双向控制字符/NUL，"
+                      "且整 id 与按 `_` 分段的任一段都不得是 Windows 保留设备名"
+                      "（CON/PRN/AUX/NUL/COM1..9/LPT1..9，含 CON.txt 形态）"
+                      "（N178：拒 ../victim 型越池读 result.json、"
+                      "拒任意目录建目录写 spec.json）" % (job_id, where))}
 
 
 # 生效条件：cg.root 与 cg.cg.root 都取不到真值时不写、直接返回 None；取到 root 时向 root/LOG_NAME 追加一行 rec（副本，setdefault ts）的 JSON，写入抛 OSError 时被吞掉静默返回 None。
@@ -288,7 +475,7 @@ def _log(cg, rec: dict) -> None:
         pass
 
 
-# 生效条件：role 不在 ROLES 时返回 ok=False 的未知角色 error；否则 model_name(model) 为空时返回 ok=False 的未配置复核模型；否则 str(prompt or "").strip() 为空时返回 ok=False 的 prompt 为空；否则在 jobs_dir(jobs)/_job_id() 下写 spec.json 与 status.json（context_files 为真、temperature 非 None、extra 为真时才并入 spec），OSError 时返回 ok=False 的写入失败，全部成功返回 ok=True 与 job_id/job_dir/spec/model。
+# 生效条件：role 不在 ROLES 时返回 ok=False 的未知角色 error；否则 model_name(model) 为空时返回 ok=False 的未配置复核模型；否则 str(prompt or "").strip() 为空时返回 ok=False 的 prompt 为空；否则落盘前先过 _valid_job_id 结构闸（未过返回 ok=False 的 job_id 非法，**不建目录不写文件**——N178：job_id 来源一旦不是 _job_id()，join 后就是「任意目录 + 生成名」的建目录/写文件原语）；闸过则在 jobs_dir(jobs)/job_id 下写 spec.json 与 status.json（context_files 为真、temperature 非 None、extra 为真时才并入 spec），OSError 时返回 ok=False 的写入失败，全部成功返回 ok=True 与 job_id/job_dir/spec/model。
 def submit(*, prompt: str, role: str = REFLECT, model: str = "", system_prompt: str = "",
            context_files=None, timeout_s: int = DEFAULT_TIMEOUT_S,
            max_tokens: int = DEFAULT_MAX_TOKENS, temperature=None, jobs: str = "",
@@ -302,6 +489,10 @@ def submit(*, prompt: str, role: str = REFLECT, model: str = "", system_prompt: 
     if not str(prompt or "").strip():
         return {"ok": False, "error": "prompt 为空"}
     jd, job_id = jobs_dir(jobs), _job_id()
+    # N178（2026-09-28）：**落盘前**过闸——makedirs 之后再过就等于已经建了目录。
+    if not _valid_job_id(job_id):
+        return {"ok": False, "job_dir": None, "job_id": job_id,
+                "error": _bad_job_id(job_id, where="submit 落点")["error"]}
     d = os.path.join(jd, job_id)
     spec = {"model": mdl, "user_prompt": str(prompt), "system_prompt": str(system_prompt or ""),
             "timeout_s": int(timeout_s), "max_tokens": int(max_tokens),
@@ -330,10 +521,14 @@ def submit(*, prompt: str, role: str = REFLECT, model: str = "", system_prompt: 
             "unit_role": role, "model": mdl}
 
 
-# 生效条件：jobs_dir(jobs)/str(job_id or "") 不是目录时返回 state=missing、terminal=False 的目录不存在 error；是目录时读 STATUS_FILE（读失败则 status 置 None）并用其 state 覆盖 state/terminal（state 属 TERMINAL_STATES 才 terminal=True）；RESULT_FILE 被 isfile 命中则 terminal=True、state=st or "done"，解析抛 OSError/ValueError 时提前返回该 error；解析为 dict 时取 ok/content/error/usage/model，且 ok 为真而 content 去空白为空时把 ok 改 False 并写空正文 error，解析为非 dict 时 ok=True 且 content 为原值。
+# 生效条件：job_id 先过 _valid_job_id 结构闸（未过返回 state="invalid_job_id" 的结构化拒绝，**不触盘**——N178：修前 "../victim" 会被 join 成池外目录并读出其 result.json 全文）；闸过时 jobs_dir(jobs)/job_id 不是目录返回 state=missing、terminal=False 的目录不存在 error；是目录时读 STATUS_FILE（读失败则 status 置 None）并用其 state 覆盖 state/terminal（state 属 TERMINAL_STATES 才 terminal=True）；RESULT_FILE 被 isfile 命中则 terminal=True、state=st or "done"，解析抛 OSError/ValueError 时提前返回该 error；解析为 dict 时取 ok/content/error/usage/model，且 ok 为真而 content 去空白为空时把 ok 改 False 并写空正文 error，解析为非 dict 时 ok=True 且 content 为原值。
 def poll(job_id: str, jobs: str = "") -> dict:
     """读 job 终态视图：**以 result.json 出现为终态主判据**，status.json 仅作辅助。"""
-    d = os.path.join(jobs_dir(jobs), str(job_id or ""))
+    # N178（2026-09-28）：调用方给的 job_id 是路径成分，**先过闸再 join**。
+    # 修前此处无闸，且 `str(job_id or "")` 还会把非 str 洗成合法成分。
+    if not _valid_job_id(job_id):
+        return _bad_job_id(job_id, where="poll 池路径成分")
+    d = os.path.join(jobs_dir(jobs), job_id)
     out = {"job_id": job_id, "job_dir": d, "state": "missing", "terminal": False,
            "ok": False, "content": None, "error": None, "status": None}
     if not os.path.isdir(d):
@@ -377,10 +572,13 @@ def poll(job_id: str, jobs: str = "") -> dict:
     return out
 
 
-# 生效条件：循环 poll(job_id, jobs)，结果 terminal 为真即补 waited_s 后返回；否则 time.time()-t0 >= float(timeout_s) 时返回 terminal=False、timeout=True 与超时 error；两者皆不满足则 sleep(float(poll_s)) 后重试（timeout_s=0 时首次 poll 非终态即超时返回）。
+# 生效条件：job_id 未过 _valid_job_id 结构闸时**立即**返回 poll 的同一拒绝结构（N178：否则非法 id 会空转满 timeout_s 才超时返回——拒绝不该以等待为代价）；闸过时循环 poll(job_id, jobs)，结果 terminal 为真即补 waited_s 后返回；否则 time.time()-t0 >= float(timeout_s) 时返回 terminal=False、timeout=True 与超时 error；两者皆不满足则 sleep(float(poll_s)) 后重试（timeout_s=0 时首次 poll 非终态即超时返回）。
 def wait(job_id: str, *, jobs: str = "", timeout_s: float = DEFAULT_TIMEOUT_S,
          poll_s: float = DEFAULT_POLL_S) -> dict:
     """阻塞等终态；超时如实返回（不假装成功、不强杀 job）。"""
+    if not _valid_job_id(job_id):
+        # N178（2026-09-28）：fail-fast——复用 poll 的拒绝结构，绝不进轮询。
+        return poll(job_id, jobs)
     t0 = time.time()
     while True:
         cur = poll(job_id, jobs)

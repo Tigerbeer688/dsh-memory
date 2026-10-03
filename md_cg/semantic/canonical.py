@@ -31,6 +31,28 @@ from . import zh_en_atoms
 WIN = 6          # 组合共现窗口（token 距离，探针实证口径）
 _ATOMS_ZH = None
 
+# 中文段判据（单点，2026-09-30 检索归一层作用域收窄时立）：
+# 中文 = CJK 统一表意文字基本区 U+4E00–U+9FFF。与 en_normalizer 分词字符类
+# `[A-Za-z\u4e00-\u9fff]` 的中文区间同区间；rust/src/text.rs::is_zh 是同判据的
+# Rust 侧单点（两侧归一层共用同一判据；改动须两侧同步，否则 rank_parity 漂移）。
+# 消费方：unify.py::unify_query（中文段逐字保留）、rust/src/atoms.rs::Atoms::unify。
+ZH_LO, ZH_HI = "\u4e00", "\u9fff"
+
+
+# 生效条件：单参 ch 为长度恰为 1 的 str 时返回 ZH_LO <= ch <= ZH_HI（CJK 基本区）；长度 != 1（空串/多字符串）一律返回 False（2026-09-30 清理批次把边界收紧为「长度恰为 1」——此前只在 ch 为空串时为假，多字符串按字典序比较可能被误判为真）。
+def is_zh_char(ch):
+    """中文段判据（单点）：CJK 统一表意文字基本区 U+4E00–U+9FFF。
+
+    边界约定（2026-09-30 清理批次乙2）：**仅长度恰为 1 的串可为真**——
+    空串与长度 >1 的串一律 False。此前只有空串为假（链式比较
+    `ZH_LO <= ch` 对空串即假），而多字符串按字典序比较：`is_zh_char("中文")`
+    判真（首字符在区间即真）＝判据外溢。两侧调用点清点结果：本函数只有
+    `unify.py::_runs` 与 `test_unify_scope.py::zh_runs` 两处消费，均逐字符
+    传入 ⇒ 本收紧对存量行为零变更；Rust 侧 `text.rs::is_zh` 收 `char`，
+    天然无空/多字符二态，边界语义两侧一致（docstring 已互指）。
+    """
+    return len(ch) == 1 and ZH_LO <= ch <= ZH_HI
+
 
 # 生效条件：模块级常量 `_ATOMS_ZH` 为 None 时按 `__file__` 所在目录的 atoms.json 取 `data.get("atoms", [])` 各项 `zh` 建集合并缓存，非 None 时直接返回 `_ATOMS_ZH`。
 def atoms_zh():

@@ -60,52 +60,324 @@ def _verdict(state, kind, evidence, detail=None):
 
 # ---------- 规则库（合规 / 纪律） ----------
 
-# 生效条件：path 为假值（None 或空串）时回落到 os.environ 的 MDCG_POLICY_FILE，所得路径仍为假值或 os.path.exists 判定为假时返回 {}；否则按 json.load 读取，抛 OSError/ValueError 或结果非 dict 时返回 {}，是 dict 则返回该 dict。
-def load_rulebook(path=None):
-    """{"forbidden": [正则], "required": [正则]}；缺失返回空规则。"""
-    path = path or os.environ.get("MDCG_POLICY_FILE")
-    if not path or not os.path.exists(path):
-        return {}
+POLICY_ENV = "MDCG_POLICY_FILE"
+# 包内默认策略（issue #43 问题 1 修复，2026-09-29 使用者裁定方向 ①+③）。
+# 根因（第4条取证）：修前 `load_rulebook` 只认 MDCG_POLICY_FILE，未设即返回
+# **空规则库**（无任何默认回落），而 npm 发布面不含 `data/policy.json`、
+# `lingshu-init` 也不生成该 env——「README 说默认 data/policy.json」成为空话。
+# 后果不是「少一条规则」而是**安全面翻转**：空规则让 text 恒判 DEFER，
+# 而 writepipe._gate_audit 的非 ACCEPT/REJECT 出口是 `cg.propose` ⇒ 正文
+# （含凭据）**明文**落 hippocampus/inbox.jsonl，且脱敏只在 REJECT 分支。
+# 故：未设时回落到包内默认；包内默认也拿不到时 fail-closed——由写入闸门
+# 在**提案入队之前**拦下（见 resolve_rulebook 与 writepipe._gate_audit）。
+DEFAULT_POLICY_REL = ("data", "policy.json")
+
+# fail-closed 时给调用方的**可执行**下一步（错误体 hint 单点，勿在多处各写一份）。
+POLICY_HINT = ("设置 MDCG_POLICY_FILE 指向可解析的策略文件（JSON 对象，含 "
+               "forbidden/required 键），或重装本包——默认策略随包发布"
+               "（包内 data/policy.json）；重装后无需再设 env。")
+
+# 列表型策略键（**判据面**）：这些键的语义就是「一组模式」，取值必须是列表。
+# 白名单式（而非「所有键都须是列表」）是必须的：默认策略里 `_comment`/`_note`
+# 本就是字符串，泛化类型闸会把**合法默认策略**判死。故形状闸只认这四键，
+# 其余键（含未知键）一律不参与形状判定——未知键是「没读到」，不是「读坏了」。
+POLICY_LIST_KEYS = ("forbidden", "required", "required_kinds", "required_labels")
+
+
+# 生效条件：rules 为 dict 时取 key 的**列表型**安全取值——list/tuple 原样浅拷贝，其余（标量/对象/None/缺键）一律返回空列表；rules 非 dict 亦返回空列表；恒不抛异常。
+def _policy_list(rules, key):
+    """列表型键的**安全**取值（纵深防御，不是可用性判据）。
+
+    为什么容错到「空」而不是抛：形状闸（`_policy_shape_error`）已在**读取单点**
+    把畸形策略判为不可用，写入闸门据此 fail-closed，正常路径下本函数只会碰到
+    列表。但 `_rule_check` / `redact_forbidden` 还被**别的调用面**直接喂 rules
+    （`audit.audit` 的 `ctx["rules"]` 兜底、验证器模块、测试），那里若因
+    `TypeError` 被兜底 `except` 吞掉，就退化成「看起来正常」的 DEFER——正是
+    issue #43 的病态出口。故消费面只保证两件事：**不抛**、**不把一个字符串
+    按字符拆成规则**（`'sk-…'` 迭代即 23 条单字符规则，计数与判定双双失真）。
+    可用性判定不在这里，仍单点在策略读取面——「同一语义两处实现」必然漂移。
+    """
+    v = rules.get(key) if isinstance(rules, dict) else None
+    return list(v) if isinstance(v, (list, tuple)) else []
+
+
+# 生效条件：rules 非 dict 时返回 None；否则逐键检查 POLICY_LIST_KEYS——任一键**存在**且取值非 list/tuple 即返回 ("policy_bad_shape", 含键名与实得类型的原因串)；全部合规返回 None。恒不抛异常。
+def _policy_shape_error(rules):
+    """策略**内容形状闸**（issue #43 键类型面补强，2026-09-29）：→ (错误码, 原因) | None。
+
+    前提与病态（复核 DEFER 的实据）：策略是**合法 JSON 对象**，但列表型键取值
+    是标量——`{"forbidden": 1}` / `{"required": true}` ⇒ `policy_report()` 的
+    列表推导抛 `TypeError`，而启动期的策略来源行（`mcp_server.main()` →
+    `_policy_stderr_note(_audit.policy_report())`）**不在任何 try 内**
+    ⇒ **server rc=1**（启动即崩＝记忆面整体不可用）；`--show-config` 同 rc=1
+    且 stdout 空，与其「恒退出 0」契约相反；写入侧 `_rule_check` 同抛，被
+    `audit.py` 验证器兜底 `except Exception → DEFER` 吞掉 ⇒ `moved_to=
+    review_queue`、正文（含凭据）**逐字**落 `hippocampus/inbox.jsonl`。
+    `{"forbidden": "sk-…"}` 更隐蔽：**不抛**但**按字符建规则**——`policy_report`
+    报 `forbidden=23`（把长度当规则数），写入侧以单字符规则判定 ⇒ 静默错判。
+
+    为什么**一律**判不可用（字符串「整串作单条规则」这条路也不走）：①标量取值
+    没有唯一合理读法——`"sk-…"` 既可能是「一条规则写成了标量」也可能是「一串
+    正则被压成一行」，替调用方猜即是替它决定安全边界；②按字面迭代即按字符建
+    规则（见上）；③三种形态同一个根因（列表型键没有类型闸），故同一个出口：
+    形状非法 ⇒ 策略不可用 ⇒ 在**提案入队之前** fail-closed，错误结构化 +
+    可执行 hint（`_read_policy_file` 把它并进既有错误码面，故闸门与诊断面
+    无需各自再判一次）。
+    """
+    if not isinstance(rules, dict):
+        return None
+    for key in POLICY_LIST_KEYS:
+        if key in rules and not isinstance(rules[key], (list, tuple)):
+            return ("policy_bad_shape",
+                    "策略键 %s 须为列表（实得 %s）——数组之外的值没有唯一读法，"
+                    "不猜、不按字符拆开" % (key, type(rules[key]).__name__))
+    return None
+
+
+# 生效条件：始终返回本模块所在包的包根绝对路径（`md_cg/` 的父目录），由 __file__ 反推——与 os.getcwd() 无关，cwd 在任何目录下取值相同。
+def package_root() -> str:
+    """包根（`md_cg/` 的父目录）——定位方式与 mcp_server._package_version 同族。"""
+    return os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+
+
+# 生效条件：始终返回包内默认策略文件的绝对路径（<包根>/data/policy.json）；不判存在性、不读盘，路径不可得的情形由 resolve_rulebook 报 policy_unavailable。
+def default_policy_path() -> str:
+    """包内随发默认策略路径（按包根解析，不依赖 cwd）。"""
+    return os.path.join(package_root(), *DEFAULT_POLICY_REL)
+
+
+# 生效条件：path 指向的文件可读、json.load 得 dict 且通过形状闸（POLICY_LIST_KEYS 取值皆列表）时返回 (rules, None)；文件不存在返回 (None, ("policy_not_found", 原因))，OSError 返回 ("policy_unreadable", 原因)，JSON 非法返回 ("policy_invalid_json", 原因)，顶层非对象返回 ("policy_not_object", 原因)，列表型键取值非列表返回 ("policy_bad_shape", 原因)；空 dict 是**可用**策略（内容为空，非可用性故障）。
+def _read_policy_file(path):
+    """读单个策略文件 → (rules|None, (错误码, 原因)|None)。错误码集合是判据面。"""
+    if not os.path.exists(path):
+        return None, ("policy_not_found", "文件不存在：%s" % path)
     try:
         with open(path, encoding="utf-8") as f:
             rules = json.load(f)
-    except (OSError, ValueError):
-        return {}
+    except OSError as exc:
+        return None, ("policy_unreadable", "读取失败：%s: %s"
+                      % (type(exc).__name__, exc))
+    except ValueError as exc:
+        return None, ("policy_invalid_json", "JSON 解析失败：%s" % exc)
+    if not isinstance(rules, dict):
+        return None, ("policy_not_object",
+                      "顶层须为 JSON 对象（实得 %s）" % type(rules).__name__)
+    shape = _policy_shape_error(rules)          # 形状闸（键类型面）：与不可用同码
+    if shape is not None:
+        return None, shape
+    return rules, None
+
+
+# 生效条件：path 显式为真值、或 os.environ 的 POLICY_ENV（MDCG_POLICY_FILE）去空后非空时以之为来源（source="env"，含显式传入的 path）——该文件不可用即返回 (None, "env", 结构化 error)，**不回落到包内默认**（显式指定即用户的决定，坏路径必须可见）；两者皆空时回落 default_policy_path()（source="package_default"），可用返回 (rules, "package_default", None)，不可用返回 (None, "unavailable", 结构化 error)；恒不抛异常，结构化 error 恒含 code/path/reason/hint 四键。
+def resolve_rulebook(path=None):
+    """策略来源解析单点（issue #43）：→ (rules|None, source, error|None)。
+
+    source ∈ {"env", "package_default", "unavailable"}，供启动 stderr /
+    --show-config / op=info 报出来源；有 error 即**策略不可用**。
+
+    为什么单点：来源判定（env vs 包内默认 vs 不可用）只有这一处，闸门、
+    自描述面、守卫读同一个函数——「同一语义两处实现」必然随改动漂移。
+    为什么**不抛异常**：策略不可用是可诊断的事实，抛异常会被 audit() 的
+    兜底 except 吞成 DEFER（正是本 issue 的病态出口），异常不该在这里变成
+    又一个「看起来正常」的裁决。
+    """
+    explicit = path if path is not None else (os.environ.get(POLICY_ENV) or "")
+    explicit = str(explicit).strip()
+    if explicit:
+        rules, why = _read_policy_file(explicit)
+        if rules is None:
+            return None, "env", {"code": why[0], "path": explicit,
+                                 "reason": why[1], "hint": POLICY_HINT}
+        return rules, "env", None
+    dflt = default_policy_path()
+    rules, why = _read_policy_file(dflt)
+    if rules is None:
+        return None, "unavailable", {"code": "policy_unavailable",
+                                     "path": dflt, "reason": why[1],
+                                     "hint": POLICY_HINT}
+    return rules, "package_default", None
+
+
+# 生效条件：exc 为任意异常对象时返回策略自描述的**不可用形状**（六键字典：source="unavailable"、path=""、available=False、forbidden=0、required=0、error={code:"policy_report_failed", path:"", reason:"<类型>: <消息>", hint:POLICY_HINT}），恒不抛异常。
+def unavailable_report(exc):
+    """策略自描述兜底的**同一形状**（`policy_report` 内部兜底与各调用面兜底共用）。
+
+    为什么单点：调用面（启动 stderr / `--show-config` / `op=info`）只需要「拿到
+    一个可渲染的自描述」，不需要知道怎么造它；兜底形状若各面各写一份，改一处
+    必留另一处漂移——本仓「同一语义两处实现」的既有教训都在这。
+    """
+    return {"source": "unavailable", "path": "", "available": False,
+            "forbidden": 0, "required": 0,
+            "error": {"code": "policy_report_failed", "path": "",
+                      "reason": "%s: %s" % (type(exc).__name__, exc),
+                      "hint": POLICY_HINT}}
+
+
+# 生效条件：调 resolve_rulebook() 后恒返回六键字典 {"source","path","available","forbidden","required","error"}——path 在可用时按来源取（env 取 env/显式路径、包内默认取 default_policy_path()）、不可用时取 error.path；forbidden/required 为去空后的模式计数（策略不可用时均为 0，取值经 _policy_list 类型闸，标量键计数为 0 而非其长度）；error 为 None 或结构化错误；**恒不抛异常**（形状闸是第一道，本函数的 except 是第二道，兜底形状由 unavailable_report 单点给出）。
+def policy_report():
+    """策略自描述（启动 stderr / --show-config / op=info 共用，单点）。
+
+    为什么单点：来源文案与计数若各面各写一份，改一处必留另一处漂移——
+    本仓「同一语义两处实现」的既往教训（负条件判据、CCG 冒号形态）都在这。
+
+    为什么**恒不抛**（issue #43 键类型面补强）：本函数是**启动路径**上的调用
+    （`mcp_server.py:3907`，构造点在 main() 任何 try 之外——N225 的教训：启动期
+    崩＝记忆面整体不可用），也是 `--show-config` 的应答体（其契约是恒退出 0）。
+    诊断面不得因为「策略畸形」这件事本身而死：畸形恰好是最需要被诊断出来的
+    情形。两道防线：形状闸让本函数体在畸形下根本走不到列表推导；万一还有
+    未预料的形态，except 收成 `unavailable_report`（available=false）而不是
+    traceback。
+    """
+    try:
+        rules, source, err = resolve_rulebook()
+        if err is not None:
+            path = err.get("path") or ""
+        elif source == "env":
+            path = os.environ.get(POLICY_ENV) or ""
+        else:
+            path = default_policy_path()
+        return {"source": source, "path": path, "available": err is None,
+                "forbidden": len([r for r in _policy_list(rules, "forbidden") if r]),
+                "required": len([r for r in _policy_list(rules, "required") if r]),
+                "error": err}
+    except Exception as exc:                      # noqa: BLE001 —— 自描述面恒不抛
+        return unavailable_report(exc)
+
+
+# 生效条件：委托 resolve_rulebook(path)——可用时返回该规则 dict；不可用（来源缺失/不可读/非对象）时返回 {}，**不抛异常**——fail-closed 的判定单点在 resolve_rulebook，落点在写入闸门（writepipe._gate_audit 在提案入队前拦下），本函数保持「空规则即空 dict」的既有契约以免调用点（redact_forbidden 等）因异常而连坐。
+def load_rulebook(path=None):
+    """{"forbidden": [正则], "required": [正则]}；不可用返回空规则 {}。
+
+    来源口径（issue #43）：path 参数 > MDCG_POLICY_FILE > 包内默认
+    `data/policy.json`；三者都拿不到时返回 {}（此时**不应**把 {} 当成
+    「合规」——写入闸门据 resolve_rulebook 的 error fail-closed）。
+    """
+    rules, _source, _err = resolve_rulebook(path)
     return rules if isinstance(rules, dict) else {}
 
 
-# 生效条件：当 rules 的 forbidden 与 required 去空后非全空时，逐条对 text 做 re.search（非法正则跳过），无禁止命中且必需项全部命中才返回 ACCEPT，否则 REJECT；两类都为空时返回 DEFER。
-def _rule_check(text, rules):
-    """规则为空 → DEFER（无规则不能假装合规）。"""
-    forbidden = [r for r in (rules.get("forbidden") or []) if r]
-    required = [r for r in (rules.get("required") or []) if r]
+# 生效条件：kind 属于 rules 的 required_kinds（该键缺失或去空后为空列表时视为全部 kind）时才检查 required；forbidden 对所有 kind 恒检查。两类去空后全空即返回 DEFER；有任一 forbidden 命中即返回 REJECT 与「命中禁止规则：<模式>」（非法正则跳过）；required 适用且存在缺失项即返回 REJECT 与「缺少必需要素：<展示名、连接>（补齐后重写即可，本条未入库）」并附 detail={"missing": [...], "missing_patterns": [...]}（两数组按下标一一对应）；全部通过即 ACCEPT（required 为空时措辞如实说明未配置必需规则，required 非空但被 kind 跳过时如实说明不适用于该 kind）。返回三元组 (state, evidence, detail)。
+def _rule_check(text, rules, kind="text"):
+    """规则为空 → DEFER（无规则不能假装合规）。
+
+    两类规则的生效面**不对称**：forbidden 是内容政策（机密外泄形态），对所有
+    content_kind 恒生效；required 是**成文格式**要求（CCG 六要素），只对
+    `required_kinds` 收窄内的 kind 生效——该键缺失或为空即「全部 kind」，
+    与改动前（required 对所有 kind 生效）行为一致，向后兼容。
+
+    缺失项**全列不截断**（原实现只列前 3 个，写入方拿不到完整补齐清单）；
+    展示名优先取 required_labels 的同下标中文名（policy 侧展示件，缺失或与
+    去空后的 required 长度不一致即整体回落正则串）——labels 畸形不得抛错，
+    也不得改变判定，它只影响证据文本。
+
+    边界（如实）：required 非空但被 kind 跳过、且 forbidden 为空时判 ACCEPT，
+    证据里点明「不适用于该 kind」——「规则不适用于此类内容」与「未配置规则」
+    是两件事（后者才 DEFER）。若部署方要求某 kind 也恒判 DEFER，应收窄
+    required_kinds（去掉该 kind）而不是靠本函数猜。
+
+    键类型面（issue #43 补强）：四类列表型键一律经 `_policy_list` 取值——取值
+    非列表时**当空列表**而不是迭代它。畸形策略的正常路径在读取单点就被形状闸
+    判为不可用（写入闸门 fail-closed），这里是纵深防御：本函数还会被直接喂
+    rules 的调用面用到，那里一个 `TypeError` 会被 `audit()` 的兜底 except 吞成
+    DEFER（病态出口），字符串取值则会被按字符建成规则。
+    """
+    forbidden = [r for r in _policy_list(rules, "forbidden") if r]
+    required = [r for r in _policy_list(rules, "required") if r]
     if not forbidden and not required:
-        return DEFER, "未配置合规/纪律规则（MDCG_POLICY_FILE），无法判定"
+        return DEFER, "未配置合规/纪律规则（MDCG_POLICY_FILE），无法判定", None
     for pat in forbidden:
         try:
             if re.search(pat, text):
-                return REJECT, f"命中禁止规则：{pat}"
+                return REJECT, f"命中禁止规则：{pat}", None
         except re.error:
             continue
-    missing = []
-    for pat in required:
+    kinds = [str(k) for k in _policy_list(rules, "required_kinds") if str(k)]
+    req_active = bool(required) and (not kinds or str(kind) in kinds)
+    if req_active:
+        labels = _policy_list(rules, "required_labels")
+        if len(labels) != len(required):
+            labels = []                      # 长度不匹配 → 整体回落正则串
+        missing, missing_patterns = [], []
+        for i, pat in enumerate(required):
+            try:
+                if not re.search(pat, text):
+                    missing_patterns.append(pat)
+                    missing.append(str(labels[i]) if labels else pat)
+            except re.error:
+                continue
+        if missing_patterns:
+            return (REJECT,
+                    "缺少必需要素：%s（补齐后重写即可，本条未入库）"
+                    % "、".join(missing),
+                    {"missing": missing, "missing_patterns": missing_patterns})
+    if not required:
+        return (ACCEPT,
+                f"通过 {len(forbidden)} 条禁止规则（未配置必需规则）", None)
+    if not req_active:
+        return (ACCEPT,
+                f"通过 {len(forbidden)} 条禁止规则"
+                f"（{len(required)} 条必需规则不适用于 content_kind={kind}）", None)
+    return ACCEPT, f"通过 {len(forbidden)} 条禁止 + {len(required)} 条必需规则", None
+
+
+# 生效条件：rules 为 None 时回落 load_rulebook()；对 rules["forbidden"] 经 _policy_list 取值（非列表取值当空列表，不按字符建规则）去空后的每条模式求出全部命中跨度，按跨度合并（重叠/相邻者合并、占位符取其中**最先声明**那条规则的序号）后整段替换为「[已过滤:禁表#i]」，返回替换后的文本；非法正则跳过不抛错；无命中时原样返回 text。
+def redact_forbidden(text, rules=None):
+    """把命中禁止规则的片段替换成占位符——负记忆（rejected）落盘前用。
+
+    REJECT 的内容仍记入负记忆（「这条被拒过」本身有价值），但命中禁表的
+    片段正是**不该入库的东西**（凭据形态），原样写进 rejected 层等于拦截
+    之后又把凭据存了一遍（issue #43）。占位符只带禁表序号，不带原文，也
+    不带原文哈希；否决原因（evidence）里已有命中的模式，可审计。
+
+    为什么按**跨度合并**而不是逐条 `re.sub` 串行替换（2026-09-28 PR#44 复核
+    实测的反例）：串行替换时先命中的窄规则会先把文字换成占位符，宽规则随后
+    就再也匹配不上那段被替换过的文字——全形态令牌 `mdcg1.<role>.<id>.<secret>`
+    里 id 段先被 `\\btk_...` 掩掉，宽规则 `mdcg1\\....` 便无法命中，
+    **密钥段原样留在负记忆里**（拦截了 id、漏了真正的凭据）。跨度合并与规则
+    书写顺序无关：任一规则命中的字符一律被掩，重叠部分并为一段。
+
+    键类型面（issue #43 补强）：forbidden 经 `_policy_list` 取值——取值非列表
+    当空列表，避免「字符串取值被按字符逐条建规则」时把正文掩成筛子（形状闸
+    已在读取单点判其不可用，本条是消费面的纵深防御）。
+    """
+    if rules is None:
+        rules = load_rulebook()
+    pats = [r for r in _policy_list(rules, "forbidden") if r]
+    spans = []          # (起, 止, 规则序号) —— 序号为去空后 1 起的下标（占位符标签）
+    for i, pat in enumerate(pats, 1):
         try:
-            if not re.search(pat, text):
-                missing.append(pat)
+            for m in re.finditer(pat, text):
+                if m.end() > m.start():     # 零宽命中不掩（掩了等于插字符）
+                    spans.append((m.start(), m.end(), i))
         except re.error:
-            continue
-    if missing:
-        return REJECT, f"缺少必需要素：{missing[:3]}"
-    return ACCEPT, f"通过 {len(forbidden)} 条禁止 + {len(required)} 条必需规则"
+            continue                        # 非法正则跳过，不因一条坏规则废掉整次脱敏
+    if not spans:
+        return text
+    spans.sort()
+    merged = []         # 重叠或相接的跨度并成一段，标签取最先声明的那条规则
+    for st, en, i in spans:
+        if merged and st <= merged[-1][1]:
+            pst, pen, pi = merged[-1]
+            merged[-1] = (pst, en if en > pen else pen, pi if pi < i else i)
+        else:
+            merged.append((st, en, i))
+    out, last = [], 0
+    for st, en, i in merged:
+        out.append(text[last:st])
+        out.append("[已过滤:禁表#%d]" % i)
+        last = en
+    out.append(text[last:])
+    return "".join(out)
 
 
 # ---------- 内建验证器 ----------
 
-# 生效条件：以 payload['content']（为假值则回落 payload['text']，再为假值取空串）作为文本，用 ctx['rules']（为假值则回落 load_rulebook()）做规则检查，返回 _verdict(检查状态, 'text', 证据)。
+# 生效条件：以 payload['content']（为假值则回落 payload['text']，再为假值取空串）作为文本，用 ctx['rules']（为假值则回落 load_rulebook()）按 kind='text' 做规则检查，返回 _verdict(检查状态, 'text', 证据, 规则检查给出的 detail)；缺要素 REJECT 时 detail 形如 {"missing": [中文名...], "missing_patterns": [正则...]}（其余状态为 None）。
 def _verify_text(payload, ctx):
     text = str(payload.get("content") or payload.get("text") or "")
-    state, ev = _rule_check(text, ctx.get("rules") or load_rulebook())
-    return _verdict(state, "text", ev)
+    state, ev, detail = _rule_check(text, ctx.get("rules") or load_rulebook(),
+                                    "text")
+    return _verdict(state, "text", ev, detail)
 
 
 # 生效条件：ctx['principal'] 缺失或为 None 时恒 DEFER；否则按 payload['action']（为假值取空串）是否属于 admin/forget/restore/review_decide 分别取 p.can_admin 或 p.can_write，且 p 具 allows 方法而 payload['sensitivity'] 为真值时再叠加 p.allows(sensitivity)，按最终 ok 返回 ACCEPT/REJECT。
@@ -126,12 +398,13 @@ def _verify_permission(payload, ctx):
                     f"can_admin={getattr(p, 'can_admin', None)}")
 
 
-# 生效条件：payload['content']（为假值取空串）经 ctx['rules']（为假值回落 load_rulebook()）检查后，state==REJECT 即 REJECT；否则 ctx['cg'] 非 None 且 payload['topic']（为假值回落 payload['query']，再为假值取空串）非空且 cg.search 结果含 ACCEPT 状态节点时 DEFER（查询抛异常则跳过该路）；再 state==DEFER 时 DEFER，否则 ACCEPT。
+# 生效条件：payload['content']（为假值取空串）经 ctx['rules']（为假值回落 load_rulebook()）按 kind='work_wip' 检查后，state==REJECT 即 REJECT（证据前缀「纪律不合规：」，缺要素时把规则检查的 detail 一并透传）；否则 ctx['cg'] 非 None 且 payload['topic']（为假值回落 payload['query']，再为假值取空串）非空且 cg.search 结果含 ACCEPT 状态节点时 DEFER（查询抛异常则跳过该路）；再 state==DEFER 时 DEFER，否则 ACCEPT。
 def _verify_work_wip(payload, ctx):
     text = str(payload.get("content") or "")
-    state, ev = _rule_check(text, ctx.get("rules") or load_rulebook())
+    state, ev, detail = _rule_check(text, ctx.get("rules") or load_rulebook(),
+                                    "work_wip")
     if state == REJECT:
-        return _verdict(REJECT, "work_wip", f"纪律不合规：{ev}")
+        return _verdict(REJECT, "work_wip", f"纪律不合规：{ev}", detail)
     cg = ctx.get("cg")
     topic = str(payload.get("topic") or payload.get("query") or "")
     if cg is not None and topic:

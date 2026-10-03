@@ -96,11 +96,12 @@ pub fn fmt_num(n: f64) -> String {
 // ------------------------------------------------------------------ 解析
 
 /// 生效条件：input 为完整合法 JSON → Ok(Json)（重复键取最后、支持 \uXXXX
-/// 代理对、UTF-8 原样）；空输入/语法错/尾部多余内容 → Err(带偏移位置)。
+/// 代理对、UTF-8 原样）；空输入/语法错/尾部多余内容/嵌套超过 `MAX_DEPTH` →
+/// Err(带偏移位置)。
 /// 不适用条件：不解析流式输入（全文一次性），不做数值精度裁剪。
 pub fn parse(input: &str) -> Result<Json, String> {
     let bytes = input.as_bytes();
-    let mut p = Parser { b: bytes, i: 0 };
+    let mut p = Parser { b: bytes, i: 0, depth: 0 };
     p.skip_ws();
     let v = p.value()?;
     p.skip_ws();
@@ -110,9 +111,22 @@ pub fn parse(input: &str) -> Result<Json, String> {
     Ok(v)
 }
 
+/// 嵌套深度上限（N184，批次65）：递归下降 value↔object/array 互递归无界时，
+/// 深嵌套输入栈溢出 abort 整进程（Rust 栈溢出不可捕获）——而 spec.json/
+/// status.json/result.json 是跨语言文件协议接口（job.rs 模块头注明「任意宿主
+/// 创建」），超限必须返回 Err 转为解析失败面，不得崩进程。
+/// 取值依据（实测）：解析递归在**主线程**跑（serve 主循环 deps_gate/classify_
+/// result、poll 观测面），debug 构建主线程栈预算下 768 层可过、1024 层即溢出
+/// （≈1KB/层，Windows 主线程栈约 1MB）——上限必须显著低于实测边界：256 对
+/// 上界留 ≥3× 余量；正常任务文件嵌套 ≤ 10 层，合法深结构远用不到。
+/// 注意：libtest 线程栈（8MiB 级）不代表生产面，勿按测试线程定上限。
+const MAX_DEPTH: usize = 256;
+
 struct Parser<'a> {
     b: &'a [u8],
     i: usize,
+    /// 当前嵌套深度（value 互递归计数，N184）。
+    depth: usize,
 }
 
 impl<'a> Parser<'a> {
@@ -131,7 +145,12 @@ impl<'a> Parser<'a> {
     }
 
     fn value(&mut self) -> Result<Json, String> {
-        match self.peek() {
+        if self.depth >= MAX_DEPTH {
+            // N184：超限拒绝（Err 携带偏移），互递归在受限深度内终止。
+            return Err(format!("嵌套超深（>{MAX_DEPTH} 层）@{}", self.i));
+        }
+        self.depth += 1;
+        let out = match self.peek() {
             None => Err("空输入".into()),
             Some(b'{') => self.object(),
             Some(b'[') => self.array(),
@@ -140,7 +159,9 @@ impl<'a> Parser<'a> {
             Some(b'f') => self.lit("false", Json::Bool(false)),
             Some(b'n') => self.lit("null", Json::Null),
             Some(_) => self.number(),
-        }
+        };
+        self.depth -= 1;
+        out
     }
 
     fn lit(&mut self, word: &str, v: Json) -> Result<Json, String> {
@@ -393,4 +414,109 @@ fn write_str(s: &str, out: &mut String) {
         }
     }
     out.push('"');
+}
+
+// ---------------------------------------------------------------- canonical
+
+impl Json {
+    /// P0-2 幂等键 canonical 形态（批次53）：递归键排序 + 紧凑分隔符 + 与
+    /// `to_json_string` 同一套字符串转义与数字格式（fmt_num）。同内容异键序/
+    /// 异空白/异尾换行的 spec → 同一串——提交面 content-hash 幂等键
+    /// （main.rs cmd_submit × hmac::sha256）的规范化前提。
+    /// 对象重复键取**最后一个**（与 `get`/Python dict 覆盖语义一致），
+    /// 不保留重复形态（否则 canonical 不唯一）。
+    pub fn to_canonical_string(&self) -> String {
+        let mut s = String::new();
+        self.write_canonical(&mut s);
+        s
+    }
+
+    fn write_canonical(&self, out: &mut String) {
+        match self {
+            Json::Obj(kv) => {
+                let mut sorted: Vec<&(String, Json)> = kv.iter().collect();
+                sorted.sort_by(|a, b| a.0.cmp(&b.0));
+                out.push('{');
+                let mut first = true;
+                let mut i = 0;
+                while i < sorted.len() {
+                    // 重复键取最后一个（排序后同键相邻；跳过组内除末项外全部）
+                    if i + 1 < sorted.len() && sorted[i + 1].0 == sorted[i].0 {
+                        i += 1;
+                        continue;
+                    }
+                    if !first {
+                        out.push(',');
+                    }
+                    first = false;
+                    write_str(&sorted[i].0, out);
+                    out.push(':');
+                    sorted[i].1.write_canonical(out);
+                    i += 1;
+                }
+                out.push('}');
+            }
+            Json::Arr(a) => {
+                out.push('[');
+                for (i, v) in a.iter().enumerate() {
+                    if i > 0 {
+                        out.push(',');
+                    }
+                    v.write_canonical(out);
+                }
+                out.push(']');
+            }
+            other => other.write(out),
+        }
+    }
+}
+
+#[cfg(test)]
+mod canonical_tests {
+    use super::{parse, Json};
+
+    /// 键序/空白/尾换行差异 → canonical 同串（幂等键的规范化前提）。
+    #[test]
+    fn canonical_ignores_key_order_and_whitespace() {
+        let a = parse(r#"{"model":"m","user_prompt":"x","timeout_s":60}"#).unwrap();
+        let b = parse("{\n  \"timeout_s\" : 60,\n  \"user_prompt\" : \"x\",\n  \"model\" : \"m\"\n}\n").unwrap();
+        assert_eq!(a.to_canonical_string(), b.to_canonical_string());
+        assert_eq!(
+            a.to_canonical_string(),
+            r#"{"model":"m","timeout_s":60,"user_prompt":"x"}"#
+        );
+    }
+
+    /// 重复键取最后一个（对齐 get/Python dict）；嵌套结构与数组递归生效；
+    /// 数组元素序有意义（不排序）；值不同 → 串不同。
+    #[test]
+    fn canonical_dedupes_keys_and_recurses() {
+        let dup = parse(r#"{"a":1,"a":2,"n":{"b":true,"a":null},"arr":[{"z":1,"y":2}]}"#).unwrap();
+        assert_eq!(
+            dup.to_canonical_string(),
+            r#"{"a":2,"arr":[{"y":2,"z":1}],"n":{"a":null,"b":true}}"#
+        );
+        let arr_order = parse(r#"{"arr":[1,2]}"#).unwrap();
+        let arr_swap = parse(r#"{"arr":[2,1]}"#).unwrap();
+        assert_ne!(arr_order.to_canonical_string(), arr_swap.to_canonical_string());
+        assert_eq!(Json::Null.to_canonical_string(), "null");
+    }
+
+    /// N184（批次65）：深嵌套必须返回 Err（解析失败面）而非栈溢出 abort 整
+    /// 进程——spec.json/status.json/result.json 是跨语言文件协议接口（job.rs
+    /// 模块头注明 kill 标志「任意宿主创建」），任意能写 jobs 池的组件落盘
+    /// 10 万层嵌套（约 100KB）即可让 deps_gate/classify_result/poll 在解析时
+    /// 溢栈：Rust 栈溢出不可捕获、整进程终止，serve 每次重启必复崩。
+    #[test]
+    fn deep_nesting_beyond_limit_is_err_not_abort() {
+        let deep = "[".repeat(100_000);
+        assert!(parse(&deep).is_err());
+    }
+
+    /// N184 配套：上限内深嵌套正常解析（防线不得误伤合法深结构）。
+    #[test]
+    fn nesting_within_limit_parses() {
+        let ok = format!("{}{}", "[".repeat(64), "]".repeat(64));
+        assert!(matches!(parse(&ok), Ok(Json::Arr(_))));
+    }
 }

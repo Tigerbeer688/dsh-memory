@@ -10,9 +10,17 @@
 （hive/ 为 python 包：PYTHONPATH 指向 dsh-memory 仓根）
 
 工具面（5 个）：
-  hive_spawn   提交任务（model/user_prompt 必填）→ job_id 毫秒即返。可选：
+  hive_spawn   提交任务（model/user_prompt **与四槽 identity/task/unit** 必填）→
+               job_id（由 Rust 侧 `hive alloc-id` 独占创建得出）即返。可选：
                system_prompt/context_files/max_tokens/temperature/thinking/
-               tools/max_tool_rounds/mdcg_root/web_search_backend。
+               tools/max_tool_rounds/mdcg_root/web_search_backend/depends_on。
+               depends_on（H-6）= 上游 job_id 列表，全 done 才被领取（失败传播见
+               scheduler::deps_gate）；本面在写入 spec 前过与 CLI 同判据的两道闸
+               （格式 = h 开头且不含路径成分；存在性 = jobs/<dep> 是目录），
+               不满足即 fail-closed 拒绝（不静默忽略、不降级为「无依赖」）。
+               id 契约 v2（B8）：id = `h_<身份>_<任务>_<单元>_<编号>`，四槽之三
+               必填、编号由 Rust 侧分配器给；**本面不再自造 id**（旧
+               `h{毫秒}_{uuid6}` 已退场），HIVE_EXE 不可用即显式报错（不静默降级）。
                **统一子代理默认**（缺省即注入）：reasoning_effort=high、
                context_budget_tokens=200000、timeout_s=600。模型名须与
                HIVE_API_BASE 配对（deepseek base→deepseek-flash/deepseek-v4-pro；
@@ -39,12 +47,57 @@ import contextlib
 import io
 import json
 import os
+import subprocess
 import sys
 import time
 import uuid
 
+# ---------------------------------------------------------------- 入口自保证 UTF-8
+# 约束（工作纪律第 15 条）：本调用必须在**任何文件/库 I/O 之前**——utf8_boot.ensure_utf8
+# 在解释器未开 UTF-8 模式时以相同 argv 重启自身（-X utf8），早于它的任何 open/stdio
+# 读写都走 locale 编码（Windows 中文机 = cp936：裸 open 抛 UnicodeDecodeError、中文写
+# 落 GBK 字节）。本文件下方 _package_version() 就在**模块级**读 package.json，故锚点
+# 必须落在它之前。仓库根入 sys.path 的形态照 hive/exec.py::_md_cg_import 的最小写法
+# （助手在仓根，不是 md_cg 包目录）。
+# 被 import（本模块非 __main__）时助手只置子进程继承面、绝不重启/退出——F6：静默重启
+# 会吞掉调用方输入；本入口的真实接入形态是 `python -m hive.hive_mcp.mcp_server`。
+_UTF8_ROOT = os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.abspath(__file__))))
+if _UTF8_ROOT not in sys.path:
+    sys.path.insert(0, _UTF8_ROOT)
+from utf8_boot import ensure_utf8  # noqa: E402
+
+ensure_utf8(__file__)
+
+
+# SERVER_VERSION 从包根 package.json 动态读取（issue #42 同族：硬编码与发布
+# 版本脱节）；读不到回落 "0.1.0" 保底不阻塞启动。
+# v21-R1（2026-09-28）：**回落必须覆盖全形态**——修前只捉 (OSError, ValueError)
+# 却无条件 `.get("version")`，顶层是合法 JSON 但非对象（`[1,2]`/`"0.9.9"`/`123`/
+# `null`/`true`）时 AttributeError 逃出 except，而本句在**模块级**立即求值 ⇒
+# `python -m hive.hive_mcp.mcp_server` 连 initialize 都发不出就退出（服务起不来）；
+# `{"version": 123}` 不抛但把 int 塞进握手 serverInfo.version（协议要字符串）。
+# 同族已修：md_cg/mcp_server.py。
+def _package_version() -> str:
+    """读包根 package.json 的 version；**任何**形态异常都回落 "0.1.0"。
+
+    生效条件：文件可读、json.load 得 dict、且 doc["version"] 为 strip() 后非空
+    的 str 时返回该值；文件缺失 / OSError / JSON 非法 / 顶层非对象 / version
+    缺失·非字符串·空白串时一律回落 "0.1.0"（TypeError、AttributeError 一并兜底，
+    绝不把异常抛给 import 期）。
+    """
+    try:
+        root = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+        with open(os.path.join(root, "package.json"), encoding="utf-8") as f:
+            doc = json.load(f)
+        ver = doc.get("version") if isinstance(doc, dict) else None
+    except (OSError, ValueError, TypeError, AttributeError):
+        return "0.1.0"
+    return ver if isinstance(ver, str) and ver.strip() else "0.1.0"
+
+
 SERVER_NAME = "hive-mcp"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = _package_version()
 PROTOCOL_VERSION = "2024-11-05"
 
 REPO = os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
@@ -118,18 +171,257 @@ def _exe_path() -> str:
     return os.path.join(REPO, "hive", "target", "release", name)
 
 
-# 生效条件：jid 为 str、以 "h" 开头且其余每字符均为 ASCII 字母/数字/下划线时返回 True，其余（含空串、`..`、`../victim`、`h/../../x`、非 str）一律 False——与 rust 侧 `job::valid_job_id` 同口径（跨语言靠注释约定对齐，勿自持第二判据）。
+# ==================================================== id 契约 v2 孪生闸（B4/B5′）
+#
+# 判据真源 = `hive/src/job.rs::valid_job_id`（Rust 侧是单点，契约 §五 裁决 3）。
+# 本段是它在 python 面的**孪生**——两侧对任何一例必须**同判**，逐例证据 =
+# `hive/id_contract_corpus_v2.txt`（两侧共读同一份语料：Rust 单测
+# `id_contract_corpus_verdicts` 与守卫 `hive/test_id_contract_v2.py` 各自解码同一
+# 份 hex，任一侧判反即红）。**不许改语料迁就实现**。
+#
+# 结构逐条对齐 Rust（顺序都一致，顺序会改变错误文本）：
+#   ① h 前缀与非空；② 首尾空白；③ 尾点；④ 单独的 `.`/`..`；
+#   ⑤ 逐字符：控制/路径成分 → 零宽/双向控制 → `_`/`.` 直通 → 区块白名单成员；
+#   ⑥ 整 id 的 Windows 保留设备名；⑦ 按 `_` 分段的保留设备名（Win32 按分量解析）。
+#
+# 字符类判据（B5′；2026-09-30 使用者裁定 ①-(c) 换面）：**唯一真源 =
+# `hive/id_charset_blocks.txt` 的区间并集**——本模块**导入时读一次**（c2：不做每调用
+# I/O），与 Rust `job.rs`（`include_str!` 编译期嵌入 + 首次使用惰性解析，纯 std）和
+# `md_cg/units.py`（同样读这份文件；读数据不是 import）**共读同一份数据**。判据
+# **不查任何 Unicode 属性库**（不用 `str.isalnum()`，也不做 NFC 计算）⇒ 与 Rust 工具链
+# 的属性表版本差**结构性不可能**：全码点同判是结构性的（同一份数据），不是逐例对齐
+# 出来的。
+#
+# 为什么旧的属性表机制**整段退休**（`OTHER_ALPHABETIC_BLOCKS` 补齐闭集、
+# `NFC_REWRITE_BLOCKS` 排除表、Cn 残余声明）：它们三者的存在理由**只有一个**——两侧
+# 各查自己的 Unicode 属性表（Rust 工具链 vs Python `unicodedata`），版本不同 ⇒
+# `isalphanumeric` 必然分叉，于是要用「实测导出的补齐表」抹平、用「方向安全的残余声明」
+# 兜住补不上的一部分。新区块表下判据只读**一份数据**：无属性表可陈化、无差可补、无残余
+# 可声明（旧机制点名的「会归一化改写」形态现在由「不在表内」承载，且依据是**区块选择
+# 裁决**而非属性推断）。**不许新旧两套并存**。
+#
+# NFC 保证方式（c5）：表本身由 `scripts/gen_id_charset_blocks.py` 按「类目 ∈
+# {Lu,Ll,Lt,Lm,Lo,Nd} ∧ 单字符 NFC 稳定」生成（生成器与陈化守卫各全表重算一遍）⇒ 判据
+# 不必做真 NFC 计算，收下的 id 也保证已是 **NFC 形态**（**拒收而非静默归一化**）。
+#
+# fail-closed（c2）：表缺失 / 不可读 / 任一行不合形态 / 解析出空区间集 ⇒ 判据**一律返回
+# false**（绝不放行），且**绝不退回任何 Unicode 属性判定兜底**。
+
+#: 区块表数据文件（c1 的**唯一真源**）——三处读者（本模块、`hive/src/job.rs`、
+#: `md_cg/units.py`）共读同一份数据，任何一处都不得再手写/内嵌区间常量。
+ID_CHARSET_BLOCKS_REL = "hive/id_charset_blocks.txt"
+_MAX_CP = 0x10FFFF
+
+
+# 生效条件：text 为表文件全文时返回区间列表 [(起, 止)]——按**唯一解析配方**：每行取
+# `#` 之前部分后 strip；空行跳过；余下 split('-') 两段 int(x, 16) = (lo, hi)。
+# 任一行不合形态 / 越界 / 逆序 / 相邻相交乱序 / 空表 → 抛 ValueError——fail-closed：
+# **绝不静默跳过坏行**（跳掉一行的表是另一张表，两侧随即不同判）。
+def _parse_charset_blocks(text: str) -> list:
+    """区块表解析（**唯一配方**；与 Rust `job.rs::parse_id_charset_blocks` 同一条）。"""
+    out: list = []
+    for lineno, line in enumerate(text.split("\n"), 1):
+        body = line.split("#", 1)[0].strip()
+        if not body:
+            continue
+        parts = body.split("-")
+        if len(parts) != 2:
+            raise ValueError("区块表第 %d 行不是 LO-HI 形态：%r" % (lineno, line))
+        lo, hi = int(parts[0], 16), int(parts[1], 16)
+        if not (0 <= lo <= hi <= _MAX_CP):
+            raise ValueError("区块表第 %d 行区间非法：%r" % (lineno, line))
+        if out and lo <= out[-1][1] + 1:
+            raise ValueError("区块表第 %d 行未归并到最小（相邻/相交/乱序）：%r"
+                             % (lineno, line))
+        out.append((lo, hi))
+    if not out:
+        raise ValueError("区块表解析出空区间集（fail-closed：空表绝不放行）")
+    return out
+
+
+# 生效条件：无入参，返回 (区间表, 错误说明)——文件可读且解析通过 → (tuple 区间表, None)；
+# 表缺失/不可读 → ((), 原因)；解析失败 → ((), 原因)；后两者都让判据 fail-closed。
+def _load_charset_blocks() -> tuple:
+    """读**数据文件**一次（c2：导入期求值；不是 import hive 的任何模块/代码）。"""
+    path = os.path.join(REPO, "hive", "id_charset_blocks.txt")
+    try:
+        with open(path, encoding="utf-8") as fh:
+            text = fh.read()
+    except OSError as exc:
+        return (), "%s 不可读：%s" % (ID_CHARSET_BLOCKS_REL, exc)
+    try:
+        return tuple(_parse_charset_blocks(text)), None
+    except ValueError as exc:
+        return (), "%s 解析失败：%s" % (ID_CHARSET_BLOCKS_REL, exc)
+
+
+#: 判据数据（**模块导入时求值一次**；c2：不做每调用 I/O）：区间表 + 读取/解析错误。
+#: 错误非 None ⇒ [`_id_charset_member`] 对一切字符返回 False（fail-closed）。
+ID_CHARSET_BLOCKS, ID_CHARSET_ERROR = _load_charset_blocks()
+
+
+# 生效条件：blocks 为区间列表且 c 为单字符、其码点落在任一区间内 → True；否则 False
+# （blocks 为空 ⇔ 表缺失/坏行/空表 ⇒ **一律 False**——这条 fail-closed 由守卫直接断言）。
+def _charset_member_in(blocks, c: str) -> bool:
+    u = ord(c)
+    return any(lo <= u <= hi for lo, hi in blocks)
+
+
+# 生效条件：c 为单字符且落在区块表区间并集内 → True；表缺失/坏表 → False。
+# **不查任何 Unicode 属性库**（不用 `isalnum`、不做 NFC 计算）⇒ 接受集只由这一份数据
+# 决定，与 Rust 侧逐码点相同（守卫 `hive/test_id_contract_v2.py` 的 C 组全码点遍历断言）。
+# 不适用条件：`_`(U+005F) 与 `.`(U+002E) **不在表内**，由 [`_job_id_reject_reason`] 的
+# **结构分支**处理（槽分隔符 / 非尾点非单点的点）⇒ 本判据是「字符类」判据，不含这两个
+# 结构字符。
+def _id_charset_member(c: str) -> bool:
+    return _charset_member_in(ID_CHARSET_BLOCKS, c)
+
+
+# Windows 保留设备名（B4 拒收项；与 `job.rs::RESERVED_DEVICE_NAMES` 逐项同集）。
+# Win32 对**单个路径分量**做设备名解析且**忽略扩展名**（`CON.txt` 与 `CON` 同指
+# 设备），故比对的是「首个 `.` 之前」部分；比对**ASCII 大小写不敏感**
+# （不用 str.upper()：它的 Unicode 折叠面比 Rust 的 eq_ignore_ascii_case 宽，
+# 会让两侧分叉）。
+RESERVED_DEVICE_NAMES = (
+    "CON", "PRN", "AUX", "NUL", "COM1", "COM2", "COM3", "COM4", "COM5", "COM6",
+    "COM7", "COM8", "COM9", "LPT1", "LPT2", "LPT3", "LPT4", "LPT5", "LPT6",
+    "LPT7", "LPT8", "LPT9",
+)
+_ASCII_UPPER = str.maketrans("abcdefghijklmnopqrstuvwxyz",
+                             "ABCDEFGHIJKLMNOPQRSTUVWXYZ")
+
+
+# 生效条件：c 为零宽/不可见注入载体（U+200B..U+200F、U+2060、U+FEFF）→ True。
+def _is_zero_width(c: str) -> bool:
+    return "\u200b" <= c <= "\u200f" or c in ("\u2060", "\ufeff")
+
+
+# 生效条件：c 为双向控制字符（U+202A..U+202E、U+2066..U+2069）→ True。
+def _is_bidi_control(c: str) -> bool:
+    return "\u202a" <= c <= "\u202e" or "\u2066" <= c <= "\u2069"
+
+
+# 生效条件：s 的「首个 `.` 之前」部分与任一保留设备名 **ASCII 大小写不敏感**
+# 相等 → True（含 `CON.txt` 这类带扩展名形态）——与 rust `job::is_reserved_device_name` 同判。
+def _is_reserved_device_name(s: str) -> bool:
+    base = s.split(".")[0].translate(_ASCII_UPPER)
+    return base in RESERVED_DEVICE_NAMES
+
+
+# 生效条件：jid 通过 id 契约 v2 全部判据 → None；否则返回**可直接展示的拒收原因**
+# （含路径成分/不可见注入/NFC 形态建议等，错误显式、不静默降级）。
+# 与 __valid_job_id 是同一判据的两个出口（后者 = 前者 is None），顺序逐条对齐
+# rust `job::valid_job_id`（顺序会改变报错文本，但**不改判定**——所有分支都是
+# 「拒」，故两侧同判性不受顺序影响；顺序对齐只为可读原因与 Rust 一致）。
+def _job_id_reject_reason(jid) -> str | None:
+    if not isinstance(jid, str) or jid == "":
+        return "job_id 须为非空字符串"
+    if not jid.startswith("h"):
+        return "job_id 须以 `h` 开头（h 前缀保留，契约 §四.7）"
+    if jid.strip() != jid:
+        return "job_id 含首尾空白（Win32 会静默剥掉 ⇒ 与其他 id 落到同一目录）"
+    if jid.endswith("."):
+        return "job_id 以 `.` 结尾（Win32 会静默剥尾点 ⇒ 与去掉尾点的 id 同指）"
+    if jid in (".", ".."):
+        return "job_id 是相对路径段"
+    # c7 段级判据（2026-09-30 加固）：按 `_` 分段，**任一段**等于 `.` 或 `..` 即拒。
+    # 段级而非整串：id 的段可能被宿主当**目录名**或**父目录段**用（契约 §四.4「目录可作它的
+    # 父段」，成 5 段形态）。现场定性：`h_.._x` / `h_a_.._b` 这类「含 `..` 段但不以点结尾」的
+    # id 此前被整串判据收下，拼出的路径**停在池内**、不构成穿越 ⇒ 面向重构的纵深加固。
+    # 与 rust `job::valid_job_id`、`md_cg/units.py::_valid_job_id` **三处同判**；
+    # 范围**只加这一条**（不拒空段 `h__x`——未被裁定的行为收紧不许顺手做）。
+    if any(seg in (".", "..") for seg in jid.split("_")):
+        return ("job_id 的某一段是相对路径段（`.` / `..`）"
+                "——段级判据：任一段等于 `.` 或 `..` 即拒（该段可能被当目录名或父目录段用）")
+    for c in jid:
+        u = ord(c)
+        # c7/c9：以下拒收项**逐条显式判**——不许靠「不在白名单里所以默认被拒」兜
+        # （防将来有人放宽某个区块时把它们一并带进来）。控制字符 = Cc（C0 U+0000..
+        # U+001F / DEL U+007F / C1 U+0080..U+009F），这里写成显式区间而不查
+        # `unicodedata.category`：判据不查任何 Unicode 属性库（与 rust `is_control` 同集）。
+        if u <= 0x1F or 0x7F <= u <= 0x9F or c in "/\\:":
+            return (f"job_id 含路径成分/控制字符 {c!r}"
+                    f"（`/` `\\` `:` 是 2026-09-25 池外读写缺陷的载体）")
+        if _is_zero_width(c):
+            return (f"job_id 含零宽字符 U+{u:04X}"
+                    "（不可见注入载体：同形异义、显示与字节不一致）")
+        if _is_bidi_control(c):
+            return (f"job_id 含双向控制字符 U+{u:04X}"
+                    "（不可见注入载体：显示顺序与字节顺序不一致）")
+        if c == "_" or c == ".":
+            continue
+        if not _id_charset_member(c):
+            return (f"job_id 含非法字符 U+{u:04X}：只收**区块白名单**"
+                    "（`hive/id_charset_blocks.txt`，三处读者共读的唯一真源）内的字母/数字"
+                    "与 `_`（`.` 非尾点、非单独才收）；表外的一切形态一律拒收——含会归一化"
+                    "改写的形态（CJK 兼容表意 / 全角 / 带圈字母数字 / 数学字母 / 组合标记 / "
+                    "Hangul Jamo 等）与候选区块之外的其它文种。**不做静默归一化**：表内形态"
+                    "即已 **NFC 稳定**（表由生成器按「类目 ∧ 单字符 NFC 稳定」筛选而来），"
+                    "故请改用表内的等价形态（如把 ﬁ 写成 fi、把组合序列写成预合成字符）后重提")
+    if _is_reserved_device_name(jid):
+        return ("job_id 命中 Windows 保留设备名"
+                "（CON/PRN/AUX/NUL/COM1..9/LPT1..9，含 CON.txt 这类带扩展名形态）")
+    if any(_is_reserved_device_name(seg) for seg in jid.split("_")):
+        return ("job_id 的某一段命中 Windows 保留设备名"
+                "（Win32 的设备名解析是**按分量**做的：`h_CON_x` 里的 CON 段同样危险）")
+    return None
+
+
+# 生效条件：jid 通过 id 契约 v2 全部判据 → True，否则 False——与 rust 侧
+# `job::valid_job_id` 同口径（判据单点在 Rust，本面是**孪生**；同判性由
+# `hive/id_contract_corpus_v2.txt` 的对照语料逐例钉死，勿自持第二判据）。
 def _valid_job_id(jid) -> bool:
-    """job_id 结构校验（防路径穿越，2026-09-25 缺陷）。
+    """job_id 结构校验（防路径穿越 + id 契约 v2 字符集闸，2026-09-25 缺陷）。
 
     MCP 面 job_id 由客户端可控：`poll ../victim` 曾可读池外任意目录全文、
     `kill ..` 曾可在池外写 kill 标志（os.path.join 裸拼 + isdir 恒真）。
-    一切把外部 job_id 拼进路径的入口（_t_poll/_t_kill）先过此闸。
+    一切把外部 job_id 拼进路径的入口（_t_poll/_t_kill/_dep_gate）先过此闸。
+    契约 v2 的字符集闸 = **区块白名单**（`hive/id_charset_blocks.txt` 的区间并集，
+    唯一真源三处共读；**不查任何 Unicode 属性库** ⇒ 与 Rust 侧的属性表版本差结构性
+    不可能），另收两个结构字符 `_`（槽分隔符）与 `.`（非尾点、非单独）；拒收 =
+    路径成分/首尾空白/尾点/控制字符/零宽/双向控制/Windows 保留设备名/表外的一切字符
+    （含会归一化改写的形态）/「任一段等于 `.` 或 `..`」（c7 段级）。使中文四槽 id 与存量
+    旧形态 `h<13位毫秒>_<4位hex>` **同时**合法（存量零迁移）。
     """
-    if not isinstance(jid, str) or not jid.startswith("h"):
-        return False
-    return all(("a" <= c <= "z") or ("A" <= c <= "Z")
-               or ("0" <= c <= "9") or c == "_" for c in jid)
+    return _job_id_reject_reason(jid) is None
+
+
+# 生效条件：deps 为 None（调用方未传该参数）→ 返回 None（「缺省不写」，不校验不计入）；
+# deps 非 list → 返回类型原因串；list 内任一项未过 _valid_job_id 结构闸 → 返回格式原因串；
+# 任一项在 jobs 下非目录 → 返回存在性原因串；全部通过 → None。调用方拿到非 None 即
+# fail-closed（拒提交、不写 spec、不拉 serve），绝不静默忽略或降级为「无依赖」。
+# 不适用条件：不做 DAG 环检测——无环性由**存在性闸**结构性保证：提交时只能引用
+# **已存在**的任务目录（本函数的存在性闸 + CLI 侧 `hive/src/main.rs` 的
+# depends_on 存在性检查 + 运行期 `hive/src/scheduler.rs::deps_gate`），引用不到
+# 提交时尚不存在的任务，自引用亦不可能。**不是**由 id 的时间序保证：旧形态 id
+# 恰好也带时间戳（名序=时间序只是巧合的代理），契约 v2 的语义四槽 id **不再有此
+# 性质**，故论证不得依赖它（见 hive/src/spec.rs 的 Spec.depends_on 头注）。
+def _dep_gate(jobs: str, deps) -> str | None:
+    """依赖门禁（H-6）：与 CLI 同判据的两道闸——**格式**（job_id 结构）与
+    **存在性**（`jobs/<dep>` 是目录）。
+
+    为什么判据必须是这一份（不得分叉第二套）：CLI 侧同两闸的落点 =
+    `hive/src/spec.rs:203`（格式，走 `job::valid_job_id`）+ `hive/src/main.rs:289`
+    （存在性，`jobs.join(dep).is_dir()`）；调度侧 `hive/src/scheduler.rs::deps_gate`
+    读的就是 spec.json 的 `depends_on`。MCP 面此前既不收也不写该键（H-6 缺陷：
+    只有 CLI `hive submit` 能用依赖门禁），程序化接入（含 orch 派生）无从使用。
+    格式判据复用 `_valid_job_id`（与 rust `job::valid_job_id` 同口径的唯一实现），
+    存在性判据与 CLI 同为「是目录」（同名**文件**不算）；文案亦与两侧逐字对齐
+    （守卫 `hive/test_h6_mcp_depends_on.py` 的 D 组用同一批 id 两侧对照逐项钉住）。
+    """
+    if deps is None:
+        return None
+    if not isinstance(deps, list):
+        # 比 CLI 更严的一处（有意、已声明）：CLI 侧 as_str_vec 对裸字符串按单元素
+        # 列表宽松采信；本工具面 schema 声明的是 array，静默强转等于接受非法入参。
+        return (f"depends_on 必须是字符串列表（job_id 数组），got "
+                f"{type(deps).__name__}: {deps!r}——不静默强转/不降级为「无依赖」")
+    for d in deps:
+        if not _valid_job_id(d):
+            return f"depends_on 项非法: {d}（须为 h 开头且不含路径成分的 job_id）"
+        if not os.path.isdir(os.path.join(jobs, d)):
+            return f"依赖不完整: {d}（任务不存在，先提交上游任务）"
+    return None
 
 
 # ---------------------------------------------------------------- serve 管理
@@ -234,27 +526,172 @@ def _ensure_serve(jobs: str) -> dict:
 
 # ---------------------------------------------------------------- 工具实现
 
-# 生效条件：jobs 与 spec 给定且不做校验，即生成 h{毫秒时间戳}_{uuid4 前 6 位} 的 job_id，建 jobs/job_id 目录并写 spec.json 与 status.json（state=pending、timeout_s 取 spec.get("timeout_s", 300) 缺键回落 300、model 取 spec.get("model") 缺键为 None），返回 job_id。
-def _submit(jobs: str, spec: dict) -> str:
-    job_id = f"h{int(time.time() * 1000)}_{uuid.uuid4().hex[:6]}"
+# ---------------------------------------------------------------- 工具实现
+
+# P11 结果完整性锚密钥链（批次53；N190 键集收窄）：与 hive/src/keyres.rs 同一链、
+# 同一顺序——`HIVE_ORCH_TOKEN`（令牌明文直值）→ `HIVE_ORCH_TOKEN_FILE`（**路径**，
+# 读全文 strip）→ None。只取 hive 身份/令牌面（对照 config.local 既有键），不新发明
+# 密钥来源、不设公开缺省常量（N143 教训）。N190：`HIVE_API_KEY` 不再兜底——它是模型
+# （网关）密钥、属普通配置（exec.py 调 LLM 必需，serve 派发时默认继承给执行器），
+# 把它当锚密钥 = 每个部署到模型密钥的面都自动成为锚签发面，且「谁有权签锚」退化成
+# 「谁能调模型」（服务端 hive/src/keyres.rs 头注同口径）。config.local.json 的解析值
+# 按 serve_start 合并语义（{**os.environ, **config}）胜出进程 env，故先查 config 再查
+# env（读序未动）。
+_RESULT_KEY_KEYS = ("HIVE_ORCH_TOKEN", "HIVE_ORCH_TOKEN_FILE")
+# env 直值环的键：**值本身即密钥**的键。`HIVE_ORCH_TOKEN_FILE` 的值是**路径**（同
+# Rust keyres.rs:43-50），故不入本环——由下方文件环读全文 strip（N190 同源链同步：
+# 旧实现把路径串本身当密钥直接返回，文件环成不可达死代码，与 serve 侧「读文件、
+# 不可读/空白即 None」判据分叉）。
+_ENV_DIRECT_KEYS = ("HIVE_ORCH_TOKEN",)
+
+# 小写读取（2026-09-28 使用者裁定，与 rust keyres.rs 同口径）：`HIVE_ORCH_TOKEN` 系
+# 值**读取即折小写**——写面（md_cg.tokens 签发）产小写、读面折小写 ⇒ 大小写不再是
+# 第二语义。只折 ASCII `A-Z`；**不用 str.lower()**（它对 Unicode 段的结论与 Rust
+# `to_ascii_lowercase()` 不同，会把跨语言同源链折出分叉）。
+# 诚实边界：①锚密钥＝折小写后的值 ⇒ 锚面大小写不敏感；对含大写的存量令牌折小写会
+# 改变锚密钥 ⇒ submit 面与 serve 面必须同一构建，否则判伪锚。②本归一**只作用于锚面**
+# （值仅作 HMAC 密钥，无逐字节对照物）；身份面 `hive/orch.py::_read_token` **不折**——
+# 那里的值要与令牌库比对，而 secret 是 base64url 必含大写（`md_cg/tokens.py::parse_token`），
+# 折小写即毁令牌。
+_ASCII_LOWER = str.maketrans("ABCDEFGHIJKLMNOPQRSTUVWXYZ",
+                             "abcdefghijklmnopqrstuvwxyz")
+
+
+def _ascii_lower(s: str) -> str:
+    return s.translate(_ASCII_LOWER)
+
+
+# 生效条件：无必需形参——先 _load_local_config() 取 config 解析值（load_config 已完成 {"file":…} 读文件），两键按序首个非空字符串胜出（折 ASCII 小写）；再查进程 env 直值环同序（值本身即密钥，同折）；再取 env HIVE_ORCH_TOKEN_FILE 读文件全文 strip 后折小写（不可读/空白视同该环缺失，不回落路径串本身）；全缺 → None（提交面退回旧格式，不写 result_nonce——零配置部署行为不变）。
+def _result_anchor_key() -> str | None:
+    """结果完整性锚密钥（P11 批次53；N190 收窄为身份两环）：hive 身份/令牌面唯一解析点。
+
+    与 rust keyres::resolve_key_from_env 同链同序同归一（submit 与 serve 两侧同口径，
+    勿再分叉第二套解析）；config 值胜出 env（serve_start 合并语义）。
+    （N190：模型密钥不再兜底；2026-09-28：三环统一折 ASCII 小写——见 `_ascii_lower` 头注）
+
+    诚实边界（如实点名，本批未动）：config 形态的 `HIVE_ORCH_TOKEN_FILE` 按**直值**
+    采信（部署实况该键写路径串）——判据面只问「锚是否启用」（`_submit` 的
+    `is not None` 判据），与 serve 侧读文件后的非空判定同结论；仅当该路径不可读时
+    两面分叉。env 形态已按 Rust 语义读文件（守卫 C 组冻结两侧）。
+    """
+
+    def _env(k: str) -> str | None:
+        v = (os.environ.get(k) or "").strip()
+        return _ascii_lower(v) or None
+
+    cfg, _err = _load_local_config()
+    for k in _RESULT_KEY_KEYS:
+        v = cfg.get(k)
+        if isinstance(v, str) and v.strip():
+            return _ascii_lower(v.strip())
+    for k in _ENV_DIRECT_KEYS:
+        v = _env(k)
+        if v:
+            return v
+    f = _env("HIVE_ORCH_TOKEN_FILE")
+    if f:
+        try:
+            with open(f, "r", encoding="utf-8") as fh:
+                s = _ascii_lower(fh.read().strip())
+            if s:
+                return s
+        except OSError:
+            pass
+    return None
+
+
+class SubmitError(Exception):
+    """提交面分配失败（fail-closed：显式报错，绝不静默降级、绝不自造 id）。"""
+
+
+# 生效条件：HIVE_EXE 可用（isfile）→ 以
+# `hive alloc-id --identity X --task Y --unit Z --jobs <池>` 分配 job_id 并返回它
+# （**任务目录已由分配器创建** = 分配已完成）；HIVE_EXE 不可用 / 进程失败 /
+# 输出非 JSON / ok 非真 / 未给 job_id / 返回的 id 未过本面孪生闸 → 抛 SubmitError
+# （含可直读原因，绝不静默降级、绝不自造 id）。
+# 不适用条件：不写 spec.json/status.json（写序归 _submit）；本函数不产生任何
+# 「毫秒 + uuid」形态的 id。
+def _alloc_job_id(jobs: str, identity: str, task: str, unit: str) -> str:
+    """调 `HIVE_EXE alloc-id` 分配 job_id（B3/B7/B8；契约 §五 裁决 3）。
+
+    为什么必须调外部进程而不是在 python 里自造：分配器（独占创建即分配、编号
+    定宽 4 位、五单元闭集、槽闸）的**唯一实现**是 Rust 侧 `job::alloc_job_id`；
+    python 面自持第二份必然漂移（历史形态 `h{毫秒}_{uuid6}` 即此，H-1 的碰撞那半
+    与 id 契约 v2 都不允许它再存在）。
+    """
+    exe = _exe_path()
+    if not os.path.isfile(exe):
+        raise SubmitError(
+            f"HIVE_EXE 不可用：{exe} 不存在——id 分配器的唯一实现是 Rust 侧 "
+            "`hive alloc-id`（契约 §五 裁决 3），本面**不自造 id**"
+            "（旧 `h{毫秒}_{uuid6}` 形态已退场）。先 `cargo build --release`"
+            "（hive/ 下），或用 HIVE_EXE 指向可用二进制。")
+    try:
+        r = subprocess.run(
+            [exe, "alloc-id", "--identity", identity, "--task", task,
+             "--unit", unit, "--jobs", jobs],
+            capture_output=True, text=True, encoding="utf-8",
+            errors="replace", cwd=REPO)
+    except OSError as e:
+        raise SubmitError(f"HIVE_EXE 调起失败：{exe}（{type(e).__name__}: {e}）")
+    out = (r.stdout or "").strip()
+    try:
+        doc = json.loads(out)
+    except ValueError:
+        raise SubmitError(
+            f"alloc-id 输出非 JSON（rc={r.returncode}）：{out[:400]!r}"
+            f"；stderr={(r.stderr or '')[:200]!r}")
+    if not isinstance(doc, dict) or doc.get("ok") is not True:
+        raise SubmitError(f"分配 job_id 失败（rc={r.returncode}）："
+                          f"{json.dumps(doc, ensure_ascii=False)[:400]}")
+    jid = doc.get("job_id")
+    if not isinstance(jid, str) or not jid:
+        raise SubmitError(f"alloc-id 未返回 job_id：{out[:400]!r}")
+    # 跨语言分叉自检：分配器返回的 id 必须过本面孪生闸（两闸同判是本面的硬前提，
+    # 不过即显式报警——绝不把未过闸的 id 拿去拼路径）。
+    if not _valid_job_id(jid):
+        raise SubmitError(
+            f"alloc-id 返回的 job_id 未过本面孪生闸（跨语言分叉信号）：{jid!r}"
+            f"——{_job_id_reject_reason(jid)}")
+    return jid
+
+
+# 生效条件：三槽合法、单元 ∈ 五单元闭集、号位未满、HIVE_EXE 可用 →
+# 分配 job_id（`_alloc_job_id`，**目录即由它创建**）→ 落 spec.json → 落
+# status.json（state=pending），返回 job_id；分配失败（含 HIVE_EXE 不可用）→
+# 抛 SubmitError（调用方转成显式 ok:False）。
+# 写序与 rust `job::init_job_with_slots` 同款：spec.json 先行、status.json 后写
+# = 「任务就绪」信号，serve 只领取见到 status.json 且 state=pending 的任务。
+# P11（批次53）：_result_anchor_key() 解析到密钥时 status 追加
+# result_nonce=uuid4 hex（任务自此声明锚预期，serve 侧 classify_result 采信 done
+# 前校验 result_anchor），密钥缺失则不加该键（旧格式，行为零变更）。
+# 不适用条件：**不再自造 id**（B7/B8：`f"h{毫秒}_{uuid6}"` 已退场，id 一律由
+# Rust 侧分配器独占创建得出）；不做槽合法性校验（那是分配器的判据面，
+# 本面不持第二套——B8 四槽必填由 _t_spawn/orch._spawn 在调用前显式拦）。
+def _submit(jobs: str, spec: dict, identity: str, task: str, unit: str) -> str:
+    job_id = _alloc_job_id(jobs, identity, task, unit)
     d = os.path.join(jobs, job_id)
-    os.makedirs(d, exist_ok=True)
     with open(os.path.join(d, "spec.json"), "w", encoding="utf-8") as f:
         json.dump(spec, f, ensure_ascii=False)
+    nonce = uuid.uuid4().hex if _result_anchor_key() is not None else None
+    status = {
+        "job_id": job_id,
+        "state": "pending",
+        "created_ts": int(time.time() * 1000),
+        "started_ts": None,
+        "heartbeat_ts": None,
+        "elapsed_s": 0.0,
+        "timeout_s": spec.get("timeout_s", 300),
+        "model": spec.get("model"),
+        "pid": None,
+        "error": None,
+    }
+    if nonce:
+        # 秘密性归锚密钥；nonce 只求任务内唯一（防锚跨任务复用）
+        status["result_nonce"] = nonce
     with open(os.path.join(d, "status.json"), "w", encoding="utf-8") as f:
         json.dump(
-            {
-                "job_id": job_id,
-                "state": "pending",
-                "created_ts": int(time.time() * 1000),
-                "started_ts": None,
-                "heartbeat_ts": None,
-                "elapsed_s": 0.0,
-                "timeout_s": spec.get("timeout_s", 300),
-                "model": spec.get("model"),
-                "pid": None,
-                "error": None,
-            },
+            status,
             f,
             ensure_ascii=False,
         )
@@ -274,6 +711,13 @@ def _submit(jobs: str, spec: dict) -> str:
 # 不受影响，只多付一次冷启解析）。
 _PARSE_CACHE = {}          # path -> (mtime_ns, size, parsed)
 _PARSE_CACHE_MAX = 256
+
+# H-3（坏 status 观测面）：与 rust 侧 job.rs 的同名常量逐字一致——
+#   CORRUPT_MARK = serve 连续 N 拍解析失败后落的**旁证**标记（绝不改写 status.json 本体）；
+#   QUARANTINE_DIR = doctor --quarantine 移入的池内保留区（list_jobs 只收 h 前缀目录，
+#   故移入者自动退出领取面/统计面）。两处不一致 = 两个口径（本仓明令避免）。
+CORRUPT_MARK = "status.corrupt.json"
+QUARANTINE_DIR = "_quarantine"
 
 
 # 生效条件：path 与 parse 给定；os.stat(path) 抛 OSError 时摘除该 path 的缓存项并原样执行 parse()（其异常语义由调用方处理），stat 成功且缓存命中（(st_mtime_ns, st_size) 与登记值相等）时返回登记解析值，否则执行 parse()、成功返回（不抛异常）后登记（含超上限先整体清空）并返回其值。
@@ -303,6 +747,64 @@ def _read_status(jobs: str, job_id: str):
     except (OSError, ValueError):
         return None
     return dict(st) if isinstance(st, dict) else st
+
+
+# 生效条件：jobs 与 job_id 给定；status.json 不存在 → ("absent", None)（提交竞态窗口的正常
+# 时序），存在且解析成功 → ("ok", st)，存在但解析失败 → ("corrupt", 原因文本)（事故信号）。
+# H-3：与 rust `job::read_status_classified` 三态同口径——**必须把「不在」与「坏」分开**，
+# 旧版把两者都压成读不到（None），doctor 里就只剩一个 unknown，事故与正常时序不可分。
+def _status_class(jobs: str, job_id: str):
+    p = os.path.join(jobs, job_id, "status.json")
+    if not os.path.isfile(p):
+        return ("absent", None)
+    st = _read_status(jobs, job_id)
+    if st is None:
+        return ("corrupt", f"{p}: status.json 不可解析")
+    return ("ok", st)
+
+
+# 生效条件：jobs 给定——返回隔离保留区（jobs/_quarantine）内的任务名（h 前缀目录，
+# 名升序）；目录不存在/不可读 → 空列表。与 rust `job::quarantined_jobs` 同口径。
+def _quarantined_jobs(jobs: str):
+    root = os.path.join(jobs, QUARANTINE_DIR)
+    try:
+        names = os.listdir(root)
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if n.startswith("h") and os.path.isdir(os.path.join(root, n)))
+
+
+# 「无时间」哨兵 = i64::MIN，与 rust `job::created_ts_of` 逐值同口径（跨语言靠本注释
+# 与两侧单测/对照语料钉死，勿各自发明第二个默认值）。
+_TS_MIN = -(2 ** 63)
+_TS_MAX = 2 ** 63 - 1
+
+
+# 生效条件：jobs 与 job_id 给定——返回该任务 status.json 的 created_ts 真值（Unix 毫秒）；
+# 缺失 / 非数 / 负值 / 非有限 / status.json 缺失或不可解析 → _TS_MIN（与 rust
+# `job::created_ts_of` 同判据：读失败不抛异常、按缺失处理且结果确定）。**只读**。
+def _created_ts_of(jobs: str, job_id: str):
+    """created_ts 真值读取单点（排序键；不做任何状态判读）。"""
+    st = _read_status(jobs, job_id)
+    ts = st.get("created_ts") if isinstance(st, dict) else None
+    # bool 是 int 子类，但 rust 侧 Json::Bool 不是 Num → 同样按「非数」处理。
+    if isinstance(ts, bool) or not isinstance(ts, (int, float)):
+        return _TS_MIN
+    if ts != ts or ts < 0 or ts in (float("inf"), float("-inf")):
+        return _TS_MIN
+    # rust `n as i64` 是饱和转型，此处同口径（超界不静默加宽）。
+    return max(_TS_MIN, min(_TS_MAX, ts))
+
+
+# 生效条件：jobs 给定——返回池内任务名（h 前缀目录）按 **created_ts 真值升序**，
+# 次键 id 字典序（与 rust `job::list_jobs_by_created` 同一排序键：同哨兵值内按名序，
+# 总序确定且与目录枚举次序无关）；目录不可读的异常语义与旧 sorted(listdir) 一致。
+# 消费者：_t_poll 无参列表与 _t_doctor 汇总遍历（两处必须走本单点，勿各自 sorted）。
+def _list_jobs_by_created(jobs: str):
+    names = [n for n in os.listdir(jobs)
+             if n.startswith("h") and os.path.isdir(os.path.join(jobs, n))]
+    return sorted(names, key=lambda n: (_created_ts_of(jobs, n), n))
 
 
 def _load_json_file(p: str):
@@ -342,15 +844,32 @@ def _result_view(job_dir: str, head):
 # 宿主照 hive/README.md「spec 字段」表传 command / commands / orchestrate / workdir 时——
 # 前三个只属 CLI/spec 层（exec_cmd.py / orch.py），workdir 由本面强制取进程 cwd——四者皆被
 # 静默丢弃，表现为「以为在跑确定性任务、实际走了 LLM 路径烧 token」。故显式拒绝并指路 CLI。
+# depends_on（H-6）在列：它是**调度语义**键（deps_gate 读 spec.json），本面收下并过
+# 格式+存在性两闸后原样写入 spec；闸不过即拒（见 _dep_gate / _t_spawn）。
+# identity/task/unit（id 契约 v2 · B8）在列：它们是**必填**的四槽之三（第四槽「编号」
+# 由 Rust 侧分配器给出），本面收下**不写进 spec**——它们只喂给 `HIVE_EXE alloc-id`
+# 分配 id（分配器是单点，本面不持第二套）；不进白名单就会在「未知键显式拒绝」处
+# 被误杀，故必须在此列出。
 SPAWN_ALLOWED_KEYS = frozenset({
     "model", "user_prompt", "system_prompt", "context_files", "timeout_s",
     "reasoning_effort", "context_budget_tokens", "context_strict", "thinking",
     "tools", "max_tool_rounds", "mdcg_root", "web_search_backend",
-    "max_tokens", "temperature",
+    "max_tokens", "temperature", "depends_on",
+    "identity", "task", "unit",
 })
 
 
-# 生效条件：a 给定；当 a 含 SPAWN_ALLOWED_KEYS 之外的键、a.get("model") 去空白后为空、a.get("user_prompt") 去空白后为空、或 a.get("context_files") 中任一项（相对项按 os.getcwd() 拼接）未通过 isfile 时返回 ok: False 与对应 error，否则组装 spec（timeout_s/context_budget_tokens 以 int(x or 默认) 把 0/空值/缺键回落默认，workdir 固定为 os.getcwd()）并返回 ok: True 含 job_id/jobs_dir/serve。
+# 生效条件：a 给定；当 a 含 SPAWN_ALLOWED_KEYS 之外的键、a.get("model") 去空白后为空、
+# a.get("user_prompt") 去空白后为空、**四槽之三（identity/task/unit）任一缺失或空白**、
+# a.get("context_files") 中任一项（相对项按 os.getcwd() 拼接）未通过 isfile 时返回
+# ok: False 与对应 error；**依赖门禁（H-6）**：a.get("depends_on") 非 None 时经
+# _dep_gate(jobs, ...) 过两道闸（格式=job_id 结构，与 rust job::valid_job_id 同判据；
+# 存在性=jobs/<dep> 是目录，与 CLI 同口径），任一不过返回 ok: False 与可读 error
+# （**不写 spec、不拉 serve、不降级为「无依赖」**）；全过（或未传）则组装 spec
+# （timeout_s/context_budget_tokens 以 int(x or 默认) 把 0/空值/缺键回落默认，workdir
+# 固定为 os.getcwd()，depends_on 非 None 时原样写入列表）并**调 HIVE_EXE alloc-id
+# 分配 id**（`_submit`：本面不自造 id），分配失败（含 HIVE_EXE 不可用）返回
+# ok: False 与原因；成功返回 ok: True 含 job_id/jobs_dir/serve。
 def _t_spawn(a: dict) -> dict:
     unknown = sorted(k for k in a if k not in SPAWN_ALLOWED_KEYS)
     if unknown:
@@ -366,11 +885,32 @@ def _t_spawn(a: dict) -> dict:
             "→ deepseek-flash / deepseek-v4-pro；智谱 base → glm-5.3-flash。子代理推荐 flash 档。")}
     if not (a.get("user_prompt") or "").strip():
         return {"ok": False, "error": "缺必填参数 user_prompt"}
+    # 四槽（B8）：身份/任务/单元**必填**（第四槽「编号」由分配器独占创建给出）。
+    # 位置在 _jobs_dir()/_dep_gate/_ensure_serve **之前**：缺槽不是「可以再等等」
+    # 的状态，fail fast 在触任何文件机械与 serve 之前——**不许静默推导**
+    # （猜错且静默正是 H-1 那半边缺陷的形状）。
+    slots = {k: str(a.get(k) or "").strip() for k in ("identity", "task", "unit")}
+    missing = [k for k, v in slots.items() if not v]
+    if missing:
+        return {"ok": False, "error": (
+            "缺四槽入参——四槽 = 身份/任务/单元/编号，其中 identity / task / unit "
+            f"**必填**（编号由分配器独占创建给出，无需入参），不许静默推导。"
+            f"缺：{'、'.join(missing)}。可照抄示例："
+            "hive_spawn(model=\"deepseek-flash\", user_prompt=\"…\", "
+            "identity=\"zcode端\", task=\"灵枢迭代\", unit=\"反思单元\")——"
+            "单元槽取蜂巢五单元**闭集**（记录单元/反思单元/验证单元/输出单元/维生系统；"
+            "英文键 record/reflect/verify/output/sustain 亦可）。")}
     jobs = _jobs_dir()
     for rel in a.get("context_files") or []:
         path = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
         if not os.path.isfile(path):
             return {"ok": False, "error": f"context 文件不存在: {path}"}
+    # 依赖门禁（H-6）：**写 spec 之前**过与 CLI 同判据的两道闸（格式 + 存在性，
+    # 单点实现 = _dep_gate）。位置在 _ensure_serve 之前——坏 spec 不拉起 serve、
+    # 不落盘，也绝不静默降级为「无依赖」（那会让下游任务在依赖未 done 时被领取）。
+    dep_err = _dep_gate(jobs, a.get("depends_on"))
+    if dep_err:
+        return {"ok": False, "error": dep_err}
     ensure = _ensure_serve(jobs)
     spec = {"model": a["model"].strip(), "user_prompt": a["user_prompt"]}
     if a.get("system_prompt"):
@@ -399,13 +939,24 @@ def _t_spawn(a: dict) -> dict:
         spec["mdcg_root"] = a["mdcg_root"]
     if a.get("web_search_backend"):
         spec["web_search_backend"] = a["web_search_backend"]
+    if a.get("depends_on") is not None:
+        # 依赖门禁已在前面过闸（此处只写）；原样写入、保序、不裁剪——
+        # 显式 `[]` = 提交方声明「无依赖」，同样落键（不是静默省略）。
+        spec["depends_on"] = list(a["depends_on"])
     spec["workdir"] = os.getcwd()
-    job_id = _submit(jobs, spec)
+    try:
+        # 分配 id 的唯一通道（B7/B8）：`HIVE_EXE alloc-id`（Rust 侧分配器），
+        # 本面不再自造 id；HIVE_EXE 不可用/槽非法/号位用尽 → 显式 ok:False。
+        job_id = _submit(jobs, spec, slots["identity"], slots["task"], slots["unit"])
+    except SubmitError as e:
+        return {"ok": False, "error": str(e)}
     return {
         "ok": True,
         "job_id": job_id,
         "jobs_dir": jobs,
         "serve": ensure,
+        "slots": {"identity": slots["identity"], "task": slots["task"],
+                  "unit": slots["unit"]},
         "spec_defaults": {
             "reasoning_effort": spec["reasoning_effort"],
             "context_budget_tokens": spec["context_budget_tokens"],
@@ -422,17 +973,14 @@ def _t_poll(a: dict) -> dict:
     if job_id:
         if not _valid_job_id(job_id):
             return {"ok": False,
-                    "error": f"job_id 非法: {job_id}（须为 h 开头且不含路径成分）"}
+                    "error": f"job_id 非法: {job_id}——{_job_id_reject_reason(job_id)}"}
         d = os.path.join(jobs, job_id)
         if not os.path.isdir(d):
             return {"ok": False, "error": f"任务不存在: {job_id}"}
         st = _read_status(jobs, job_id) or {"error": "status 不可读"}
         st["result"] = _result_view(d, head=None)  # 单查给全文
         return {"ok": True, "job": st}
-    ids = sorted(
-        n for n in os.listdir(jobs)
-        if n.startswith("h") and os.path.isdir(os.path.join(jobs, n))
-    )
+    ids = _list_jobs_by_created(jobs)
     active_states = {"pending", "claimed", "running"}
     items = []
     for jid in ids:
@@ -456,28 +1004,43 @@ def _t_kill(a: dict) -> dict:
     job_id = a.get("job_id") or ""
     if not _valid_job_id(job_id):
         return {"ok": False,
-                "error": f"job_id 非法: {job_id}（须为 h 开头且不含路径成分）"}
+                "error": f"job_id 非法: {job_id}——{_job_id_reject_reason(job_id)}"}
     d = os.path.join(jobs, job_id)
     if not os.path.isdir(d):
         return {"ok": False, "error": f"任务不存在: {job_id}"}
     flag = os.path.join(d, "kill")
     if not os.path.exists(flag):
-        open(flag, "w").close()
+        # 空标记文件：内容无实义（消费方 job.rs:344-346 只判存在），
+        # 仍显式声明 encoding —— 判据「凡文本模式一律显式」（B 项，零例外）。
+        open(flag, "w", encoding="utf-8").close()
     return {"ok": True, "job_id": job_id, "hint": "worker 检测到 kill 标志后强杀（≤1s）"}
 
 
-# 生效条件：_a 给定且内容未被使用；遍历 jobs 下以 "h" 开头的目录按 (status or {}).get("state") or "unknown" 计数并读 _heartbeat(jobs) 后返回单个 ok: True 字典，其中 serve_alive=_serve_alive(jobs)、exe_found=os.path.isfile(_exe_path())、exec_source 依 hb.get("exec_py") 真值取 "serve_heartbeat" 否则 "no_heartbeat_or_legacy"。
+# 生效条件：_a 给定且内容未被使用；遍历 jobs 下以 "h" 开头的目录按三态分类（_status_class，H-3）计数——
+# ok 取 (status or {}).get("state") or "unknown"、absent 计 "no_status"（提交竞态窗口）、corrupt 计独立类别
+# "corrupt" 并进 corrupt_jobs 明细（job_id/error/marker）；再读 _heartbeat(jobs) 与隔离保留区（quarantined）
+# 后返回单个 ok: True 字典，其中 serve_alive=_serve_alive(jobs)、exe_found=os.path.isfile(_exe_path())、
+# exec_source 依 hb.get("exec_py") 真值取 "serve_heartbeat" 否则 "no_heartbeat_or_legacy"。
 def _t_doctor(_a: dict) -> dict:
     jobs = _jobs_dir()
     exe = _exe_path()
     cfg, cfg_err = _load_local_config()
     states = {}
-    for jid in sorted(
-        n for n in os.listdir(jobs)
-        if n.startswith("h") and os.path.isdir(os.path.join(jobs, n))
-    ):
-        st = _read_status(jobs, jid)
-        s = (st or {}).get("state") or "unknown"
+    corrupt_jobs = []
+    for jid in _list_jobs_by_created(jobs):
+        kind, st = _status_class(jobs, jid)
+        if kind == "ok":
+            s = (st or {}).get("state") or "unknown"
+        elif kind == "corrupt":
+            # H-3：坏 status 单列独立类别 + 明细（不再被压进 unknown 里静默）
+            s = "corrupt"
+            corrupt_jobs.append({
+                "job_id": jid,
+                "error": st,
+                "marker": os.path.isfile(os.path.join(jobs, jid, CORRUPT_MARK)),
+            })
+        else:
+            s = "no_status"
         states[s] = states.get(s, 0) + 1
     hb = _heartbeat(jobs)
     return {
@@ -487,6 +1050,14 @@ def _t_doctor(_a: dict) -> dict:
         "exe_path": exe,
         "jobs_dir": jobs,
         "task_states": states,
+        # H-3 观测面（与 CLI `hive doctor` 同口径）：坏 status 明细 + 已隔离件清单
+        "corrupt_jobs": corrupt_jobs,
+        "quarantine_dir": os.path.join(jobs, QUARANTINE_DIR),
+        "quarantined": _quarantined_jobs(jobs),
+        "corrupt_note": ("corrupt=status.json 存在但不可解析（事故信号，不自动终态化——"
+                         "那会把坏文件静默吞掉）；处置=`hive doctor --quarantine` 移出池"
+                         "（可 `--unquarantine` 退回），坏字节原样保留供诊断。"
+                         "no_status=任务目录在但 status.json 尚未出现（提交竞态窗口，正常时序）。"),
         # 执行器资格（**优先采信 serve 自报的心跳**，与 CLI doctor 同口径）
         "exec_py": hb.get("exec_py"),
         "exec_mode": hb.get("exec_mode"),
@@ -558,7 +1129,7 @@ def _t_restart(_a: dict) -> dict:
 TOOLS = [
     {
         "name": "hive_spawn",
-        "description": "灵枢蜂巢：提交 LLM 任务到并发队列（毫秒级返回 job_id，后台执行不阻塞）。统一子代理默认：reasoning_effort=high / context_budget_tokens=200000 / timeout_s=600。**只接受下方 properties 列出的 15 个参数**：白名单外的键（如 command / commands / orchestrate / workdir）会被显式拒绝——确定性执行（跑命令/测试/回归）与编排请改走 CLI（hive submit + hive/exec_cmd.py / orch.py）。",
+        "description": "灵枢蜂巢：提交 LLM 任务到并发队列（毫秒级返回 job_id，后台执行不阻塞）。四槽必填：identity / task / unit（id = h_<身份>_<任务>_<单元>_<编号>，编号由 Rust 侧分配器独占创建给出；单元槽取蜂巢五单元闭集）。统一子代理默认：reasoning_effort=high / context_budget_tokens=200000 / timeout_s=600。**只接受下方 properties 列出的 19 个参数**：白名单外的键（如 command / commands / orchestrate / workdir）会被显式拒绝——确定性执行（跑命令/测试/回归）与编排请改走 CLI（hive submit + hive/exec_cmd.py / orch.py）。",
         "inputSchema": {
             "type": "object",
             "properties": {
@@ -581,8 +1152,38 @@ TOOLS = [
                 "web_search_backend": {"type": "string", "description": "web_search 后端（可选）"},
                 "max_tokens": {"type": "number", "description": "可选"},
                 "temperature": {"type": "number", "description": "可选，[0,2]"},
+                "depends_on": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "description": ("上游任务 job_id 列表（可选）：全 done 才被领取，"
+                                    "任一上游 error/timeout/killed/needs_review → 本任务"
+                                    "直接 error（失败传播）。每个 id 须为 h 开头且不含"
+                                    "路径成分，且 jobs/<id> 目录必须已存在——不过闸即"
+                                    "拒绝提交（不静默忽略、不降级为「无依赖」）。"),
+                },
+                "identity": {
+                    "type": "string",
+                    "description": ("身份槽（**必填**，id 契约 v2 四槽之一）：提交者/端别，"
+                                    "如 zcode端。落进 job_id = h_<身份>_<任务>_<单元>_<编号>；"
+                                    "只收**区块白名单**（hive/id_charset_blocks.txt）内的"
+                                    "字母/数字（不含 `_` `.` 与路径成分），表内形态即已 "
+                                    "NFC 稳定（**不做静默归一化**，表外形态直接拒收）。"
+                                    "不许省略、不许推导。"),
+                },
+                "task": {
+                    "type": "string",
+                    "description": ("任务槽（**必填**，四槽之一）：工作流/迭代名，如 灵枢迭代。"
+                                    "字符口径同 identity；目录可作它的父段（成 5 段）。"),
+                },
+                "unit": {
+                    "type": "string",
+                    "description": ("单元槽（**必填**，四槽之一）：蜂巢五单元**闭集**——"
+                                    "记录单元 / 反思单元 / 验证单元 / 输出单元 / 维生系统"
+                                    "（英文键 record / reflect / verify / output / sustain "
+                                    "二选一，落 id 一律中文名）。副代理不是第六单元。"),
+                },
             },
-            "required": ["model", "user_prompt"],
+            "required": ["model", "user_prompt", "identity", "task", "unit"],
         },
     },
     {

@@ -30,6 +30,22 @@ import os
 import subprocess
 import sys
 
+# ---------------------------------------------------------------- 入口自保证 UTF-8
+# 约束（工作纪律第 15 条）：本调用必须在**任何文件/库 I/O 之前**——utf8_boot.ensure_utf8
+# 在解释器未开 UTF-8 模式时以相同 argv 重启自身（-X utf8），早于它的任何 open/stdio
+# 读写都走 locale 编码（Windows 中文机 = cp936：裸 open 抛 UnicodeDecodeError、中文写
+# 落 GBK 字节）。本文件是被本仓测试与 CI 直接调用的全量入口，必须最先保证。仓库根入
+# sys.path 的形态照 hive/exec.py::_md_cg_import 的最小写法（助手在仓根）。
+# 被 import（本模块非 __main__）时助手只置子进程继承面、绝不重启/退出——F6：静默重启
+# 会吞掉调用方输入。
+_UTF8_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _UTF8_ROOT not in sys.path:
+    sys.path.insert(0, _UTF8_ROOT)
+from utf8_boot import ensure_utf8  # noqa: E402
+
+ensure_utf8(__file__)
+
+
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
 
@@ -154,6 +170,13 @@ _SERIAL_ONLY = {
     # 同形态（2026-09-25 全量实测）：加速比 > 2 宽松下限在 --jobs 4 争抢下
     # 1.91× 假红（单跑 2.96×），与 bench_swarm_scale 同为负载敏感吞吐断言。
     "swarm.tests.bench_swarm_parallel",
+    # 注（2026-09-30）：scripts.test_judgment_manifest **不**入本集合——它曾在并行下
+    # 不安全（弱化实验就地改写被追踪文件 hive/test_exec_tools.py），但收口走**结构面**
+    # （实验改在临时副本上做、守卫对仓内文件全程只读，见
+    # scripts/test_judgment_manifest.py 节 [2] 与 _materialize）。理由：本集合是调度侧
+    # **跳过**，加入即把 #36 覆盖守卫整条移出默认跑法（--jobs 4）的执行集——「守卫不再
+    # 运行」比偶发红更贵；且跳过符只作用于本层 run_tests，挡不住嵌套套件
+    # （md_cg/test_interop_judgment.py:202 内层 run_tests）与手跑并发的第二实例。
 }
 
 

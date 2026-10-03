@@ -45,7 +45,7 @@ import os
 import random
 import time
 
-from . import forgetting, protect
+from . import forgetting, nodefile, protect
 from .fsutil import append_jsonl, read_jsonl
 from .mdcg import bigrams
 
@@ -450,7 +450,12 @@ def _kv_pairs(content) -> dict:
             if sep in line:
                 k, _, v = line.partition(sep)
                 k, v = k.strip(), v.strip()
-                if 2 <= len(k) <= 12 and v and k not in _SKIP_KEYS:
+                # CCG 六要素行（`# 功能名：` / `# 不适用条件：` …）是**逐节点声明**，
+                # 不是可跨节点比对的断言值。把「不适用条件」当键会让语义无关的节点
+                # 互为「同键不同值」矛盾（实测 12 抽样里 9 条 high 全是这类误报，
+                # 且 apply 会把好节点 weaken+demote 并跨层移动文件）。
+                if (2 <= len(k) <= 12 and v and k not in _SKIP_KEYS
+                        and not nodefile.is_ccg_mark(k)):
                     out.setdefault(k, v)
                 break
     return out
@@ -642,7 +647,12 @@ def decontaminate(cg, node_ids=None, *, kinds=None, dry_run: bool = True,
         nid, kind = issue["node_id"], issue["kind"]
         if kinds and kind not in kinds:
             continue
-        if kind in ("duplicate", "unverified"):
+        # 只给建议的动作必须按 CONTAMINATION 的**声明**判定，不能靠 kind 白名单：
+        # `not_yet` 声明 fix=("hint",)，原实现只排除 duplicate/unverified，
+        # 于是它会落到 _weaken 分支（实测 min_severity="info" 时 confidence
+        # 0.6→0.45、negative_evidence 0→1），声明与实修不一致。
+        _declared = CONTAMINATION.get(kind, (None, ()))[1]
+        if kind in ("duplicate", "unverified") or _declared == ("hint",):
             n_hint += 1
             actions.append({"node_id": nid, "kind": kind, "action": "hint",
                             "detail": issue["detail"], "applied": False})
@@ -705,8 +715,8 @@ def decontaminate(cg, node_ids=None, *, kinds=None, dry_run: bool = True,
 # ④ 校准偏差
 # --------------------------------------------------------------------------
 
-# 生效条件：对 cg 中每个「layer 不在 SELF_LAYERS」且 evidence_count≥int(min_evidence)（min_evidence=0 时该比较恒假而不早退）的节点，若 protect.is_protected 为假或 override 为真，且 cg.get(nid) 未抛异常并返回真值节点，则取 fm.get("confidence", 0.6)（缺键才回落 0.6，键存在为 None/假值不回落）为 old，算出 round(max(0.0, min(0.99, old+float(offset))),4)，与 old 差<1e-9 时跳过，否则写 fm["confidence"] 与 fm["calibration"] 并调用 cg._write_node 成功时 adjusted+1（写回异常被吞掉不计数），返回 (adjusted, skipped)，其中 skipped 只累计「layer 属 SELF_LAYERS」或被 protect 拦下且非 override 的节点。
-def _apply_offset(cg, offset, *, override=False, min_evidence=1):
+# 生效条件：对 cg 中每个「layer 不在 SELF_LAYERS」且 evidence_count≥int(min_evidence)（min_evidence=0 时该比较恒假而不早退）的节点，若 protect.is_protected 为假或 override 为真，且 cg.get(nid) 未抛异常并返回真值节点，则先以节点真层/敏感度过 protect.guard_overwrite（层闸 + 保护闸，override 为真时先快照 + 审计，越权抛 AccessDenied 且整批中止），再取 fm.get("confidence", 0.6)（缺键才回落 0.6，键存在为 None/假值不回落）为 old，算出 round(max(0.0, min(0.99, old+float(offset))),4)，与 old 差<1e-9 时跳过，否则写 fm["confidence"] 与 fm["calibration"] 并调用 cg._write_node，成功后置 cg._dirty[nid]=e（**标脏**：推进读缓存代际与索引增量日志）并 adjusted+1（写回异常被吞掉不计数），返回 (adjusted, skipped)，其中 skipped 只累计「layer 属 SELF_LAYERS」或被 protect 拦下且非 override 的节点。
+def _apply_offset(cg, offset, *, override=False, min_evidence=1, actor=None):
     nodes = _nodes(cg)
     adjusted = skipped = 0
     for nid, e in nodes.items():
@@ -726,6 +736,20 @@ def _apply_offset(cg, offset, *, override=False, min_evidence=1):
         if not node:
             continue
         fm = node.get("frontmatter") or {}
+        # N222（2026-09-28，同族未接线写点）：本函数是 calibrate 落库动作，此前
+        # 直调 `cg._write_node` 改写**全库** `layer∉(self,anchor)` 且
+        # `evidence_count≥1` 节点的 confidence/calibration——不过 principal 层写
+        # 白名单、不过引擎级保护闸、`override` 形参直通（含 importance≥0.7 的
+        # 不可遗忘节点），无快照无审计。持 sustain 令牌（`tokens.py:190`
+        # `layers_allow=('self',)`）即可改 knowledge 层节点置信度（实测
+        # `n_adjusted=5`，0.8→0.95；`override=True` 再 +1）。落盘前统一过
+        # `protect.guard_overwrite`：层/敏感度取**节点 fm 真值**（不信索引缓存），
+        # 解析与层闸由 `protect.require_layer` 单点承担，越权即 AccessDenied
+        # 整批中止（fail-closed，不静默跳过——否则越权面被伪装成「无可校准节点」）；
+        # `override=True` 走同一闸的显式放行分支（快照 + `_protected_audit.jsonl`）。
+        protect.guard_overwrite(cg, nid, layer=fm.get("layer"),
+                                sensitivity=fm.get("sensitivity"),
+                                override=override, actor=actor)
         old = float(fm.get("confidence", 0.6))
         new = round(max(0.0, min(0.99, old + float(offset))), 4)
         if abs(new - old) < 1e-9:
@@ -736,6 +760,18 @@ def _apply_offset(cg, offset, *, override=False, min_evidence=1):
         try:
             cg._write_node(nid, os.path.join(cg.root, e["path"]), fm,
                            node.get("content") or "")
+            # 标脏（N133 修复，对照先例 md_cg/mdcg.py 的 update_tags / verify
+            # 直写分支 `self._dirty[node_id] = e`）：本函数原先写盘后**完全不
+            # 碰索引**（条目字段集不含 confidence，无需同步），但正因如此
+            # path_gen 不推进 ⇒ 读缓存（默认开）把写盘前的旧 fm 判新鲜——
+            # 同进程「calibrate 后读」拿旧 confidence（其余两处同族写点
+            # forgetting.reinforce / insight.verify 同批补标脏）。标脏同时
+            # 让本写进 `_dirty → flush → _index_log` 重放。**不下沉进
+            # `_write_node`**：该口另有「只对账索引不落盘」的调用方，下沉会
+            # 凭空产生写入代际与自重载。
+            _dirty = getattr(cg, "_dirty", None)
+            if isinstance(_dirty, dict):
+                _dirty[nid] = e
             adjusted += 1
         except Exception:                                 # noqa: BLE001
             pass
@@ -767,7 +803,8 @@ def calibrate(cg, *, apply: bool = False, override: bool = False, actor=None,
     adjusted = skipped = 0
     if apply and abs(offset) > 1e-9:
         adjusted, skipped = _apply_offset(cg, offset, override=override,
-                                          min_evidence=min_evidence)
+                                          min_evidence=min_evidence,
+                                          actor=actor)
         _log(cg, "calibrate", ok=True, offset=offset, gap=gap,
              adjusted=adjusted, actor=actor)
     blind = 0

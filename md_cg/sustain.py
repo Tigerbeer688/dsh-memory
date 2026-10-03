@@ -70,11 +70,70 @@ DEFAULT_HEAL_INTERVAL = 300.0     # 自愈巡检 5min
 DEFAULT_SCRUB_INTERVAL = 3600.0   # 记忆自净（抽查/去污染/校准）1h
 DEFAULT_EVOLVE_INTERVAL = 7200.0  # 演化巡检（固化/重要性候选盘点）2h；只读
 DEFAULT_TIDY_INTERVAL = 21600.0   # 整理巡检（contextual 同构组聚合）6h
+
+# ---- 四档 `auto_*` 缺省的**单一真源**（P0-2，2026-10-01）--------------------
+# 为什么要有这张表：同一组缺省此前在**三处**各写一份——op 路径
+# （mcp_server.py 的 `_sustain_call` start 分支）、env 路径（`_start_sustain`）
+# 与 `SustainLoop.__init__` 形参。三份必然漂移，且已经漂了：`auto_tidy` 在
+# op 路径是 `False`、在 env 路径是 `"1"`（True）——同一个 `(root,name)` 走哪条
+# 入口得到相反的整理语义，是**对外可见的缺省不一致**。
+# 纪律：改缺省只改这里；调用点只许经 `auto_default` / `auto_from_env` /
+# `auto_from_args` 读取，**不得再写第二处字面量**（守卫 test_auto_defaults.py 钉死）。
+#
+# ⚠ 本轮**对外可见的缺省变更**（P0-2 裁决值 = 开）：`auto_tidy` 由 op 路径原
+# 字面量 `False` 收敛为 `True`，取 env 路径（生产路径：常驻 serve 自启）既有值
+# ——该动作确定性、永不删除节点、可逆可审计（见 `_tick_tidy` 说明），op 路径的
+# `False` 是唯一错位项。**opt-out：`MDCG_AUTO_TIDY=0`（env 路径）／显式传
+# `auto_tidy=false`（op 路径——显式入参仍优先于本表）。**
+AUTO_DEFAULTS = {"auto_heal": True, "auto_scrub": False,
+                 "auto_evolve": False, "auto_tidy": True}
+#: 各 `auto_*` 的 env 覆盖键（env 路径入口照此读；即各档的 opt-out 名）。
+AUTO_ENVS = {"auto_heal": "MDCG_SUSTAIN_AUTOHEAL",
+             "auto_scrub": "MDCG_AUTO_SCRUB",
+             "auto_evolve": "MDCG_AUTO_EVOLVE",
+             "auto_tidy": "MDCG_AUTO_TIDY"}
+#: 关断字面量——与两入口既有口径逐字一致的三写法（`0` / `false` / `False`）。
+AUTO_OFF_VALUES = ("0", "false", "False")
+
 DEFAULT_WARN_FACTOR = 2.5         # 2.5× 心跳间隔 → 警告
 DEFAULT_DEAD_FACTOR = 3.5         # 3.5× → 失联
 DEFAULT_WORKING_FACTOR = 2.0      # 任务执行中阈值 ×2
 STALE_TEMP_AGE = 3600.0           # 临时文件超过 1h 视为陈旧
+ACCESS_LOG_COMPACT_LINES = 500    # 访问日志超过该行数即折叠（否则无上限增长）
 _POLL = 0.2                       # 循环轮询步长（常驻进程 CPU 可忽略）
+
+
+# 生效条件：name 为 AUTO_DEFAULTS 的键时返回该档缺省的 bool（真源表取值，无副作用）；键不存在时抛 KeyError（不做静默回落——拼错档名即为编程错误）。
+def auto_default(name: str) -> bool:
+    """`auto_*` 缺省的真源读取（无环境、无入参）。"""
+    return bool(AUTO_DEFAULTS[name])
+
+
+# 生效条件：name 为 AUTO_DEFAULTS 的键时，从 environ（缺省 os.environ）按 AUTO_ENVS[name] 取名取值，缺键时回落「真源缺省对应的字面量」（真值→"1"、假值→"0"）；取值经 str() 后不属于 AUTO_OFF_VALUES 即为真。返回 bool。
+def auto_from_env(name: str, environ=None) -> bool:
+    """env 路径（常驻 serve 自启）的 `auto_*` 读取器。
+
+    与改动前的逐处字面量**同义**：`os.environ.get(<键>, <默认>) not in
+    ("0", "false", "False")`——默认字面量由真源表推出，不再各写一份。
+    """
+    env = os.environ if environ is None else environ
+    return str(env.get(AUTO_ENVS[name],
+                       "1" if AUTO_DEFAULTS[name] else "0")) not in AUTO_OFF_VALUES
+
+
+# 生效条件：args 为 dict 且含 name 键时返回 bool(args[name])（显式传 None 亦为 False——与改动前 `bool(a.get(name, <默认>))` 逐字同义）；args 非 dict 或缺该键时回落 auto_default(name)。
+def auto_from_args(name: str, args, environ=None) -> bool:
+    """op 路径（工具面 `sustain action=start`）的 `auto_*` 读取器。
+
+    判据是**键在不在**而不是值真假：`{"auto_tidy": False}` 与
+    `{"auto_tidy": None}` 都按「显式给了」处理（前者关、后者按 bool(None)=False
+    关），缺键才回落真源缺省——与改动前 `a.get(name, default)` 的语义一字不差。
+    `environ` 仅为签名对齐 `auto_from_env`（op 路径不读 env；保留位以免调用点
+    两边形参不一致）。
+    """
+    if isinstance(args, dict) and name in args:
+        return bool(args[name])
+    return auto_default(name)
 
 
 # --------------------------------------------------------------------------
@@ -393,7 +452,11 @@ def _locked_nodes(cg) -> int:
     if st.get("unlocked"):
         return 0
     nodes = (getattr(cg, "index", {}) or {}).get("nodes") or {}
-    return sum(1 for e in nodes.values()
+    # H-4 止血：取用前先取快照——`nodes` 是**共享可变面**（前台 add/flush 会改
+    # 同一 dict），裸迭代撞上并发写即 RuntimeError('dictionary changed size
+    # during iteration')（N138，FI-M04）。list() 拷贝在 C 层一次完成（迭代期间
+    # 不释放 GIL），故快照自身原子；判据与结果逐位不变（只换取用方式）。
+    return sum(1 for e in list(nodes.values())
                if (e.get("sensitivity") or "") in crypto.ENCRYPTED_LEVELS)
 
 
@@ -418,7 +481,8 @@ def _ccg_backlog(nodes: dict, top: int) -> dict:
     """
     n = no_basis = no_neg = 0
     sample = []
-    for nid, e in nodes.items():
+    # H-4 止血：快照迭代（同 `_locked_nodes` 注释；N138 裸迭代崩溃面）。
+    for nid, e in list(nodes.items()):
         mb = not e.get("verification_basis")
         mn = not e.get("has_neg_conditions")
         no_basis += 1 if mb else 0
@@ -445,7 +509,9 @@ def evolution_candidates(cg, *, layer: str = None, top: int = 8,
     """
     nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
     if layer:
-        nodes = {k: v for k, v in nodes.items() if v.get("layer") == layer}
+        # H-4 止血：快照迭代（N138 裸迭代崩溃面）——过滤结果另建新 dict，
+        # 与旧式字典推导逐项同序同值。
+        nodes = {k: v for k, v in list(nodes.items()) if v.get("layer") == layer}
     from . import weights
     md = weights.APPLY_DELTA if min_delta is None else float(min_delta)
     imp = weights.recalc(cg, layer=layer, apply=False, min_delta=md,
@@ -481,7 +547,13 @@ def diagnose(cg, *, name: str = "md_cg", stale_temp_age: float = STALE_TEMP_AGE,
         issues.append({"code": "index_drift", "severity": "warning",
                        "detail": f"索引 {len(nodes)} ≠ 磁盘 {disk}",
                        "fix": "rebuild_index"})
-    orphans = [nid for nid, e in nodes.items()
+    # H-4 止血：快照迭代（N138：前台 add/flush 与后台巡检共用一个 MdCG 实例，
+    # 索引 dict 是共享可变面；裸 items() 撞并发写即 RuntimeError）。
+    # 面**不止本文件**：本函数默认参数还会经 evolution_candidates → weights.recalc
+    # → weights.coverage_index，且下面无条件调 refindex.check_refs——那些站点同样
+    # 作用于这个共享 dict，必须一并取快照（否则只切在这里等于没止血；见
+    # md_cg/test_h4_sustain_snapshot.py 的全域扫描器与目标级判据）。
+    orphans = [nid for nid, e in list(nodes.items())
                if e.get("path")
                and not os.path.exists(os.path.join(root, e["path"]))]
     if orphans:
@@ -491,9 +563,25 @@ def diagnose(cg, *, name: str = "md_cg", stale_temp_age: float = STALE_TEMP_AGE,
 
     shards = _index_log_shards(root)
     if shards:
-        issues.append({"code": "index_log_backlog", "severity": "info",
+        # severity 必须是 warning：_tick_heal 只在 rep["ok"] 为假（即存在 warning）时
+        # 才进 heal()，标 info 会让本问题永远进不了修复路径。
+        issues.append({"code": "index_log_backlog", "severity": "warning",
                        "detail": f"{len(shards)} 个索引增量分片未合并",
-                       "fix": "flush_index"})
+                       "fix": "compact_index"})
+
+    _acc_log = os.path.join(root, "_access.log")
+    _acc_lines = 0
+    try:
+        if os.path.exists(_acc_log):
+            with open(_acc_log, encoding="utf-8", errors="replace") as _af:
+                _acc_lines = sum(1 for _ in _af)
+    except OSError:
+        _acc_lines = 0
+    if _acc_lines > ACCESS_LOG_COMPACT_LINES:
+        issues.append({"code": "access_log_backlog", "severity": "warning",
+                       "detail": f"访问日志 {_acc_lines} 行未折叠进节点"
+                                 f"（> {ACCESS_LOG_COMPACT_LINES}）",
+                       "fix": "compact_access"})
 
     temps = _list_stale_temps(root, stale_temp_age)
     if temps:
@@ -528,7 +616,11 @@ def diagnose(cg, *, name: str = "md_cg", stale_temp_age: float = STALE_TEMP_AGE,
         issues.append({"code": "ref_dangling", "severity": "warning",
                        "detail": f"{len(refs['dangling'])} 个 ref 悬空（源文件已删除）",
                        "sample": [r.get("path") for r in refs["dangling"][:5]],
-                       "fix": "rebuild_refs"})
+                       # 悬空**没有**自动动作：源已不在，重切只能扫到 0 个文件
+                       # （refindex.rebuild 的 roots_missing 侧已拦住「水位被写空」），
+                       # 处置走 op=ref action=prune 或恢复真源后重建 ⇒ 不承诺够不着的
+                       # 动作（fix 只被展示面消费，改它是口径修正而非行为开关）。
+                       "fix": None})
     if refs.get("truncated"):
         issues.append({"code": "ref_check_truncated", "severity": "info",
                        "detail": f"ref 巡检只覆盖前 {refs['max_nodes']} 个节点，结果不完整",
@@ -609,43 +701,161 @@ def _audit(root: str, op: str, action: str, detail: str = ""):
                   "detail": str(detail)[:200], "pid": os.getpid()})
 
 
-# 生效条件：按 diagnose(cg, name=name, stale_temp_age=stale_temp_age) 的 issues code 集合分派——命中 index_drift/index_orphan 重建索引、ref_stale/ref_dangling 按 ref 重建源索引、index_log_backlog 合并索引分片、stale_temps 清理陈旧临时文件、half_line_logs 修补半截日志；ccg_backlog 仅 allow_evolve=True 且 reflect_fn 非 None 时才 consolidate（否则记 needs_llm），importance_drift 仅 allow_evolve=True 时才重算重要性（否则记 evolve_disabled）；dry_run=True 时各动作只记入 actions 不落盘，返回含 after["ok"]、dry_run、actions、before/after 的 stats 与 t 的 dict；
+# --------------------------------------------------------------------------
+# 同因不重试（自愈的失败记忆）
+#
+# 为什么需要：自愈没有记忆——每 tick 都 diagnose → heal。当病灶**超出预算**时
+# （例：ref_stale 的根因是 rebuild 被 max_files=500 / max_items=2000 截断，
+# 永远重写不到"坏"的那几个节点、截断还跳过对账），每 tick 都会重跑同一次注定
+# 失败的 rebuild、重刷同一批行与审计。记忆 + 退避是唯一有界的止法。
+#
+# 边界（刻意保守）：①只影响**同一信号的重复失败**——首次失败永远真跑、永远如实
+# 上报，绝不把「失败」变成「不报」；②信号变化、或上次结果不坏（ok/truncated 都
+# 好）⇒ 立刻放行重试；③记忆进程内、重启即清（只影响退避节奏，不影响正确性）；
+# ④默认只在常驻循环里启用（`repeat_guard=True`），手动 op=sustain action=heal
+# 不受影响（手动即显式要求试一次）。
+# --------------------------------------------------------------------------
+
+_HEAL_MEMO: dict = {}          # (root, code) → {signal, bad, streak, ts}
+HEAL_BACKOFF_MAX = 3600.0      # 退避上限 1h
+
+
+# 生效条件：res 非 dict 时返回 False，否则返回 res.get('ok') is False 或 bool(res.get('truncated'))——即「跑完了但没修好/没修完」；
+def _bad_result(res) -> bool:
+    """动作结果是否「跑完了但没修好」（ok=False 或 truncated）。"""
+    if not isinstance(res, dict):
+        return False
+    return res.get("ok") is False or bool(res.get("truncated"))
+
+
+# 生效条件：按 (root, code) 查 _HEAL_MEMO，存在且 signal 与上次相同、上次 bad 且距上次尝试 < min(HEAL_BACKOFF_MAX, interval*2^(streak-1)) 时返回 (True, {'streak','wait_s','age_s','reason'})（不改记忆），否则返回 (False, {})；
+def _repeat_skip(root: str, code: str, signal: str,
+                 interval: float) -> tuple:
+    """同因失败不重试：返回 (skip, info)。`interval` 是调用方的巡检间隔（退避基准）。
+
+    等待时长只由**失败的尝试次数**（streak）决定：每次「真的又试了一次仍失败」
+    才翻倍；窗口内被拦下的那些 tick 只报同一个窗口，不把等待继续推大——
+    否则一次失败就会在几个 tick 内冲到 1h 上限，退避与「试了几次」脱钩。
+    """
+    st = _HEAL_MEMO.get((root, code)) or {}
+    if not st or st.get("signal") != signal or not st.get("bad"):
+        return False, {}
+    streak = int(st.get("streak") or 0)
+    wait = min(HEAL_BACKOFF_MAX, max(0.0, float(interval)) * (2 ** max(0, streak - 1)))
+    age = time.time() - float(st.get("ts") or 0.0)
+    if age < wait:
+        return True, {"streak": streak, "wait_s": round(wait, 1),
+                      "age_s": round(age, 1), "reason": "repeat_failure"}
+    return False, {}
+
+
+# 生效条件：按 (root, code) 记下本次的 signal 与结果是否坏；同信号连续失败时 streak 累加、坏结果首次记 1、好结果清零，ts 记当前时间；
+def _repeat_remember(root: str, code: str, signal: str, bad: bool) -> None:
+    st = _HEAL_MEMO.get((root, code)) or {}
+    same = st.get("signal") == signal
+    if bad:
+        streak = int(st.get("streak") or 0) + 1 if same else 1
+    else:
+        streak = 0
+    _HEAL_MEMO[(root, code)] = {"signal": signal, "bad": bool(bad),
+                                "streak": streak, "ts": time.time()}
+
+
+# 生效条件：按 diagnose(cg, name=name, stale_temp_age=stale_temp_age) 的 issues code 集合分派——命中 index_drift/index_orphan 重建索引、**ref_stale** 按 ref 重建源索引（ref_dangling 不触发）、index_log_backlog 合并索引分片、stale_temps 清理陈旧临时文件、half_line_logs 修补半截日志；ccg_backlog 仅 allow_evolve=True 且 reflect_fn 非 None 时才 consolidate（否则记 needs_llm），importance_drift 仅 allow_evolve=True 时才重算重要性（否则记 evolve_disabled）；dry_run=True 时各动作只记入 actions 不落盘，返回含 after["ok"]、dry_run、actions、before/after 的 stats 与 t 的 dict；repeat_guard 为真时同一信号且上次未修好的动作记 {'applied': False, 'reason': 'repeat_failure'} 并按 heal_interval*2^n 退避（上限 1h）；
 def heal(cg, *, name: str = "md_cg", dry_run: bool = False,
          stale_temp_age: float = STALE_TEMP_AGE,
-         allow_evolve: bool = False, reflect_fn=None, verify_fn=None) -> dict:
+         allow_evolve: bool = False, reflect_fn=None, verify_fn=None,
+         heal_interval: float = DEFAULT_HEAL_INTERVAL,
+         repeat_guard: bool = False) -> dict:
     """按诊断结果修复派生物。dry_run=True 时只列动作、不落盘。
 
     演化类动作（G7）默认**不动**，须显式 `allow_evolve=True` 才放行，且只放行
     **确定性**动作（重要性重算，有 rollback）；依赖 LLM 的固化永不自动跑。
+
+    `repeat_guard=True`（常驻循环用）开启「同因不重试」：诊断信号与上次全同、
+    且上次结果未修好（`ok=False` 或 `truncated`）时不再执行，记
+    `{'applied': False, 'reason': 'repeat_failure', 'streak': n}` 并按
+    `heal_interval × 2^n` 退避（上限 1h，进程内记忆、重启即清）。首次失败永远
+    真跑并如实上报；手动调用默认不开启（手动即显式要求试一次）。
     """
     before = diagnose(cg, name=name, stale_temp_age=stale_temp_age)
     codes = {i["code"] for i in before["issues"]}
     root = cg.root
     actions = []
 
-# 生效条件：闭包 dry_run 为真时向 actions 追加 {"code": code, "detail": detail, "applied": False} 并返回；否则调用 fn()，成功追加 applied=True/ok=True，抛异常时追加 applied=True/ok=False 与 error，最后执行 _audit(root, "heal", code, detail)；
+    def _signal(code: str) -> str:
+        """该 code 的**诊断事实签名**（detail + sample）：同因＝信号不变。"""
+        for i in before["issues"]:
+            if i["code"] == code:
+                return "%s|%s" % (i.get("detail"), i.get("sample"))
+        return ""
+
+# 生效条件：闭包 dry_run 为真时向 actions 追加 {"code": code, "detail": detail, "applied": False} 并返回；repeat_guard 为真且 _repeat_skip 判为重复失败时追加 applied=False/reason=repeat_failure/streak/wait_s 并返回；否则调用 fn() 取回值 res，res 为 dict 且 ok 为 False（或 truncated）时记 ok=False 并附 result 摘要，抛异常时追加 applied=True/ok=False 与 error，最后执行 _audit(root, "heal", code, detail) 并 _repeat_remember；
     def act(code: str, detail: str, fn):
         if dry_run:
             actions.append({"code": code, "detail": detail, "applied": False})
             return
+        if repeat_guard:
+            skip, info = _repeat_skip(root, code, _signal(code), heal_interval)
+            if skip:
+                # 不是「不报」：把「同一病灶上次就没修好」如实记进动作与审计。
+                actions.append({"code": code, "detail": detail, "applied": False,
+                                "ok": False, **info})
+                _audit(root, "heal", code,
+                       "%s → repeat_failure（第 %s 次，退避 %ss）"
+                       % (detail, info.get("streak"), info.get("wait_s")))
+                return
+        res = None
         try:
-            fn()
-            actions.append({"code": code, "detail": detail,
-                            "applied": True, "ok": True})
+            res = fn()
         except Exception as e:                       # 自愈失败不能拖垮进程
             actions.append({"code": code, "detail": detail, "applied": True,
                             "ok": False, "error": f"{type(e).__name__}: {e}"})
+        else:
+            # `fn()` 跑完 ≠ 修好：返回 dict 且 ok is False（或 truncated）时
+            # 如实记 ok=False——「重建失败」绝不能被记成 ok=True。
+            bad = _bad_result(res)
+            row = {"code": code, "detail": detail, "applied": True, "ok": not bad}
+            if isinstance(res, dict):
+                brief = {k: res[k] for k in ("ok", "indexed", "files", "truncated",
+                                             "roots_missing", "errors")
+                         if k in res}
+                if isinstance(brief.get("errors"), list):
+                    brief["errors"] = brief["errors"][:1]
+                if brief:
+                    row["result"] = brief
+                    detail = "%s → %s" % (detail, brief)
+            actions.append(row)
+        if repeat_guard:
+            _repeat_remember(root, code, _signal(code),
+                             bool(actions[-1].get("ok") is False))
         _audit(root, "heal", code, detail)
 
     if "index_drift" in codes or "index_orphan" in codes:
         act("rebuild_index", "重建索引（漂移 / 孤儿）", cg.rebuild_index)
-    if "ref_stale" in codes or "ref_dangling" in codes:
+    if "ref_stale" in codes:
+        # 只对 ref_stale 自动重建。ref_dangling（源已删/已搬）重切只会 0 文件、
+        # 治不好 dangling（rebuild 的 roots_missing 侧已拦「水位被写空」），出口是
+        # op=ref action=prune / 恢复真源后重建 —— 不在这里触发。
+        # 止血点必须在本行：heal 按 code 分派（fix 字段无任何调度器消费）。
         from . import refindex as _ri
         _led = _ri.Ledger(root)
-        act("rebuild_refs", "按 ref 重建源索引（修复漂移；悬空需人工处置）",
+        act("rebuild_refs", "按 ref 重建源索引（修复 ref_stale）",
             lambda: _ri.rebuild(cg, ledger=_led))
     if "index_log_backlog" in codes:
         act("flush_index", "合并索引增量分片", cg.flush)
+
+# 生效条件：闭包内先 cg.flush()（把内存 _dirty 落进分片）再 cg.compact_index()
+# （读「_index.json 快照 + 分片」写回快照并清空分片）；顺序不可颠倒——compact_index
+# 以整体替换 self.index，未 flush 的内存条目会丢。
+    def _compact_index():
+        cg.flush()
+        return cg.compact_index()
+    if "index_log_backlog" in codes:
+        act("compact_index", "分片折叠进 _index.json（快照落盘）", _compact_index)
+    if "access_log_backlog" in codes:
+        act("compact_access", "折叠访问日志进 access_count / last_access",
+            cg.compact_access)
     if "stale_temps" in codes:
         paths = _list_stale_temps(root, stale_temp_age)
 
@@ -792,7 +1002,7 @@ def watermarks(cg) -> dict:
 # 常驻循环
 # --------------------------------------------------------------------------
 
-# 生效条件：传入 cg 即构造实例并把 self.cg 指向它，name/beat_interval/heal_interval/auto_heal/scrub_interval/auto_scrub/evolve_interval/auto_evolve/tidy_interval/auto_tidy 用各默认值（DEFAULT_* 与 False/True）经 float()/bool() 落为 self 属性，ledger 为假值（默认 None）时回落 SessionLedger(cg.root)，d 经 net_dir(d) 赋值，其余运行态字段初始化为 False/None/空列表/空 Event/Lock
+# 生效条件：传入 cg 即构造实例并把 self.cg 指向它，name/beat_interval/heal_interval/auto_heal/scrub_interval/auto_scrub/evolve_interval/auto_evolve/tidy_interval/auto_tidy 用各默认值（DEFAULT_* 与 AUTO_DEFAULTS 真源表）经 float()/bool() 落为 self 属性，ledger 为假值（默认 None）时回落 SessionLedger(cg.root)，d 经 net_dir(d) 赋值，其余运行态字段初始化为 False/None/空列表/空 Event/Lock
 class SustainLoop:
     """常驻自维持循环：后台线程周期心跳 + 周期巡检 + 必要时自愈。
 
@@ -800,18 +1010,31 @@ class SustainLoop:
     让对端立刻看到「正常下线」而不是「失联」。
     """
 
-# 生效条件：传入 cg 时按 name 与各 DEFAULT_* 默认值初始化——self.d=net_dir(d)（d 假值时回落 MDCG_SUSTAIN_DIR/~/ .mdcg/sustain）、self.ledger=ledger or SessionLedger(cg.root)（ledger 假值时新建），beat/heal/scrub/evolve/tidy 间隔 float() 化、auto_heal/auto_scrub/auto_evolve/auto_tidy bool() 化后存为实例属性；
+# 生效条件：传入 cg 时按 name 与各 DEFAULT_* / AUTO_DEFAULTS 真源表默认值初始化——self.d=net_dir(d)（d 假值时回落 MDCG_SUSTAIN_DIR/~/ .mdcg/sustain）、self.ledger=ledger or SessionLedger(cg.root)（ledger 假值时新建），beat/heal/scrub/evolve/tidy 间隔 float() 化、auto_heal/auto_scrub/auto_evolve/auto_tidy bool() 化后存为实例属性；
     def __init__(self, cg, name: str = "md_cg", *,
                  beat_interval: float = DEFAULT_BEAT_INTERVAL,
                  heal_interval: float = DEFAULT_HEAL_INTERVAL,
-                 auto_heal: bool = True, d: str = None,
+                 # 四档 `auto_*` 缺省取自**单一真源**（P0-2）：本形参默认值与
+                 # 两个入口读取的是同一张表，`SustainLoop(cg)` 与
+                 # `sustain action=start` / `_start_sustain` 三面同值。
+                 auto_heal: bool = AUTO_DEFAULTS["auto_heal"], d: str = None,
                  ledger: SessionLedger = None,
                  scrub_interval: float = DEFAULT_SCRUB_INTERVAL,
-                 auto_scrub: bool = False,
+                 auto_scrub: bool = AUTO_DEFAULTS["auto_scrub"],
                  evolve_interval: float = DEFAULT_EVOLVE_INTERVAL,
-                 auto_evolve: bool = False,
+                 auto_evolve: bool = AUTO_DEFAULTS["auto_evolve"],
                  tidy_interval: float = DEFAULT_TIDY_INTERVAL,
-                 auto_tidy: bool = False):
+                 auto_tidy: bool = AUTO_DEFAULTS["auto_tidy"],
+                 # 第六档：睡眠周期（§三 九步 / §4.7）。四个缺省一律取自
+                 # `md_cg/sleep.py` 的 **env 表单一真源**（SLEEP_ENV_DEFAULTS +
+                 # sleep_env 族读取器）——本处**不写第二份缺省字面量**；两个
+                 # 入口（`_start_sustain` / op 路径）同样只经那些读取器。
+                 sleep_interval: float = None,
+                 auto_sleep: bool = None,
+                 sleep_merge: str = None,
+                 sleep_window: str = None,
+                 sleep_scrub_apply: bool = None):
+        from . import sleep as _sleep
         self.cg = cg
         self.name = name
         self.beat_interval = float(beat_interval)
@@ -825,6 +1048,22 @@ class SustainLoop:
         self.auto_evolve = bool(auto_evolve)
         self.tidy_interval = float(tidy_interval)
         self.auto_tidy = bool(auto_tidy)
+        # 第六档睡眠周期：值全来自 sleep 模块的真源读取器（缺省见 §4.7 表）。
+        self.sleep_interval = float(_sleep.sleep_interval()
+                                    if sleep_interval is None
+                                    else sleep_interval)
+        self.auto_sleep = bool(_sleep.sleep_enabled() if auto_sleep is None
+                               else auto_sleep)
+        self.sleep_merge = (_sleep.sleep_merge_mode() if sleep_merge is None
+                            else str(sleep_merge))
+        self.sleep_window = (_sleep.sleep_window() if sleep_window is None
+                             else str(sleep_window))
+        self.sleep_scrub_apply = bool(_sleep.sleep_scrub_apply()
+                                      if sleep_scrub_apply is None
+                                      else sleep_scrub_apply)
+        self.last_sleep = None
+        self.sleeps = []
+        self.sleep_round = 0
         self.task_running = False
         self.beats = 0
         self.last_beat = None
@@ -880,13 +1119,14 @@ class SustainLoop:
         clear_stamp(self.name, self.d)
         return self
 
-# 生效条件：self._stop 未置位期间轮询，按 beat_interval/heal_interval/scrub_interval/evolve_interval/tidy_interval 到期分别执行 beat 与 _tick_heal/_tick_scrub/_tick_evolve/_tick_tidy，各 tick 抛出的异常被吞掉不中断循环，末尾以 _stop.wait(_POLL) 休眠；
+# 生效条件：self._stop 未置位期间轮询，按 beat_interval/heal_interval/scrub_interval/evolve_interval/tidy_interval/**sleep_interval（第六档）** 到期分别执行 beat 与 _tick_heal/_tick_scrub/_tick_evolve/_tick_tidy/_tick_sleep，各 tick 抛出的异常被吞掉不中断循环，末尾以 _stop.wait(_POLL) 休眠；
     def _run(self):
         next_beat = time.time() + self.beat_interval
         next_heal = time.time() + self.heal_interval
         next_scrub = time.time() + self.scrub_interval
         next_evolve = time.time() + self.evolve_interval
         next_tidy = time.time() + self.tidy_interval
+        next_sleep = time.time() + self.sleep_interval
         while not self._stop.is_set():
             now = time.time()
             if now >= next_beat:
@@ -919,13 +1159,20 @@ class SustainLoop:
                 except Exception:
                     pass                       # 整理巡检失败不中断常驻
                 next_tidy = now + self.tidy_interval
+            if now >= next_sleep:
+                try:
+                    self._tick_sleep()
+                except Exception:
+                    pass                       # 睡眠周期失败不中断常驻
+                next_sleep = now + self.sleep_interval
             self._stop.wait(_POLL)
 
-# 生效条件：以 apply=self.auto_tidy 调 writelimit.tidy_contextual(self.cg, actor="sustain_tidy")，把 t/scanned/groups/members/applied_count/auto_tidy 记入 self.last_tidy 与 tidys（仅保留最近 20 条），随后调 _tick_conformance()；auto_tidy=False（默认）时只盘点不落盘；
+# 生效条件：以 apply=self.auto_tidy 调 writelimit.tidy_contextual(self.cg, actor="sustain_tidy")，把 t/scanned/groups/members/applied_count/auto_tidy 记入 self.last_tidy 与 tidys（仅保留最近 20 条），随后调 _tick_conformance()；auto_tidy 为假时只盘点不落盘；
     def _tick_tidy(self):
         """整理巡检（contextual 流水治理·读侧）：同构组聚合 + 成员降权。
 
-        确定性动作、永不删节点；`auto_tidy=False`（默认）只盘点不落盘。
+        确定性动作、永不删节点；`auto_tidy` 为假时只盘点不落盘。缺省值取自
+        模块级真源 `AUTO_DEFAULTS`（P0-2；缺省为 True，opt-out 见该表注释）。
         治理对象：单日批次流水（「批次247收官记忆」×163 那类同模板写入）
         —— 写入侧限流（writelimit.check）拦增量，本巡检收敛存量。
         """
@@ -956,6 +1203,41 @@ class SustainLoop:
         except Exception as e:                              # noqa: BLE001
             self.last_conformance = {"ok": False, "verdict": "BLINDSPOT",
                                      "error": f"{type(e).__name__}: {e}"}
+
+# 生效条件：self.sleep_round 自增 1 后以 enabled=self.auto_sleep / merge_mode=self.sleep_merge / scrub_apply=self.sleep_scrub_apply / window=self.sleep_window / round_index=self.sleep_round 调 sleep.run_cycle(self.cg)，把 t/batch/round/candidates/merged/skipped/conflicts/九步名与其 skipped 明细/auto_sleep/merge_mode 记入 last_sleep 与 sleeps（保留最近 20 条）；auto_sleep 为假时 run_cycle 只记账不迭代；
+    def _tick_sleep(self):
+        """睡眠周期（第六档 tick）：§3.1 九步显式化 + §4.4 副本迭代与周期合并。
+
+        **只在副本上迭代**（物化 → 影子迭代 → 对账四闸 → 语义重放 + git 合并），
+        主库真源面在非合并阶段逐字节不变。四个开关全取 `md_cg/sleep.py` 的 §4.7
+        env 表真源：`MDCG_SLEEP`（总开关，缺省开）、`MDCG_SLEEP_MERGE`（缺省
+        auto＝自动走四阶段，冲突仍挂起）、`MDCG_SLEEP_WINDOW`（缺省 23:00-07:00，
+        **窗口外只记账不迭代**）、`MDCG_SLEEP_SCRUB_APPLY`（缺省 **关**——第④步
+        缺省只在副本上盘点、不落盘）。
+
+        ⑤权重刷新与衰减 / ⑥索引重建两步本轮是**显式 no-op 占位**（台账里标
+        `skipped: "未接线"`），故本轮**不动检索读数**。
+        """
+        from . import sleep as _sleep
+        self.sleep_round += 1
+        r = _sleep.run_cycle(self.cg, enabled=self.auto_sleep,
+                             merge_mode=self.sleep_merge,
+                             scrub_apply=self.sleep_scrub_apply,
+                             window=self.sleep_window,
+                             round_index=self.sleep_round)
+        steps = list(r.get("steps") or [])
+        rec = {"t": r.get("t"), "batch": r.get("batch"), "round": r.get("round"),
+               "candidates": r.get("candidates"),
+               "merged": r.get("merged"), "skipped": r.get("skipped"),
+               "conflicts": r.get("conflicts"),
+               "steps": [s.get("step") for s in steps],
+               "steps_skipped": ["%s:%s" % (s.get("step"), s.get("skipped"))
+                                 for s in steps if s.get("skipped")],
+               "auto_sleep": self.auto_sleep, "merge_mode": self.sleep_merge}
+        self.last_sleep = rec
+        with self._lock:
+            self.sleeps.append(rec)
+            self.sleeps = self.sleeps[-20:]
 
 # 生效条件：恒以 evolution_candidates(self.cg) 只读盘点并记入 last_evolve 与 evolves（保留最近 20 条）；仅当 self.auto_evolve 为真且 ev["importance_drift"]["n"] 为真时才额外执行 weights.recalc(self.cg, apply=True, actor="sustain_evolve")，其异常写入 rec["applied"]；
     def _tick_evolve(self):
@@ -1010,11 +1292,19 @@ class SustainLoop:
                               "issues": [i["code"] for i in rep["issues"]]}
         if not (self.auto_heal and not rep["ok"]):
             return
-        res = heal(self.cg, name=self.name)
+        # 常驻循环才开 repeat_guard（同因不重试 + 退避）：手动 op=sustain action=heal
+        # 不受影响；heal_interval 用作退避基准。
+        res = heal(self.cg, name=self.name,
+                   heal_interval=self.heal_interval, repeat_guard=True)
         if res["actions"]:
             with self._lock:
-                self.heals.append({"t": res["t"],
-                                   "actions": [a["code"] for a in res["actions"]]})
+                self.heals.append({
+                    "t": res["t"],
+                    "actions": [a["code"] for a in res["actions"]],
+                    # 没修好的（含重复失败被拦下的）单列，免得「动作跑了」被读成
+                    # 「修好了」——审计行同口径。
+                    "failed": [a["code"] for a in res["actions"]
+                               if a.get("ok") is False]})
                 self.heals = self.heals[-20:]
 
     # ---- 状态 ----
@@ -1046,6 +1336,13 @@ class SustainLoop:
                 "evolves": self.evolves[-5:],
                 "last_tidy": self.last_tidy,
                 "tidys": self.tidys[-5:],
+                "sleep_interval": self.sleep_interval,
+                "auto_sleep": self.auto_sleep,
+                "sleep_merge": self.sleep_merge,
+                "sleep_window": self.sleep_window,
+                "sleep_scrub_apply": self.sleep_scrub_apply,
+                "last_sleep": self.last_sleep,
+                "sleeps": self.sleeps[-5:],
                 "last_conformance": self.last_conformance,
                 "peers": peers(self.d),
                 "sessions": self.ledger.summary()}

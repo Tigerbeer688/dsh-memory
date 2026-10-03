@@ -40,7 +40,10 @@ from __future__ import annotations
 import os
 import time
 
+from . import protect
+from . import security as _security
 from .fsutil import append_jsonl, read_jsonl
+from .security import AccessDenied
 
 #: 验证态全集。语义：
 #:   unverified  未验证（默认；存量缺字段即视为它）
@@ -635,7 +638,7 @@ def dependents_index(cg, refresh: bool = False) -> dict:
             return cached
     nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
     idx = {}
-    for nid, e in nodes.items():
+    for nid, e in list(nodes.items()):
         for p in as_deps((e or {}).get(DEPS_FIELD)):
             idx.setdefault(p, []).append(nid)
     for k in idx:
@@ -674,19 +677,39 @@ def _sync_index(cg, node_id, fm) -> None:
         flush()
 
 
+# 生效条件：cg.get(node_id) 为假值（节点不存在）时返回 {"ok": False, "error": "node_not_found", "node_id": node_id}；否则先过层写闸 protect.require_layer(cg, node_id, layer=fm.layer, sensitivity=fm.sensitivity)（N209：越权身份抛 AccessDenied → 转成 {"ok": False, "error": "layer_denied", "changed": False} 负路由，记 set_state_denied 台账，**不写盘**），再经 stamp 裁决：code 为 noop 或非法迁移时返回 ok=False 或 changed=False 不写盘，成功时把 fm 经 cg._write_node 落盘、_sync_index 同步验证态快照、_record 追加台账，fm 含 depends_on 时再 invalidate_cache，返回 {node_id, from, to, code, ok, changed, reason, at}。
 def set_state(cg, node_id: str, dst: str, reason: str = None, actor: str = None,
               evidence: str = None, method: str = None, trigger: str = None,
               override: bool = False) -> dict:
     """推进一个节点的验证态（**唯一推进入口**）。
 
     非法迁移不走异常而是返回 `{"ok": False, "error": <code>, ...}`（负路由）。
-    幂等迁移返回 `changed=False` 且不写盘。
+    幂等迁移返回 `changed=False` 且不写盘。**写盘前另过 principal 层写闸**
+    （N209：无权写该层 → `error="layer_denied"` 负路由，零写盘 + 台账留痕）。
     """
     node = cg.get(node_id)
     if not node:
         return {"ok": False, "error": "node_not_found", "node_id": node_id}
     fm = dict(node.get("frontmatter") or {})
     src = state_of(fm)
+    # N209（同族未接线的相邻写面）：验证态推进 = 对节点本体 frontmatter 的一次
+    # **覆写**（`cg._write_node` 全量重写 fm + 正文），与 add / 覆写写面同一层闸。
+    # 此前该路径零层闸（MdCGSecure 对 set_state/set_verification/mark_dependents
+    # 无任何覆盖）⇒ 持 verify 令牌者经 verify→mark_dependents → 把**任意层**
+    # 依赖者（实测 self 层）置 doubted。拒绝走**负路由**而非 raise：本函数契约是
+    # 「非法迁移不抛异常（ok=False + 机器码）」，且 mark_dependents 契约是
+    # 「永不抛、不阻断本次裁决」——但**绝不写盘**，并把拒绝记进 `_trust.jsonl`
+    #（不静默：与 `mark_dependents_degraded` 同一「留痕降级」口径）。
+    try:
+        protect.require_layer(cg, node_id, layer=fm.get("layer"),
+                              sensitivity=fm.get("sensitivity"))
+    except AccessDenied as exc:
+        _record(cg, {"t": time.time(), "action": "set_state_denied",
+                     "node_id": node_id, "from": src, "to": dst,
+                     "error": f"{type(exc).__name__}: {exc}",
+                     "actor": actor, "trigger": trigger})
+        return {"node_id": node_id, "from": src, "to": dst, "ok": False,
+                "error": "layer_denied", "reason": str(exc), "changed": False}
     ok, code, why = stamp(fm, dst, reason=reason, actor=actor, evidence=evidence,
                           method=method, trigger=trigger, override=override)
     base = {"node_id": node_id, "from": src, "to": dst, "code": code}
@@ -781,7 +804,7 @@ def propagate(cg, *, apply: bool = False, max_nodes: int = MAX_NODES_DEFAULT,
     nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
     dep_map = dependents_index(cg)
     roots = []
-    for nid, e in nodes.items():
+    for nid, e in list(nodes.items()):
         st = (e or {}).get(STATE_FIELD)
         if st in ("expired", "rechecking"):
             roots.append(nid)
@@ -910,13 +933,24 @@ def backfill(cg, apply: bool = False, limit: int = 5000) -> dict:
 
 
 def describe(cg, node_id: str, now: float = None) -> dict:
-    """单节点验证态全貌（供 op=status / 状态头渲染）。只读、失败不抛。"""
+    """单节点验证态全貌（供 op=status / 状态头渲染）。只读、失败不抛。
+
+    N205（2026-09-28）：`cg.get` 被读闸拒后**不得**回落索引条目仍报 ok=True——
+    索引条目本身就是密级/会话/验证态元数据（layer/tags/session/verification_state），
+    回落等于把「不可读」当「可见」返回（实测：guest 对 private 节点 get→None，
+    而 status 仍回 ok=True + verification_state='verified' + depends_on +
+    状态头「✓ 已验证」）。口径改为与 get/search/recall 一致的「不可见即不存在」：
+    判定走跨层单点 `security.node_visible`（纯 MdCGOS 无身份模型 → 不受影响；
+    设计者 can_admin 豁免不变）。
+    """
     try:
         node = cg.get(node_id)
     except Exception:                                      # noqa: BLE001
         node = None
     e = ((getattr(cg, "index", None) or {}).get("nodes") or {}).get(node_id)
     if not node and not e:
+        return {"ok": False, "error": "node_not_found", "node_id": node_id}
+    if not node and not _security.node_visible(cg, node_id):
         return {"ok": False, "error": "node_not_found", "node_id": node_id}
     fm = (node or {}).get("frontmatter") or {}
     deps = as_deps(fm.get(DEPS_FIELD)) or as_deps((e or {}).get(DEPS_FIELD))
@@ -951,13 +985,23 @@ def summary(cg) -> dict:
 
 
 def load_ledger(cg, *, node_id: str = None, limit: int = None) -> list:
-    """读验证态台账（跳过坏行；可按节点过滤）。"""
+    """读验证态台账（跳过坏行；可按节点过滤）。
+
+    N205（2026-09-28）：行内 `reason` 含**明文证据串**（外部裁决理由），此前
+    只按 node_id 等值过滤、零可见性判定 ⇒ 任何持 read op 的身份（含无令牌
+    guest，`cg(op="status", action="ledger")` 在 guest 的 ops_allow 内）可读走
+    他人私密节点的裁决证据与验证态。口径与库读面统一：逐行按
+    `security.node_visible`（跨层单点）判定行所属节点对本身份是否可见，
+    不可见/不可证（已 forget、索引无条目）→ 该行整条不出；设计者豁免。
+    """
     path = os.path.join(cg.root, AUDIT_FILE)
     out = []
     for r in read_jsonl(path):
         if not isinstance(r, dict):
             continue
         if node_id and r.get("node_id") != node_id:
+            continue
+        if not _security.node_visible(cg, r.get("node_id")):
             continue
         out.append(r)
     return out[:int(limit)] if limit else out

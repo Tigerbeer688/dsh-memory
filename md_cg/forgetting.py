@@ -33,7 +33,7 @@
                                         噪音，不该去强化既有记忆（否则例行日志
                                         会把普通记忆刷成高重要性）
     3) 冗余 ≥0.85             → MERGE ← 外部/未知来源的重复 = 又一次确认，强化
-    4) 半重复 且 不重要       → DEFER
+    4) 半重复 且 未触发保护   → DEFER ← 与重要度无关：半重复是「变更确认」的输入端
     5) 重要度 ≥0.30           → ACCEPT
     6) 新信息 ≥0.15           → ACCEPT
     7) 其余                   → DEFER
@@ -47,7 +47,9 @@ import math
 import os
 import time
 
-from . import lifecycle, nodefile
+from . import lifecycle, nodefile, protect
+from . import crypto
+from . import security as _security
 from .fsutil import append_jsonl, atomic_write, publish, read_jsonl
 from .mdcg import bigrams
 
@@ -76,6 +78,10 @@ INTERNAL_ROLES = ("command", "tool-output", "edit", "system")
 DETERMINISTIC_BASIS = ("data", "measurement", "compiler", "test", "formal_proof")
 
 LOG_FILE = "_forgetting.jsonl"
+
+# 合并面「新正文去向」/「归属并列」的常量（B3 / H3，2026-09-30）
+MERGE_SOURCES_KEEP = 20         # fm.merge_sources 只保留最近 N 条「新写入方归属」
+AGG_MARK = "聚合"               # 聚合行标记（与 writelimit.converge_into 同款）
 
 
 # ---------------------------------------------------------------- 三问
@@ -124,6 +130,48 @@ def payload(content):
         if s:
             out.append(s)
     return "".join(out)
+
+
+# 生效条件：node_id 为真值且 cg.index 的 nodes 中已有该 id 时返回该 id（本次写入是覆写既有同 id 节点）；node_id 为空、cg 无 index 或取 index 抛异常、id 不在索引中时返回 None。
+def prior_node(cg, node_id):
+    """本次写入是否为**覆写既有同 id 节点**——返回既有 id 或 None（存在性判据单点）。
+
+    P-9b(a) 根因（探针实测）：同 id 覆写时 `redundancy(exclude=node_id)` 自排除
+    （「不与自身比正文」本身正确），但该层若只此一个节点 ⇒ `compared=0`、
+    `duplicate_with=None`、`duplicate_ratio=0.0`——裁决里「覆写」与「全新写入」
+    **完全不可区分**（审计面全 null，静默洞）。存在性判据收敛在此一处：`assess`
+    的 entropy 标注与直写路径的返回体共用，不各写一份。
+
+    边界（如实）：判据读 `cg.index`，与 `redundancy` 同一数据面（同代际假设）；
+    index 陈旧时最坏是漏标一次覆写提示，不影响任何落盘行为。
+    """
+    if not node_id:
+        return None
+    try:
+        nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
+    except Exception:
+        return None
+    return node_id if node_id in nodes else None
+
+
+# 生效条件：node_id 为真值且 cg.get(node_id) 返回真值时返回覆盖度（_coverage(bigrams(payload(content)), bigrams(payload(既有正文)))，1.0＝逐字同构的重写）；node_id 为空、节点取不到、既有正文为空时返回 None。
+def self_coverage(cg, node_id, content):
+    """「本次正文 vs 同 id 既有正文」的覆盖度（1.0 = 内容等同的重写）。
+
+    与 `redundancy` 共用同一套骨架（payload/bigrams/_coverage），不另写一份
+    重复度算法；差别只在比较对象是**自己**（故不适用 exclude）。用途：同 id
+    覆写时回答「这次是空写还是真改了」（P-9b(a) 提示的主体信息）。
+    """
+    try:
+        node = cg.get(node_id)
+    except Exception:
+        node = None
+    if not node:
+        return None
+    body = bigrams(payload(node.get("content") or ""))
+    if not body:
+        return None
+    return round(_coverage(bigrams(payload(content)), body), 4)
 
 
 # 生效条件：content 经 payload/bigrams 得空集合时直接返回零值 best（max=0.0、with=None、compared=0）；否则遍历 cg.index 的 nodes，跳过 nid==exclude，layer 为真值时只比较 str(layer 字段 or "")==layer 的节点，cg.get(nid) 抛异常/返回假值、或该节点 content 的 bigrams 为空则跳过，每计入一个节点后若 n>=limit 立即 break（故 limit 为 0 或负数时只比较首项即停），返回覆盖度最大者 best（无覆盖度提升时不更新 with/jaccard，compared 为实际计入数）。
@@ -188,15 +236,60 @@ def importance_score(hint, novelty, kind, content):
     return {"score": round(max(0.0, min(1.0, s)), 4), "from": "heuristic"}
 
 
-# 生效条件：以 source_kind(role,verification_basis) 的 kind 与 redundancy(cg,content,layer=layer,exclude=node_id) 的 red["max"] 为输入，按 if/elif 顺序取首个命中分支——imp["score"]≥PROTECT_IMPORTANCE→"ACCEPT"；否则 kind=="internal_deterministic" 且 red["max"]≥DUP_DROP→"DROP"；否则 red["max"]≥DUP_MERGE→"MERGE"；否则 red["max"]≥DUP_DROP 且 imp["score"]<IMPORTANCE_MIN→"DEFER"；否则 imp["score"]≥IMPORTANCE_MIN→"ACCEPT"；否则 novelty≥NOVELTY_MIN→"ACCEPT"；否则→"DEFER"。
+# 生效条件：以 source_kind(role,verification_basis) 的 kind 与 redundancy(cg,content,layer=layer,exclude=node_id) 的 red["max"] 为输入，按 if/elif 顺序取首个命中分支——imp["score"]≥PROTECT_IMPORTANCE→"ACCEPT"（reason 按 imp["from"] 分叉：hint→「触发不可遗忘保护」，heuristic→「未落保护——保护须显式声明」，issue50-d）；否则 kind=="internal_deterministic" 且 red["max"]≥DUP_DROP→"DROP"；否则 red["max"]≥DUP_MERGE→"MERGE"；否则 red["max"]≥DUP_DROP→"DEFER"（**与 imp 无关**）；否则 imp["score"]≥IMPORTANCE_MIN→"ACCEPT"；否则 novelty≥NOVELTY_MIN→"ACCEPT"；否则→"DEFER"。返回体附带 P-9b 可见性字段：entropy.overwrite_of / entropy.overwrite_ratio（同 id 覆写时非 null）、dedup_skipped（**仅 PROTECT 分支**非 null，标注「因保护优先未走去重」+ 去重判据读数）——两者都不改 verdict、不改落盘行为。
 def assess(cg, content, layer="contextual", role=None, verification_basis=None,
            importance_hint=None, node_id=None):
-    """三问 → 四态裁决。返回完整判据（可审计，不只给结论）。"""
+    """三问 → 四态裁决。返回完整判据（可审计，不只给结论）。
+
+    P-9b（2026-09-30）：本函数此前有两处**静默洞**（探针实测），都只补可见性、
+    不动裁决语义：
+      (a) 同 id 覆写：`redundancy(exclude=node_id)` 自排除 ⇒ 该层只此一节点时
+          compared=0、dup 字段全 null，「覆写」与「全新写入」不可区分。处置：
+          entropy 增 `overwrite_of`（既有 id）+ `overwrite_ratio`（新正文对既有
+          正文的覆盖度，1.0=空写）——判据单点在 `prior_node`/`self_coverage`。
+      (b) importance≥PROTECT_IMPORTANCE 的保护优先分支**排在冗余判定之前** ⇒
+          高重要度的近重复内容直接 ACCEPT，绕过 MERGE/DROP 而审计面只剩一句
+          「触发不可遗忘保护」。处置：该分支返回 `dedup_skipped`
+          （reason=protect_importance + duplicate_with/duplicate_ratio/compared +
+          overwrite_of），并在 reason 文案里显式写出「因保护优先未走去重」。
+          **为何不把 PROTECT 挪到冗余判定之后**（依据）：① 该分支语义是「不可
+          遗忘保护」（PROTECT_IMPORTANCE 与 writelimit.py 模块头注 :9-12 的
+          「importance_hint≥0.7 保护优先」是跨模块同一口径，且 writelimit 是
+          文档化设计不许动）；挪位后高重要度内容会被 DROP（内部确定性来源）或
+          MERGE 并入低重要度节点，**削弱的正是保护本身**，且造成两模块对同一
+          阈值的语义分叉；② DROP 分支的伤害（重要内容被丢弃）不可逆，MERGE 会把
+          关键正文并入他节点、检索归属漂移——风险高于收益；③ 缺陷本体是「绕过
+          去重而不可见」而非「保护存在」，标注即可消除静默且零回归面
+          （test_p9_forget_protect.py 的「importance_hint≥0.7→ACCEPT」逐字不变）。
+
+    issue50-d（2026-10-02）：保护分支的 reason 文案按 **imp["from"] 分叉**——
+    改前启发式路径（不传 hint）过线时也声称「触发不可遗忘保护」，但落盘面
+    importance=0.5（默认）且无保护位（隔离沙箱直读 frontmatter 实证：
+    u_heur_new 裁决 0.837/落盘 0.5；t_heur 裁决 0.711/落盘 0.5）——审计面在
+    声称未发生的事。处置：from=="hint" 且 ≥0.7 维持原文案（add 的自动保护位
+    对显式声明真落 protected 位，文案与落盘一致）；from=="heuristic" 且 ≥0.7
+    改为如实文案「启发式 …（未落保护——保护须显式声明）」。裁决面 verdict、
+    分支顺序、常量均不变；落盘口径的修复在 remember_gated ACCEPT 分支
+    （mdcos.py：落盘=裁决值 + importance_source 标注来源）。
+
+    issue50-a（2026-10-01）：分支 ④「半重复 → DEFER」此前写作
+    `red["max"] >= DUP_DROP and imp["score"] < IMPORTANCE_MIN`，**结构性不可达**：
+    用户角色属外部惊奇来源（`SOURCE_WEIGHT["external_surprising"]=1.00`），启发式
+    重要度 = 0.5·novelty + 0.3·1.00 + 0.2·lf ⇒ 基线恰为 0.30 = IMPORTANCE_MIN，
+    且比较用 `>=`；插件侧还显式传 `hint=0.6`（同样 ≥0.30）。实测：重复度 0.7324 /
+    0.7606 的半重复内容一律走分支 ⑤ 判 ACCEPT，`_forgetting.jsonl` 的 DEFER 计数为
+    0（在役库 215 条留痕：ACCEPT 201 / MERGE 14）——本应是「变更确认」输入端的
+    那条回路从不产生输入。处置：**删去 `and imp["score"] < IMPORTANCE_MIN`**，
+    半重复（且未触发保护）一律 DEFER，与重要度解耦。分支顺序与其余六条分支的
+    判据/文案均不变，保护优先（①）仍最先，故保护面零回归。
+    """
     kind = source_kind(role, verification_basis)
     red = redundancy(cg, content, layer=layer, exclude=node_id)
     novelty = round(1.0 - red["max"], 4)
     bits = round(self_information(red["max"]), 4)
     imp = importance_score(importance_hint, novelty, kind, content)
+    # P-9b(a)：同 id 覆写的存在性/覆盖度（不与自身比的 redundancy 之外的另一读法）
+    prior = prior_node(cg, node_id)
     entropy = {
         "source_kind": kind,
         "novelty": novelty,
@@ -205,20 +298,58 @@ def assess(cg, content, layer="contextual", role=None, verification_basis=None,
         "duplicate_with": red["with"],
         "duplicate_ratio": round(red["max"], 4),
         "compared": red["compared"],
+        # 非 null = 本次是覆写既有同 id 节点（原先此处无法与全新写入区分）
+        "overwrite_of": prior,
+        "overwrite_ratio": (self_coverage(cg, prior, content)
+                            if prior is not None else None),
     }
 
+    dedup_skipped = None
     if imp["score"] >= PROTECT_IMPORTANCE:
-        verdict, why = "ACCEPT", (f"重要度 {imp['score']:.2f}≥{PROTECT_IMPORTANCE}"
-                                 f"（触发不可遗忘保护）")
+        # P-9b(b)：保护优先分支先于冗余判定——近重复/覆写时不静默，给出去重读数
+        due = []
+        if prior is not None:
+            due.append("覆写既有同 id 节点 %s（正文覆盖度 %s）"
+                       % (prior, "—" if entropy["overwrite_ratio"] is None
+                          else "%.2f" % entropy["overwrite_ratio"]))
+        if red["with"] and red["max"] >= DUP_MERGE:
+            due.append("与 %s 重复度 %.2f≥%.2f（够 MERGE 阈值）"
+                       % (red["with"], red["max"], DUP_MERGE))
+        # issue50-d（2026-10-02）：文案按来源分叉——`imp["from"]` 就在手上的
+        # imp 里，单点可判。显式 hint 维持「触发不可遗忘保护」（add 的自动
+        # 保护位会真落 protected 位，文案与落盘一致）；启发式过线**只落分、
+        # 不打保护位**（issue50-d 裁决②：保护须显式声明），文案改成如实
+        # 表述——改前启发式 0.84 也声称「触发不可遗忘保护」，而落盘面
+        # importance=0.5 且无保护位（隔离沙箱实证），审计面在声称未发生的事。
+        # 分支顺序与 verdict 不变（硬边界：issue50-a 的那行除外，本批不动）。
+        if imp["from"] == "hint":
+            verdict, why = "ACCEPT", (f"重要度 {imp['score']:.2f}≥{PROTECT_IMPORTANCE}"
+                                      f"（触发不可遗忘保护）")
+        else:
+            verdict, why = "ACCEPT", (f"启发式 {imp['score']:.2f}≥{PROTECT_IMPORTANCE}"
+                                      f"（未落保护——保护须显式声明）")
+        dedup_skipped = {
+            "reason": "protect_importance",
+            "detail": ("保护优先分支排在冗余判定之前：本次未走 MERGE/DROP"
+                       + ("（" + "；".join(due) + "）" if due else
+                          "（重复度 %.2f<%.2f 且非覆写，无近重复）"
+                          % (red["max"], DUP_MERGE))),
+            "duplicate_with": red["with"] if red["max"] >= DUP_MERGE else None,
+            "duplicate_ratio": round(red["max"], 4),
+            "compared": red["compared"],
+            "overwrite_of": prior,
+        }
+        if due:
+            why += "；⚠ 因保护优先未走去重（" + "；".join(due) + "）"
     elif kind == "internal_deterministic" and red["max"] >= DUP_DROP:
         verdict, why = "DROP", (f"确定性内部产生且冗余 {red['max']:.2f}≥{DUP_DROP}"
                                f"（低熵噪音，不编码）")
     elif red["max"] >= DUP_MERGE:
         verdict, why = "MERGE", (f"重复度 {red['max']:.2f}≥{DUP_MERGE}"
                                 f"（并入 {red['with']}，强化既有）")
-    elif red["max"] >= DUP_DROP and imp["score"] < IMPORTANCE_MIN:
+    elif red["max"] >= DUP_DROP:
         verdict, why = "DEFER", (f"半重复 {red['max']:.2f}∈[{DUP_DROP},{DUP_MERGE})"
-                                f" 且重要度 {imp['score']:.2f}<{IMPORTANCE_MIN}"
+                                f" 且未触发不可遗忘保护"
                                 f"（待定复核）")
     elif imp["score"] >= IMPORTANCE_MIN:
         verdict, why = "ACCEPT", f"重要度 {imp['score']:.2f}≥{IMPORTANCE_MIN}"
@@ -228,7 +359,9 @@ def assess(cg, content, layer="contextual", role=None, verification_basis=None,
         verdict, why = "DEFER", "重要度与新信息均不足判据（待定）"
 
     return {"verdict": verdict, "reason": why, "redundancy": red,
-            "importance": imp, "entropy": entropy}
+            "importance": imp, "entropy": entropy,
+            # P-9b(b) 可见性字段：仅 PROTECT 分支非 null（其余分支本来就去重/裁决）
+            "dedup_skipped": dedup_skipped}
 
 
 # ---------------------------------------------------------------- 落库动作
@@ -243,12 +376,151 @@ def log(cg, rec):
     return rec
 
 
-# 生效条件：cg 与 node_id 必填，delta 默认 0.05；cg.get(node_id) 抛异常或返回假值时返回 None；imp 跨过 PROTECT_IMPORTANCE 即写 protected。
-def reinforce(cg, node_id, delta=0.05):
+# 生效条件：body 与 content 必传（None 按空串）；把 content 逐行空白归一去重、剔除已出现在 body 中的行；delta 为空（零新增信息）时返回 (None, None, None)，否则返回 (追加后的正文, 追加行, 行号)。
+def aggregate_line(body, content, stamp=None):
+    """MERGE 聚合行（**单点**）：新正文里「目标正文还没有的」行 → 追加一行。
+
+    B3（2026-09-30）根因：近重复合并（`forgetting.reinforce`，MERGE）与同构
+    聚合（`writelimit.converge_into`，CONVERGE）都只改 frontmatter
+    （importance/merge_count），新正文**逐字节丢弃**——「近重复但关键值不同」
+    的第二次写入在库里 0 命中（探针实测：新值 9595 全库 0 命中、节点未落盘）。
+    本函数是「新正文怎么进目标正文」的**唯一实现点**：两处落库动作共用，
+    第二处委托调用（硬约束：单点优先），不各自再写一份追加口径。
+
+    与 `converge_into` 旧口径（`" ".join(content.split())[:80]`）的两点差别，
+    均为**收窄信息损失**而非放宽判据：
+      · 不截断——旧口径把新值丢在 80 字外即整体丢失（P-3 实测：端口 9090
+        变体在库中 0 次落盘），而「新值必须在库里可检索」正是本修的目标；
+      · 只追加 delta——旧口径无条件追加，逐字重复的再写也会让目标正文无限
+        增长。按「归一化行是否已出现在目标正文（含已追加的聚合行）中」判，
+        纯重复零追加（不增长），带新信息的变体各追加一次（新值原样落盘，
+        可被 read/search 命中）。**幂等性靠子串判据**：聚合行自带
+        `- 【聚合 …】` 前缀，故比对用的是「归一化后的整段目标正文」而非
+        逐行集合——否则第二次同文再写会因前缀差异重复追加。
+    """
+    have = " ".join((body or "").split())
+    delta, seen = [], set()
+    for l in (content or "").splitlines():
+        s = " ".join(l.split())
+        if not s or s in seen or s in have:
+            continue
+        seen.add(s)
+        delta.append(s)
+    if not delta:
+        return None, None, None
+    stamp = stamp or time.strftime("%m-%d %H:%M", time.localtime())
+    line = f"- 【{AGG_MARK} {stamp}】" + "；".join(delta)
+    new_body = ((body or "") + "\n" if body else "") + line
+    return new_body, line, len(new_body.splitlines())
+
+
+# 生效条件：session 与 actor 均为假值（None/空串等）时返回 None 且不改 fm；否则把 {"session","actor","t"} 追加进 fm["merge_sources"]（只保留最近 MERGE_SOURCES_KEEP 条）并返回该条。
+def note_source(fm, session=None, actor=None, t=None):
+    """H3 归属并列（**单点**）：把「新写入方」的归属记进目标 frontmatter。
+
+    跨会话合并的处置选择与依据（探针读数：合并判定完全不看会话——`redundancy`
+    按同层全量比、`writelimit.check` 的键是 `f"{layer}:{role}"`，两处都无会话维；
+    实测 B 会话的近重复被并入 A 会话节点，B 的内容与归属双双消失）：
+      · **不动合并判定**（不按会话切分）。依据：同一事实在另一会话再次出现
+        仍是「又一次见到」= 确认信号，正是冗余闸门的既有语义；按会话切分会让
+        同一事实在每个会话各长一个节点，与「噪声丢掉、骨架留下」的目的相悖。
+      · **把双方归属并列落 fm**：目标自己的 `fm.session` 原样保留，新写入方
+        记进 `fm.merge_sources`（保序、有界）。召回侧据此可识别「这条记忆被
+        哪些会话/主体确认过」——当前会话的新内容不再无名无姓地消失。
+    """
+    if not session and not actor:
+        return None
+    src = {"session": None if session is None else str(session),
+           "actor": None if actor is None else str(actor),
+           "t": float(t if t is not None else time.time())}
+    rows = list(fm.get("merge_sources") or [])
+    rows.append(src)
+    fm["merge_sources"] = rows[-MERGE_SOURCES_KEEP:]
+    return src
+
+
+# 生效条件：cg 与 node_id 必传，content 为本次被丢弃的正文，target 为近重复目标，verdict 为 forgetting.assess 的判据字典；恒写一条 verdict=="DROP" 的留痕并返回「去向单」（含 trace_id / 全文或摘要 / 检索入口）；密级属 crypto.ENCRYPTED_LEVELS 时 dropped_content 为 None 且 content_redacted 为 True（明文不落留痕）。
+def record_drop(cg, content, node_id, target=None, verdict=None, layer=None,
+                sensitivity=None, session=None, actor=None):
+    """DROP 去向留痕（**单点**，B3-④）：被丢的新正文「去哪了」。
+
+    为什么需要它：`assess` 的 `:214` 分支（internal_deterministic 且
+    dup≥DUP_DROP，0.60）**先于** MERGE 分支命中，于是「近重复但关键值不同」的
+    确定性内部写入走 DROP，连既有节点都不强化——新正文只在日志里留一个
+    「低熵噪音，不编码」，正文本身零去向（探针实测：全库 0 命中）。
+
+    处置：**不追加进目标正文**（该分支的既有语义是「例行输出不该污染既有
+    记忆」，不能靠追加把它变相强化成 MERGE），改为把新正文**全文**与去向目标
+    一并落进 `_forgetting.jsonl`，返回单给出可检索的句柄（trace_id / 文件 /
+    sha1）。密级为加密级时不落明文（与写面 `mdcg._check_sensitivity_landing`
+    的「加密级却明文落盘」fail-closed 同口径）——只留摘要与长度，返回单显式
+    声明这一处取舍，不假装全文可检索。
+    """
+    flat = " ".join((content or "").split())
+    digest = hashlib.sha1(flat.encode("utf-8")).hexdigest()[:12] if flat else ""
+    enc = bool(flat) and str(sensitivity or "").strip().lower() \
+        in crypto.ENCRYPTED_LEVELS
+    t = time.time()
+    trace_id = f"drop-{node_id}-{int(t * 1000)}"
+    log(cg, {"t": t, "node_id": node_id, "layer": layer, "verdict": "DROP",
+             "reason": (verdict or {}).get("reason", ""),
+             "importance": (verdict or {}).get("importance"),
+             "entropy": (verdict or {}).get("entropy"),
+             "duplicate_with": target, "actor": actor, "session": session,
+             "trace_id": trace_id, "content_sha1": digest,
+             "content_chars": len(flat),
+             "dropped_content": None if enc else (flat or None),
+             "content_redacted": enc})
+    sink = {"verdict": "DROP", "duplicate_with": target, "trace_id": trace_id,
+            "kept_in": LOG_FILE,
+            "retrieval": (f"{LOG_FILE} 内 trace_id={trace_id}"
+                          f"（forgetting_history 读回；节点未落盘，"
+                          f"按 N229 读可见性过滤仅治理面可见）"),
+            "content_sha1": digest, "content_chars": len(flat),
+            "content_kept": bool(flat) and not enc}
+    if enc:
+        sink["redacted_reason"] = ("密级为加密级：明文不入留痕（与写面"
+                                   "「加密级却明文落盘」fail-closed 同口径）")
+    return sink
+
+
+# 生效条件：cg 与 node_id 必填，delta 默认 0.05，content 默认 None（不传即与改动前逐位一致：只改 frontmatter、正文原样写回）；cg.get(node_id) 抛异常或返回假值时返回 None；随后以节点真层/敏感度过 protect.guard_overwrite（层闸 + 保护闸，override 为真时先快照 + 审计）；imp 跨过 PROTECT_IMPORTANCE 即写 protected；content 非 None 时按 forgetting.aggregate_line 把「目标正文没有的」行追加为聚合行（零新增信息则不追加），session/actor 非空时按 forgetting.note_source 并列记归属；写盘后同步内存索引条目并**标脏**（cg._dirty[node_id]=e，推进读缓存代际与索引增量日志）；返回体带 content_sink（新正文去向：节点/行/行号）与 source（归属）。
+def reinforce(cg, node_id, delta=0.05, override=False, actor=None,
+              content=None, session=None):
     """MERGE 的落库动作：不新增节点，把「又一次见到」折算成既有节点的强化。
 
     重要性 +delta，merge_count +1；一旦跨过 0.7 自动打上保护标记
     （对齐「importance 提升（保护：不可遗忘…且受保护标记）」）。
+
+    B3（2026-09-30）：本函数此前**没有 content 槽**——MERGE 时新正文 100%
+    丢弃（写回的是 `node.get("content")`，即既有正文），调用方手上正握着
+    新正文却无处可传。现加 `content=None`（**缺省行为与改动前逐位一致**：
+    不传即正文原样写回，既有调用零破坏）；MERGE 时按 `aggregate_line`
+    （单点，与 `writelimit.converge_into` 共用）把新正文里目标还没有的行
+    追加为聚合行，`merge_count` 口径不变。注意**不动 importance 之外的既有
+    语义**：聚合行是「又一次见到 + 新值留痕」，不是新增节点、不改层、不改
+    密级、不绕保护闸（`guard_overwrite` 仍在本函数内、写盘之前，见 :278）。
+
+    H3（2026-09-30）：`session` 槽把「新写入方归属」并列记进目标
+    frontmatter（`note_source`，单点）——跨会话合并时目标自己的
+    `fm.session` 保留，新写入方记进 `fm.merge_sources`。
+
+    C-1（2026-09-29）：写盘后**标脏**（`cg._dirty[node_id] = e`，对照
+    `md_cg/mdcg.py` 的 update_tags / verify 直写分支先例）——不标脏时
+    `_dirty.path_gen` 不推进，默认开（`MDCG_READ_CACHE=1`）的读缓存会把写盘前
+    旧 fm 判新鲜，同进程「reinforce 后读」永久拿到旧 importance（FI-M03 实测）。
+
+    N214（2026-09-28，同族未接线写点）：本函数此前**裸调 `cg._write_node`**
+    覆写既有节点，两个入口（`mdcos.remember_gated` 的 MERGE 分支 :3380、
+    `mdcos.maintain(action="prefeed", write=True)` 的 reinforce 分支 :2783）
+    全程无 principal 层闸、无保护闸、无快照无审计——同一身份对**同层**的 `add` 被
+    `AccessDenied`，而此路照样覆写（持 write 的 reflect 令牌以 `layer='self'`
+    发 `mdcg_remember(gated=true)`：`writelimit.check` 因形参层≠contextual 放行、
+    `assess` 按形参层比得重复度 1.0 → MERGE → 改写 self 层节点的
+    importance/merge_count 并自动打保护位）。落盘前统一过
+    `protect.guard_overwrite`（单点，对照 `MdCGSecure.add` 的层闸 + `MdCG.add`
+    的保护闸），`override=True` 时先快照进 `_protected_history` 并写
+    `_protected_audit.jsonl`。
     """
     try:
         node = cg.get(node_id)
@@ -257,6 +529,9 @@ def reinforce(cg, node_id, delta=0.05):
     if not node:
         return None
     fm = node.get("frontmatter") or {}
+    protect.guard_overwrite(cg, node_id, layer=fm.get("layer"),
+                            sensitivity=fm.get("sensitivity"),
+                            override=override, actor=actor)
     imp = min(1.0, float(fm.get("importance") or 0.5) + delta)
     fm["importance"] = imp
     fm["merge_count"] = int(fm.get("merge_count") or 0) + 1
@@ -271,8 +546,16 @@ def reinforce(cg, node_id, delta=0.05):
     # 幂等 no-op（不写字段、不留痕）。protected 只豁免**降级**，回升不受限。
     lifecycle.stamp(fm, "active", reason="MERGE 重复强化（回升）",
                     actor="forgetting:reinforce")
+    # B3：新正文去向（content 缺省 None → new_body 为 None → 正文原样写回，
+    # 与改动前逐位一致）。聚合行只补「目标还没有的」行，纯重复零追加。
+    new_body, line, line_no = (None, None, None)
+    if content is not None:
+        new_body, line, line_no = aggregate_line(node.get("content"), content)
+    # H3：归属并列（新写入方 → fm.merge_sources；目标自己的 fm.session 不动）
+    source = note_source(fm, session=session, actor=actor)
     cg._write_node(node_id, os.path.join(cg.root, node["path"]),
-                   fm, node.get("content") or "")
+                   fm, new_body if new_body is not None
+                   else (node.get("content") or ""))
     e = ((getattr(cg, "index", None) or {}).get("nodes") or {}).get(node_id)
     if e is not None:
         e["importance"] = imp
@@ -281,13 +564,55 @@ def reinforce(cg, node_id, delta=0.05):
         if fm.get("protected"):
             e["protected"] = True
             e["protection_reason"] = fm["protection_reason"]
+        # H3 索引镜像（2026-09-30）：merge_sources 同款镜像（对照组
+        # `writelimit.converge_into` :257-258 的 `entry["merge_sources"]`）。
+        # 此前本段只同步 importance / lifecycle state / protected，盘面 fm 已
+        # 有新写入方归属而同进程索引条目读到 None，直到索引重载——与
+        # 「写盘后标脏、同进程读到新值」的既有纪律（C-1 / N133 同族，见下方
+        # 标脏注释）不一致：CONVERGE 落点（converge_into）与 MERGE 落点
+        # （reinforce）的读面行为必须同口径。
+        if fm.get("merge_sources"):
+            e["merge_sources"] = fm["merge_sources"]
+        # 标脏（N133 修复，对照先例 mdcg.py 的 update_tags / verify 直写分支
+        # `self._dirty[node_id] = e`）：只改内存 entry 时 path_gen 不推进，
+        # 读缓存（默认开，MDCG_READ_CACHE=1）按 `_fresh` 把写盘前的旧 fm 判
+        # 为新鲜——同进程「写后读」永久拿到旧 importance（FI-M03 实测）。
+        # 标脏同时让本写进 `_dirty → flush → _index_log` 重放（重启后索引
+        # 与盘面不再漂移）。**不把标脏下沉进 `_write_node`**：该函数另有
+        # 「只对账索引、不落盘」的调用方（backfill 对账支路等），下沉会让
+        # 它们凭空产生一次写入代际与自重载；此处按既有 48 处显式标脏同款
+        # 补，口径与 `_sync_edge_entry` 一致。
+        _dirty = getattr(cg, "_dirty", None)
+        if isinstance(_dirty, dict):
+            _dirty[node_id] = e
     return {"node_id": node_id, "importance": imp,
-            "merge_count": fm["merge_count"], "protected": bool(fm.get("protected"))}
+            "merge_count": fm["merge_count"], "protected": bool(fm.get("protected")),
+            # 新正文去向（②）：写进了哪个节点/哪一行——调用方不必猜。
+            "content_sink": {
+                "node_id": node_id,
+                "action": ("appended" if line else
+                           ("already_covered" if content is not None
+                            else "not_provided")),
+                "line": line, "line_no": line_no,
+                "chars": len(new_body if new_body is not None
+                             else (node.get("content") or ""))},
+            "source": source}
 
 
-# 生效条件：cg 必填，limit 默认 100；日志路径不存在时返回 []；否则返回 out[-limit:]，limit=0 时 -0 退化为 out[0:] 即全量。
+# 生效条件：cg 必填，limit 默认 100；日志路径不存在时返回 []；否则逐行 json.loads 后按行所属 node_id 做读可见性过滤（security.node_visible 为假的行整条剔除），再返回 out[-limit:]（limit=0 时 -0 退化为 out[0:] 即全量）。
 def history(cg, limit=100):
-    """读取遗忘留痕（最近 limit 条）。"""
+    """读取遗忘留痕（最近 limit 条，**按节点读可见性过滤**）。
+
+    N229（2026-09-28）：此前逐行 json.loads 原文返回（actor/verdict/reason/
+    importance/layer/duplicate_with…），零可见性、零归属过滤 ⇒ 任何持 read op
+    的身份（含无令牌 guest 经 `mdcg_forgetting_history`）读走全库他人的写入
+    闸留痕，并可借 `duplicate_with` 枚举 private 目标 id。口径与库读面统一：
+    逐行按 `security.node_visible`（跨层单点）判定行所属节点对本身份是否可见，
+    不可见/已删（索引无条目）→ 整条不出；设计者豁免（治理面本职）。
+
+    如实标注：行内 `duplicate_with` 指向的**另一**节点不做二次判定（那是
+    「去重目标」，与行所属节点不同源）——本轮按行所属节点收口，见报告残留。
+    """
     p = os.path.join(cg.root, LOG_FILE)
     if not os.path.exists(p):
         return []
@@ -298,9 +623,12 @@ def history(cg, limit=100):
                 line = line.strip()
                 if line:
                     try:
-                        out.append(__import__("json").loads(line))
+                        r = __import__("json").loads(line)
                     except Exception:
                         continue
+                    if not _security.node_visible(cg, (r or {}).get("node_id")):
+                        continue
+                    out.append(r)
     except Exception:
         return []
     return out[-limit:]
@@ -388,7 +716,7 @@ def longterm_assess(cg, apply=False, out=None, layer=None, keep=LONGTERM_KEEP,
     `current.json` 指针。幂等：断面内容相同则跳过重写（除非 force=True）。
     """
     nodes = (getattr(cg, "index", None) or {}).get("nodes") or {}
-    ids = sorted(nid for nid, e in nodes.items()
+    ids = sorted(nid for nid, e in list(nodes.items())
                  if not layer or e.get("layer") == layer)
     if max_rows:
         ids = ids[:int(max_rows)]

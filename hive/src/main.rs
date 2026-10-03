@@ -2,11 +2,24 @@
 //!
 //! ```text
 //! hive serve   [--jobs DIR] [--workers N]          # 常驻：扫描领取 + 并发执行
-//! hive submit  (--spec FILE | -) [--jobs DIR]      # 提交任务（- = stdin JSON）
+//! hive submit  (--spec FILE | -) --identity X --task Y --unit Z [--jobs DIR]
+//!                                                  # 提交任务（- = stdin JSON；四槽必填，
+//!                                                  #   编号由分配器独占创建得出）
+//! hive alloc-id --identity X --task Y --unit Z [--jobs DIR]
+//!                                                  # 只分配 id（建目录）并打印，不起任务
 //! hive poll    [JOB_ID] [--jobs DIR]               # 查状态（无 id = 全部摘要）
 //! hive kill    JOB_ID [--jobs DIR]                 # 写 kill 标志（worker 检测强杀）
 //! hive doctor  [--jobs DIR]                        # serve 存活 / 任务统计 / 环境检查
+//! hive doctor  [--jobs DIR] --quarantine           # 坏 status 隔离（移入 _quarantine/）
+//! hive doctor  [--jobs DIR] --unquarantine         # 隔离件原路退回（可回退）
 //! ```
+//!
+//! id 契约 v2（四槽）：`h_<身份>_<任务>_<单元>_<编号>`——身份/任务/单元三槽**必填**
+//! （`--identity/--task/--unit` 或 env `HIVE_JOB_IDENTITY/HIVE_JOB_TASK/HIVE_JOB_UNIT`，
+//! **缺任一即显式报错**，绝不用空串兜底/静默推导），单元槽取蜂巢五单元闭集（英文键或
+//! 中文名两种写法都收，落 id 一律中文名），编号由 `job::alloc_job_id` 独占创建即分配
+//! （4 位定宽，用满 9999 显式报错）。判据真源见 `docs/plans/全中文编码与蜂巢任务标识
+//! 契约_v2.0.md` §四.4 与 `hive/src/job.rs` 头注。
 //!
 //! 默认 jobs 目录：`HIVE_JOBS_DIR` env → `<exe>/../../../jobs`（即 `hive/jobs`）→ `./jobs`。
 //! 统一输出单行 JSON（`{"ok":true,...}` / `{"ok":false,"error":"..."}`），
@@ -16,7 +29,7 @@ use hive::job;
 use hive::json::{parse, Json};
 use hive::scheduler::{self, ServeCfg};
 use hive::spec;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 
@@ -91,12 +104,16 @@ fn arg_of(args: &[String], flag: &str) -> Option<String> {
         .cloned()
 }
 
-/// 生效条件：子命令分派入口——serve/submit/poll/kill/doctor 五路；未知子命令
+/// 生效条件：子命令分派入口——serve/submit/alloc-id/poll/kill/doctor 六路；未知子命令
 /// → err_json 退出 1；jobs 根 = --jobs > exe 锚定 > 相对 "jobs" 三段回退。
+/// doctor 的 --quarantine/--unquarantine 在本函数内转交（同一 jobs 根口径）。
 fn run() -> i32 {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let Some(cmd) = args.first() else {
-        println!("{}", err_json("用法: hive <serve|submit|poll|kill|doctor> ..."));
+        println!(
+            "{}",
+            err_json("用法: hive <serve|submit|alloc-id|poll|kill|doctor> ...")
+        );
         return 1;
     };
     let jobs = arg_of(&args, "--jobs")
@@ -106,14 +123,66 @@ fn run() -> i32 {
     match cmd.as_str() {
         "serve" => cmd_serve(&args, jobs),
         "submit" => cmd_submit(&args, jobs),
+        "alloc-id" => cmd_alloc_id(&args, jobs),
         "poll" => cmd_poll(&args, jobs),
         "kill" => cmd_kill(&args, jobs),
-        "doctor" => cmd_doctor(jobs),
+        "doctor" => cmd_doctor(&args, jobs),
         other => {
             println!("{}", err_json(format!("未知子命令 {other}")));
             1
         }
     }
+}
+
+/// 四槽的受理面（B8）：(CLI 旗标, env 名, 槽中文名) ——三行对应身份/任务/单元三槽
+/// （第四槽「编号」由分配器给出，不需入参）。
+const SLOT_ARGS: &[(&str, &str, &str)] = &[
+    ("--identity", "HIVE_JOB_IDENTITY", "身份"),
+    ("--task", "HIVE_JOB_TASK", "任务"),
+    ("--unit", "HIVE_JOB_UNIT", "单元"),
+];
+
+/// 生效条件：`--flag` 有值且去空白后非空 → Some(该值)；否则 env 同名变量去空白后非空
+/// → Some；否则 None。**不做空串兜底**（B8：缺任一即显式报错，不许静默推导）。
+fn slot_arg(args: &[String], flag: &str, env: &str) -> Option<String> {
+    if let Some(v) = arg_of(args, flag) {
+        if !v.trim().is_empty() {
+            return Some(v);
+        }
+    }
+    std::env::var(env)
+        .ok()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// 四槽解析（B8）：身份/任务/单元三槽必填（旗标优先，env 兜底）。
+/// 生效条件：三槽齐备 → Ok((identity, task, unit))；缺任一 → Err——错误文本含**四槽名**
+/// 与一个**可照抄示例**（含五单元词表），绝不静默推导/空串兜底。
+fn resolve_slots(args: &[String]) -> Result<(String, String, String), String> {
+    let mut got: Vec<String> = Vec::new();
+    let mut missing: Vec<String> = Vec::new();
+    for (flag, env, name) in SLOT_ARGS {
+        match slot_arg(args, flag, env) {
+            Some(v) => got.push(v),
+            None => missing.push(format!("{name}（{flag} 或 env {env}）")),
+        }
+    }
+    if !missing.is_empty() {
+        return Err(format!(
+            "缺四槽入参——四槽 = 身份/任务/单元/编号，其中身份、任务、单元**必填**\
+             （编号由分配器独占创建给出，无需入参），不许静默推导。缺：{}。\
+             可照抄示例：hive submit --spec task.json --identity zcode端 --task 灵枢迭代 \
+             --unit 反思单元（单元槽取闭集：{}）",
+            missing.join("、"),
+            job::unit_inventory()
+        ));
+    }
+    let mut it = got.into_iter();
+    Ok((
+        it.next().unwrap(),
+        it.next().unwrap(),
+        it.next().unwrap(),
+    ))
 }
 
 /// serve 心跳新鲜窗口（毫秒）——**必须与 `serve_start.py` 的 `FRESH_S = 15` 同口径**。
@@ -186,15 +255,70 @@ fn cmd_serve(args: &[String], jobs: PathBuf) -> i32 {
             exec_py.display()
         );
     }
-    let cfg = ServeCfg::new(jobs, workers, exec_py).with_interop_identity();
+    // P11 结果完整性锚（批次53；N190 链收窄）：密钥取 hive 既有**身份/令牌面**
+    // （serve_start 已把 config.local.json 注入本进程 env）。Some = 锚判据生效
+    // （stderr 显式声明，不静默）；None = 锚判据不启用（零配置部署行为不变——
+    // 但锚预期任务将按 fail-closed 判 needs_review，见 classify_result）。
+    // N190：HIVE_API_KEY（模型密钥）不再是本链兜底环，提示只列身份两环。
+    let result_key = hive::keyres::resolve_key_from_env();
+    match &result_key {
+        Some(k) => eprintln!(
+            "[hive serve] 结果完整性锚：已启用（密钥来源=hive 身份/令牌面 env，\
+             {} 字符）",
+            k.chars().count()
+        ),
+        None => eprintln!(
+            "[hive serve] 结果完整性锚：未启用（身份链 HIVE_ORCH_TOKEN / \
+             HIVE_ORCH_TOKEN_FILE 均缺；HIVE_API_KEY 是模型密钥、N190 起不作锚链兜底）\
+             ——锚预期任务将判 needs_review"
+        ),
+    }
+    let cfg = ServeCfg::new(jobs, workers, exec_py)
+        .with_result_key(result_key)
+        .with_interop_identity();
     let stop = Arc::new(AtomicBool::new(false));
     // Ctrl+C 简易处理：不挂 handler（零依赖下跨平台信号处理受限），
     // 进程被终止时 claimed/running 由下次启动的 recover_orphans 清理。
     scheduler::serve(&cfg, stop)
 }
 
-/// 生效条件：--spec 文件或 stdin 给出 spec JSON → validate → init_job 落盘
-/// → 打印 job_id；spec 非法/依赖缺失 → err_json 退出 1（fail fast 在进队列前）。
+/// P0-2 幂等键扫描（批次53）：jobs 目录内 status.json 带 `content_hash` 且
+/// state ∈ {pending, claimed, running} 的最老任务 → Some(job_id)。
+/// 读失败/无 hash（旧格式任务）/终态（done|error|timeout|killed）→ 跳过——
+/// 终态不拦（重跑语义不变）、旧格式不参与去重（向后兼容）。
+/// 生效条件：hash 给定 → 按 created_ts 升序（`job::list_jobs_by_created` 真值单点）
+/// 扫描返回首个活跃同哈希任务（=活跃同哈希中 **created_ts 最小者**，即最老的一台，
+/// 与改造前的「名升序首个 = 最老」语义一致）；池空/全不匹配 → None。
+fn find_active_by_hash(jobs: &Path, hash: &str) -> Option<String> {
+    for id in job::list_jobs_by_created(jobs) {
+        let st = match job::read_status(&job::job_dir(jobs, &id)) {
+            Ok(s) => s,
+            Err(_) => continue, // 坏/缺 status：不参与去重（无害跳过）
+        };
+        let h = match st.get("content_hash").and_then(|x| x.as_str()) {
+            Some(h) => h,
+            None => continue,
+        };
+        let active = match st.get("state").and_then(|x| x.as_str()) {
+            Some(s) => matches!(s, "pending" | "claimed" | "running"),
+            None => false,
+        };
+        if h == hash && active {
+            return Some(id);
+        }
+    }
+    None
+}
+
+/// 生效条件：--spec 文件或 stdin 给出 spec JSON → validate → 四槽解析（B8：身份/
+/// 任务/单元必填）→ init_job_with_slots 落盘 → 打印 job_id；spec 非法/缺槽/依赖缺失
+/// → err_json 退出 1（fail fast 在进队列前）。
+/// 锚预期（P11 批次53）：提交面解析到锚密钥时附带 result_nonce（响应
+/// result_anchor=on），否则旧格式（result_anchor=off）——判据面差异显式透出。
+/// 幂等键（P0-2 批次53）：spec canonical json（json.rs::to_canonical_string，
+/// 键序/空白不敏感）的 sha256 为 content_hash——同哈希**活跃**任务存在时
+/// 返回既有 job_id + deduplicated=true 不新建（响应新增 deduplicated/
+/// content_hash 两字段）；终态任务不拦（重跑语义不变）。
 fn cmd_submit(args: &[String], jobs: PathBuf) -> i32 {
     let text = match arg_of(args, "--spec") {
         Some(f) => std::fs::read_to_string(&f).unwrap_or_else(|e| {
@@ -226,8 +350,20 @@ fn cmd_submit(args: &[String], jobs: PathBuf) -> i32 {
             return 1;
         }
     };
+    // 四槽（B8）：身份/任务/单元**必填**（旗标或 env），缺任一即显式报错退出 1。
+    // 置于依赖检查/去重之前：缺槽不是「可以再等等」的状态，fail fast 在进队列前。
+    let (identity, task, unit) = match resolve_slots(args) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("{}", err_json(e));
+            return 1;
+        }
+    };
     // 依赖完整检查（I-1）：depends_on 引用的任务必须已存在（提交侧 fail fast；
-    // 无环性由 job_id 时间序结构性保证，见 scheduler::deps_gate 注释）
+    // 无环性由**存在性闸**结构性保证——提交时只能引用已存在的任务目录
+    // （本处 + MCP 侧 _dep_gate + 运行期 scheduler.rs::deps_gate），不是由 id 的
+    // 时间序保证：旧形态 id 恰好也带时间序，新形态 id 不再有此性质，故论证不得
+    // 依赖它。）
     let deps = v
         .get("depends_on")
         .map(|x| x.as_str_vec())
@@ -243,16 +379,118 @@ fn cmd_submit(args: &[String], jobs: PathBuf) -> i32 {
             return 1;
         }
     }
-    match job::init_job(&jobs, &v, sp.timeout_s) {
+    // P0-2 幂等键（批次53）：canonical json sha256 → 活跃同哈希任务去重。
+    // 置于依赖检查之后：幂等不豁免 spec 合法性（无效 spec 照旧 fail fast）。
+    let content_hash =
+        hive::hmac::hex32(&hive::hmac::sha256(v.to_canonical_string().as_bytes()));
+    if let Some(existing) = find_active_by_hash(&jobs, &content_hash) {
+        println!(
+            "{}",
+            ok_json(vec![
+                ("job_id", Json::Str(existing)),
+                ("deduplicated", Json::Bool(true)),
+                ("content_hash", Json::Str(content_hash)),
+                ("identity", Json::Str(identity)),
+                ("task", Json::Str(task)),
+                (
+                    "unit",
+                    Json::Str(job::unit_canonical(&unit).unwrap_or(&unit).to_string())
+                ),
+                ("jobs_dir", Json::Str(jobs.to_string_lossy().to_string())),
+                (
+                    "hint",
+                    Json::Str("同内容活跃任务已在池（幂等去重不新建）；poll 查状态".into())
+                ),
+            ])
+        );
+        return 0;
+    }
+    // P11 结果完整性锚（批次53）：提交面解析到锚密钥（hive 既有配置/令牌面 env）
+    // 即生成 nonce 落 status.json——任务自此声明锚预期（serve 侧校验见
+    // scheduler::classify_result）。无密钥 = 旧格式提交（result_anchor=off，
+    // 存量判据零变更）。锚开关在提交响应显式透出，不静默降级。
+    let result_key = hive::keyres::resolve_key_from_env();
+    let nonce = result_key.as_ref().map(|_| job::new_result_nonce());
+    match job::init_job_with_slots(&jobs, &identity, &task, &unit, &v, sp.timeout_s, nonce.as_deref())
+    {
         Ok(id) => {
+            // 幂等键落盘（init 后 patch 补写：不动 init_job 单写者写序契约；
+            // 补写失败仅损去重能力不损任务本体——诚实取舍不回滚）。
+            let _ = job::patch_status(
+                &job::job_dir(&jobs, &id),
+                vec![(
+                    "content_hash".to_string(),
+                    Json::Str(content_hash.clone()),
+                )],
+            );
             println!(
                 "{}",
                 ok_json(vec![
                     ("job_id", Json::Str(id)),
+                    ("deduplicated", Json::Bool(false)),
+                    ("content_hash", Json::Str(content_hash)),
+                    ("identity", Json::Str(identity)),
+                    ("task", Json::Str(task)),
+                    (
+                        "unit",
+                        Json::Str(job::unit_canonical(&unit).unwrap_or(&unit).to_string())
+                    ),
                     ("jobs_dir", Json::Str(jobs.to_string_lossy().to_string())),
+                    (
+                        "result_anchor",
+                        Json::Str(if nonce.is_some() { "on" } else { "off" }.into()),
+                    ),
                     (
                         "hint",
                         Json::Str("poll 查状态；done 后读 result.json".into())
+                    ),
+                ])
+            );
+            0
+        }
+        Err(e) => {
+            println!("{}", err_json(e));
+            1
+        }
+    }
+}
+
+/// 生效条件：`hive alloc-id --identity X --task Y --unit Z [--jobs DIR]`——按四槽
+/// 分配 job_id 并**创建** `jobs/<id>` 目录（独占创建即分配，B3），打印
+/// `{"ok":true,"job_id":…,"dir":…,"jobs_dir":…,"identity":…,"task":…,"unit":…}` 退出 0；
+/// 缺槽/槽非法/单元不在五单元闭集/编号用尽/建目录失败 → `{"ok":false,"error":…}`
+/// 退出 **1**（失败非 0，绝不静默）。
+/// 与 `init_job_with_slots` 的分工：本命令只做**分配**（目录即分配凭证），不写
+/// spec.json/status.json——MCP/编排面拿到 id 后自行落 spec，走的仍是同一条分配通道
+/// （§五 裁决 3：分配器唯一实现在 Rust 侧）。
+fn cmd_alloc_id(args: &[String], jobs: PathBuf) -> i32 {
+    let (identity, task, unit) = match resolve_slots(args) {
+        Ok(t) => t,
+        Err(e) => {
+            println!("{}", err_json(e));
+            return 1;
+        }
+    };
+    match job::alloc_job_id(&jobs, &identity, &task, &unit) {
+        Ok(id) => {
+            let dir = job::job_dir(&jobs, &id);
+            println!(
+                "{}",
+                ok_json(vec![
+                    ("job_id", Json::Str(id)),
+                    ("dir", Json::Str(dir.to_string_lossy().to_string())),
+                    ("jobs_dir", Json::Str(jobs.to_string_lossy().to_string())),
+                    ("identity", Json::Str(identity)),
+                    ("task", Json::Str(task)),
+                    (
+                        "unit",
+                        Json::Str(job::unit_canonical(&unit).unwrap_or(&unit).to_string())
+                    ),
+                    (
+                        "hint",
+                        Json::Str(
+                            "目录已创建 = 分配已完成；写 spec.json/status.json 后即进队列".into()
+                        )
                     ),
                 ])
             );
@@ -273,9 +511,9 @@ fn cmd_submit(args: &[String], jobs: PathBuf) -> i32 {
 /// poll 面看不见、无法裁决续跑。故此处透出交接四字段 + 派生 handoff_ready
 /// （need_continue==true 且 completed!=true，一眼可判；原始字段仍如实透传，
 /// 缺失=Null 以区分「旧执行器/未标」与「显式 false」）。
-/// 生效条件：result.json 存在 → 摘要视图（content_head 截断/usage/交接四字段
-/// +handoff_ready 派生）；不存在 → Json::Null；坏文件 → error 视图（如实透出
-/// 不静默）。
+/// 生效条件：result.json 存在 → 摘要视图（ok 凭证 + content_head 截断/usage/
+/// 交接四字段 +handoff_ready 派生）；不存在 → Json::Null；坏文件 → error 视图
+/// （如实透出不静默）。
 fn result_summary(dir: &std::path::Path, head: usize) -> Json {
     let p = dir.join("result.json");
     if !p.is_file() {
@@ -290,6 +528,9 @@ fn result_summary(dir: &std::path::Path, head: usize) -> Json {
             let need = matches!(r.get("need_continue"), Some(Json::Bool(true)));
             let done = matches!(r.get("completed"), Some(Json::Bool(true)));
             Json::Obj(vec![
+                // ok 凭证位（R02，批次58）：观测面此前只透 content/usage，凭证
+                // 字段不可见——矛盾裁决（error 终态 × ok=true）无从在 poll 面成立。
+                ("ok".to_string(), g("ok")),
                 ("content_head".to_string(), Json::Str(cut)),
                 ("content_truncated".to_string(), Json::Bool(truncated)),
                 (
@@ -318,20 +559,56 @@ fn result_summary(dir: &std::path::Path, head: usize) -> Json {
 }
 
 /// 生效条件：job 存在 → status 全量 + result 摘要（head 截断）合体视图；
-/// status 不可读 → 含 error 的最小视图（poll 的单查/列表共用渲染单元）。
+/// status 不可读 → 含错误的最小视图（poll 的单查/列表共用渲染单元）。
+/// H-3：该最小视图**区分两种不可读**——status.json 存在但不可解析 → 视图带
+/// `state="corrupt"`（事故信号，旧版只给 `error` 无 state，消费面看不出是坏
+/// 还是没写）；文件不存在 → 带 `state="no_status"`（提交竞态窗口）。两者都不是
+/// 一个裸 error：坏 status 不再静默。
+/// 矛盾裁决（R02，批次58）：status.state=error 终态与 result.ok=true 并存时
+/// 透出 conflict="late_result_after_error"——serve 被硬杀后 recover_orphans
+/// 按无产物标 error（scheduler.rs），error 落入 `match _ => {}` 永不回看，孤儿
+/// 执行器补写的 ok 产物遂与记账面矛盾固化。观测面不静默翻转 state、不静默吞
+/// result：两张脸同屏 + 矛盾位显式置起，裁决权交给消费面（wm.py 凭证闸拒放行/
+/// 主代理人工裁决）；其余状态组合不置位（done+ok 正常路径零扰动）。
 fn one_job_view(jobs: &PathBuf, id: &str, head: usize) -> Json {
     let dir = job::job_dir(jobs, id);
-    let mut view = match job::read_status(&dir) {
-        Ok(st) => st,
-        Err(e) => {
+    let mut view = match job::read_status_classified(&dir) {
+        job::StatusRead::Ok(st) => st,
+        job::StatusRead::Corrupt(e) => {
             return Json::Obj(vec![
                 ("job_id".to_string(), Json::Str(id.to_string())),
+                ("state".to_string(), Json::Str("corrupt".into())),
                 ("error".to_string(), Json::Str(e)),
+                (
+                    "marker".to_string(),
+                    Json::Bool(job::corrupt_mark_path(&dir).is_file()),
+                ),
+            ])
+        }
+        job::StatusRead::Absent => {
+            return Json::Obj(vec![
+                ("job_id".to_string(), Json::Str(id.to_string())),
+                ("state".to_string(), Json::Str("no_status".into())),
+                (
+                    "error".to_string(),
+                    Json::Str(format!("{}: status.json 尚未出现", dir.display())),
+                ),
             ])
         }
     };
     if let Json::Obj(kv) = &mut view {
-        kv.push(("result".to_string(), result_summary(&dir, head)));
+        let summary = result_summary(&dir, head);
+        let state_error = matches!(
+            kv.iter().rev().find(|(k, _)| k == "state"),
+            Some((_, Json::Str(s))) if s == "error"
+        );
+        if state_error && matches!(summary.get("ok"), Some(Json::Bool(true))) {
+            kv.push((
+                "conflict".to_string(),
+                Json::Str("late_result_after_error".into()),
+            ));
+        }
+        kv.push(("result".to_string(), summary));
     }
     view
 }
@@ -348,7 +625,11 @@ fn cmd_poll(args: &[String], jobs: PathBuf) -> i32 {
             if !job::valid_job_id(&id) {
                 println!(
                     "{}",
-                    err_json(format!("job_id 非法: {id}（须为 h 开头且不含路径成分）"))
+                    err_json(format!(
+                        "job_id 非法: {id}（须为 h 开头的单个路径分量：区块白名单\
+                 （hive/id_charset_blocks.txt）内的字母/数字与 `_`，\
+                         非尾点 `.`；不含 / \\ : 与控制/零宽/双向字符，且不得是保留设备名）"
+                    ))
                 );
                 return 1;
             }
@@ -356,7 +637,8 @@ fn cmd_poll(args: &[String], jobs: PathBuf) -> i32 {
             println!("{}", Json::Obj(vec![("ok".to_string(), Json::Bool(true)), ("job".to_string(), v)]).to_json_string());
         }
         None => {
-            let ids = job::list_jobs(&jobs);
+            // 无参列表按 created_ts 升序（真值单点），旧形态下与名升序逐位相同
+            let ids = job::list_jobs_by_created(&jobs);
             let items: Vec<Json> = ids.iter().map(|id| one_job_view(&jobs, id, 200)).collect();
             println!(
                 "{}",
@@ -385,7 +667,11 @@ fn cmd_kill(args: &[String], jobs: PathBuf) -> i32 {
     if !job::valid_job_id(id) {
         println!(
             "{}",
-            err_json(format!("job_id 非法: {id}（须为 h 开头且不含路径成分）"))
+            err_json(format!(
+                "job_id 非法: {id}（须为 h 开头的单个路径分量：区块白名单\
+                 （hive/id_charset_blocks.txt）内的字母/数字与 `_`，\
+                 非尾点 `.`；不含 / \\ : 与控制/零宽/双向字符，且不得是保留设备名）"
+            ))
         );
         return 1;
     }
@@ -511,10 +797,21 @@ fn fallback_exec() -> (String, String, &'static str) {
     (p.to_string_lossy().to_string(), mode, "doctor_env_or_default")
 }
 
-/// 生效条件：零参数调用 → 输出 serve 存活性/任务状态分布/执行器资格三要素
-/// （exec_py/exec_mode/exec_source——读心跳不读自身 env，跨进程 env 不可反查
-/// 的既定口径）→ 诊断退出码。
-fn cmd_doctor(jobs: PathBuf) -> i32 {
+/// 生效条件：`hive doctor [--jobs DIR] [--quarantine|--unquarantine]`——零参数形
+/// 输出 serve 存活性/任务状态分布/执行器资格三要素（exec_py/exec_mode/
+/// exec_source——读心跳不读自身 env，跨进程 env 不可反查的既定口径）→ 诊断退出码；
+/// `--quarantine`/`--unquarantine` 转 cmd_quarantine / cmd_unquarantine（写盘，
+/// 见各自头注）。
+/// H-3：status 分类走 `job::read_status_classified` 三态——不可解析单列
+/// `corrupt` 类别并附 `corrupt_jobs` 明细（job_id/error/marker），**不再被压进
+/// unknown 里静默**；文件未出现（提交竞态窗口）另列 `no_status`，与事故分开。
+fn cmd_doctor(args: &[String], jobs: PathBuf) -> i32 {
+    if args.iter().any(|a| a == "--quarantine") {
+        return cmd_quarantine(jobs);
+    }
+    if args.iter().any(|a| a == "--unquarantine") {
+        return cmd_unquarantine(jobs);
+    }
     std::fs::create_dir_all(&jobs).ok();
     let now = job::now_ms();
     // 执行器资格：**优先采信 serve 自报（心跳），无心跳才回退本进程 env 推导**。
@@ -579,12 +876,35 @@ fn cmd_doctor(jobs: PathBuf) -> i32 {
     };
 
     let mut counts: Vec<(String, u64)> = Vec::new();
-    for id in job::list_jobs(&jobs) {
-        let st = job::read_status(&job::job_dir(&jobs, &id));
-        let state = st
-            .ok()
-            .and_then(|s| s.get("state").and_then(|v| v.as_str()).map(|x| x.to_string()))
-            .unwrap_or_else(|| "unknown".into());
+    let mut corrupt_jobs: Vec<Json> = Vec::new();
+    // 汇总遍历按 created_ts 升序（真值单点）——counts/corrupt_jobs 的首次出现次序
+    // 随之确定，旧形态下与名升序逐位相同。
+    for id in job::list_jobs_by_created(&jobs) {
+        let dir = job::job_dir(&jobs, &id);
+        // H-3：三态读分开报——Ok 取 state（合法 JSON 无 state 键 → unknown，
+        // 与旧口径一致）；Corrupt 单列 corrupt 类别 + 明细；Absent（文件还没
+        // 出现 = 提交竞态窗口）另列 no_status。旧版把后两者一起压成 unknown，
+        // 事故与正常时序在统计面上不可分（H-3 的「静默」就发生在这一步）。
+        let state = match job::read_status_classified(&dir) {
+            job::StatusRead::Ok(st) => st
+                .get("state")
+                .and_then(|v| v.as_str())
+                .map(|x| x.to_string())
+                .unwrap_or_else(|| "unknown".into()),
+            job::StatusRead::Absent => "no_status".into(),
+            job::StatusRead::Corrupt(e) => {
+                corrupt_jobs.push(Json::Obj(vec![
+                    ("job_id".to_string(), Json::Str(id.clone())),
+                    ("error".to_string(), Json::Str(e)),
+                    // 标记文件是否在场（serve 连续 N 拍才落，见 CORRUPT_MARK_TICKS）
+                    (
+                        "marker".to_string(),
+                        Json::Bool(job::corrupt_mark_path(&dir).is_file()),
+                    ),
+                ]));
+                "corrupt".into()
+            }
+        };
         match counts.iter_mut().find(|(k, _)| *k == state) {
             Some((_, c)) => *c += 1,
             None => counts.push((state, 1)),
@@ -599,6 +919,12 @@ fn cmd_doctor(jobs: PathBuf) -> i32 {
             ])
         })
         .collect();
+    // 隔离保留区（H-3）：已移出池的任务如实列出——它们不在 task_states 里
+    // （list_jobs 只收 h 前缀目录），不列出来就成了另一种静默。
+    let quarantined: Vec<Json> = job::quarantined_jobs(&jobs)
+        .into_iter()
+        .map(|id| Json::Str(id))
+        .collect();
 
     println!(
         "{}",
@@ -607,6 +933,29 @@ fn cmd_doctor(jobs: PathBuf) -> i32 {
             ("serve", serve_info),
             ("jobs_dir", Json::Str(jobs.to_string_lossy().to_string())),
             ("task_states", Json::Arr(counts_json)),
+            // H-3 观测面：坏 status 明细（独立类别，不再是 task_states 里的一个
+            // unknown）+ 已隔离件清单；两者都在场时诊断者一眼可判
+            // 「坏了几台 / 是哪几台 / 错在哪 / 标记落没落 / 隔离了谁」。
+            ("corrupt_jobs", Json::Arr(corrupt_jobs)),
+            (
+                "quarantine_dir",
+                Json::Str(
+                    jobs.join(job::QUARANTINE_DIR)
+                        .to_string_lossy()
+                        .to_string(),
+                ),
+            ),
+            ("quarantined", Json::Arr(quarantined)),
+            (
+                "corrupt_note",
+                Json::Str(
+                    "corrupt=status.json 存在但不可解析（事故信号，不自动终态化——\
+                     那会把坏文件静默吞掉）；处置=`hive doctor --quarantine` 移出池\
+                     （可 `--unquarantine` 退回），坏字节原样保留供诊断。\
+                     no_status=任务目录在但 status.json 尚未出现（提交竞态窗口，正常时序）。"
+                        .into(),
+                ),
+            ),
             // 执行器资格（判「本 serve 能否跑确定性任务」看这三项，**不看**下面的 env）
             ("exec_py", Json::Str(exec_py_eff)),
             ("exec_mode", Json::Str(exec_mode_eff)),
@@ -663,6 +1012,156 @@ fn cmd_doctor(jobs: PathBuf) -> i32 {
     0
 }
 
+/// 坏 status **显式隔离**（H-3）：把当下 `status.json` 不可解析的任务目录整体
+/// rename 进 `<jobs>/_quarantine/`。
+///
+/// 为什么是搬家而不是改写：status.json 是**任务本体**，坏成什么样都照原样留着
+/// ——它既是诊断证据，也是人工修复的输入；隔离只改「它在不在领取面」这一个事实
+/// （`list_jobs` 只收 `h` 前缀目录，`_quarantine` 收不到），同卷 rename 原子，
+/// 任务目录内逐字节不动。**不做自动终态化**（那等于把坏文件静默吞掉）。
+/// 生效条件：jobs 给定 → 对 `scheduler::scan_corrupt`（只读判据，唯一定义见
+/// scheduler.rs）的每一项同卷 rename 到保留区；保留区按需建；目标已存在 → 该项
+/// 记 error 跳过（fail-closed：绝不覆盖既有保留件）；健康任务一律不碰。
+/// 返回 ok/quarantined（含 job_id/error/到哪去了）/errors/count；无坏项 →
+/// count 0 且退出 0（幂等：重复执行不报错）。errors 非空 → 退出 1（部分失败要
+/// 显式红，不静默吞）。
+/// 不适用条件：不删任何文件（隔离=搬家不是销毁，`--unquarantine` 可原路退回）；
+/// 不改写 status.json/spec.json/result.json 任一本体。
+fn cmd_quarantine(jobs: PathBuf) -> i32 {
+    let corrupt = scheduler::scan_corrupt(&jobs);
+    let qroot = jobs.join(job::QUARANTINE_DIR);
+    let mut moved: Vec<Json> = Vec::new();
+    let mut errors: Vec<Json> = Vec::new();
+    if !corrupt.is_empty() {
+        if let Err(e) = std::fs::create_dir_all(&qroot) {
+            println!(
+                "{}",
+                err_json(format!("建隔离区失败 {}: {e}", qroot.display()))
+            );
+            return 1;
+        }
+    }
+    for (id, reason) in &corrupt {
+        let from = job::job_dir(&jobs, id);
+        let to = qroot.join(id);
+        if to.exists() {
+            errors.push(Json::Obj(vec![
+                ("job_id".to_string(), Json::Str(id.clone())),
+                (
+                    "error".to_string(),
+                    Json::Str(format!("隔离区已有同名件，不覆盖: {}", to.display())),
+                ),
+            ]));
+            continue;
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => moved.push(Json::Obj(vec![
+                ("job_id".to_string(), Json::Str(id.clone())),
+                ("reason".to_string(), Json::Str(reason.clone())),
+                (
+                    "quarantined_at".to_string(),
+                    Json::Str(to.to_string_lossy().to_string()),
+                ),
+            ])),
+            Err(e) => errors.push(Json::Obj(vec![
+                ("job_id".to_string(), Json::Str(id.clone())),
+                ("error".to_string(), Json::Str(format!("rename 失败: {e}"))),
+            ])),
+        }
+    }
+    let n = moved.len();
+    println!(
+        "{}",
+        ok_json(vec![
+            ("jobs_dir", Json::Str(jobs.to_string_lossy().to_string())),
+            (
+                "quarantine_dir",
+                Json::Str(qroot.to_string_lossy().to_string()),
+            ),
+            ("count", Json::Num(n as f64)),
+            ("quarantined", Json::Arr(moved)),
+            ("errors", Json::Arr(errors.clone())),
+            (
+                "note",
+                Json::Str(
+                    "只搬「status.json 不可解析」的任务（健康任务一律不碰），\
+                     任务目录逐字节未改；`hive doctor --unquarantine` 原路退回。"
+                        .into(),
+                ),
+            ),
+        ])
+    );
+    if errors.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
+/// 隔离件**原路退回**（H-3 可回退面）：`<jobs>/_quarantine/<id>` → `<jobs>/<id>`。
+/// 生效条件：jobs 给定 → 对 `job::quarantined_jobs` 的每一项同卷 rename 回池；
+/// 池内已有同 id → 该项记 error 跳过（fail-closed 不覆盖在役任务）；无隔离件 →
+/// count 0 且退出 0（幂等）。errors 非空 → 退出 1。
+/// 不适用条件：不改写任务内容——退回后 status.json 仍是当初那个坏字节串，
+/// 「修好它」归人工（隔离只负责让它退出/回到领取面）。
+fn cmd_unquarantine(jobs: PathBuf) -> i32 {
+    let qroot = jobs.join(job::QUARANTINE_DIR);
+    let mut restored: Vec<Json> = Vec::new();
+    let mut errors: Vec<Json> = Vec::new();
+    for id in job::quarantined_jobs(&jobs) {
+        // 结构闸：隔离件名来自 read_dir（不可能含分隔符），仍显式过一道防漂移
+        if !job::valid_job_id(&id) {
+            errors.push(Json::Obj(vec![
+                ("job_id".to_string(), Json::Str(id.clone())),
+                ("error".to_string(), Json::Str("非法 job_id，拒绝退回".into())),
+            ]));
+            continue;
+        }
+        let from = qroot.join(&id);
+        let to = job::job_dir(&jobs, &id);
+        if to.exists() {
+            errors.push(Json::Obj(vec![
+                ("job_id".to_string(), Json::Str(id.clone())),
+                (
+                    "error".to_string(),
+                    Json::Str(format!("池内已有同 id，不覆盖: {}", to.display())),
+                ),
+            ]));
+            continue;
+        }
+        match std::fs::rename(&from, &to) {
+            Ok(()) => restored.push(Json::Str(id.clone())),
+            Err(e) => errors.push(Json::Obj(vec![
+                ("job_id".to_string(), Json::Str(id.clone())),
+                ("error".to_string(), Json::Str(format!("rename 失败: {e}"))),
+            ])),
+        }
+    }
+    let n = restored.len();
+    println!(
+        "{}",
+        ok_json(vec![
+            ("jobs_dir", Json::Str(jobs.to_string_lossy().to_string())),
+            ("count", Json::Num(n as f64)),
+            ("restored", Json::Arr(restored)),
+            ("errors", Json::Arr(errors.clone())),
+            (
+                "note",
+                Json::Str(
+                    "隔离件原路退回池内（仍是 pending/坏态原样）；\
+                     若 status.json 仍不可解析，serve 会再次计数并落标记。"
+                        .into(),
+                ),
+            ),
+        ])
+    );
+    if errors.is_empty() {
+        0
+    } else {
+        1
+    }
+}
+
 // ------------------------------------------------------------------ 单元测试
 
 #[cfg(test)]
@@ -679,6 +1178,55 @@ mod tests {
         p.push(format!("hive_main_{}_{}_{}", tag, std::process::id(), ns));
         std::fs::create_dir_all(&p).expect("建临时目录");
         p
+    }
+
+    /// 单测夹具：四槽建任务（与 CLI 走**同一条**写序单点；槽值固定，编号自增）。
+    fn mkjob(jobs: &PathBuf, spec: &Json, timeout_s: u64) -> String {
+        job::init_job_with_slots(jobs, "单测端", "id契约", "记录单元", spec, timeout_s, None)
+            .unwrap()
+    }
+
+    /// P0-2 幂等键（批次53）：活跃同哈希任务去重——命中/终态不拦/异哈希不拦。
+    #[test]
+    fn dedup_scan_active_only() {
+        let jobs = tmpdir("dedup");
+        let spec = parse(r#"{"model":"m","user_prompt":"x"}"#).unwrap();
+        let canon = spec.to_canonical_string();
+        let hash = hive::hmac::hex32(&hive::hmac::sha256(canon.as_bytes()));
+        // 空池：无命中
+        assert_eq!(find_active_by_hash(&jobs, &hash), None);
+        // 活跃任务（pending + content_hash）：命中
+        let id = mkjob(&jobs, &spec, 60);
+        job::patch_status(
+            &job::job_dir(&jobs, &id),
+            vec![("content_hash".to_string(), Json::Str(hash.clone()))],
+        )
+        .unwrap();
+        assert_eq!(find_active_by_hash(&jobs, &hash), Some(id.clone()));
+        // 终态（done）：不拦（重跑语义不变）
+        job::patch_status(
+            &job::job_dir(&jobs, &id),
+            vec![("state".to_string(), Json::Str("done".to_string()))],
+        )
+        .unwrap();
+        assert_eq!(find_active_by_hash(&jobs, &hash), None);
+        // 异哈希：不命中
+        let other = hive::hmac::hex32(&hive::hmac::sha256(b"other"));
+        assert_eq!(find_active_by_hash(&jobs, &other), None);
+        std::fs::remove_dir_all(&jobs).ok();
+    }
+
+    /// 幂等键规范化：键序不同的同内容 spec → 同一 content_hash。
+    #[test]
+    fn content_hash_canonical_insensitive() {
+        let a = parse(r#"{"model":"m","user_prompt":"x","timeout_s":60}"#).unwrap();
+        let b = parse(r#"{ "user_prompt" : "x" , "timeout_s":60,"model":"m" }"#).unwrap();
+        let ha = hive::hmac::hex32(&hive::hmac::sha256(a.to_canonical_string().as_bytes()));
+        let hb = hive::hmac::hex32(&hive::hmac::sha256(b.to_canonical_string().as_bytes()));
+        assert_eq!(ha, hb, "同内容异键序必须同哈希");
+        let c = parse(r#"{"model":"m","user_prompt":"不同内容","timeout_s":60}"#).unwrap();
+        let hc = hive::hmac::hex32(&hive::hmac::sha256(c.to_canonical_string().as_bytes()));
+        assert_ne!(ha, hc, "不同内容必须不同哈希");
     }
 
     /// 存活判据第三层（v13 新发现 A）：pid 号存活 ≠ serve 存活。
@@ -785,5 +1333,78 @@ mod tests {
         assert_eq!(result_summary(&empty, 100), Json::Null);
         std::fs::remove_dir_all(&d).ok();
         std::fs::remove_dir_all(&empty).ok();
+    }
+
+    /// R02 矛盾态守卫（批次58）：state=error 终态与孤儿执行器补写的
+    /// result.ok=true 同屏时，poll 合体面必须透出矛盾裁决字段——
+    /// 两张脸都如实保留（不静默翻转 state、不静默吞 result），由消费面
+    /// （wm.py 凭证闸/主代理）裁决，而非观测面替天做主。
+    #[test]
+    fn one_job_view_flags_late_result_after_error() {
+        let jobs = tmpdir("conflict");
+        let spec = parse(r#"{"model":"m","user_prompt":"x"}"#).unwrap();
+        let id = mkjob(&jobs, &spec, 60);
+        let dir = job::job_dir(&jobs, &id);
+        // 与 scheduler.rs recover_orphans 无产物分支逐字同字段：error 终态
+        job::patch_status(
+            &dir,
+            vec![
+                ("state".to_string(), Json::Str("error".into())),
+                (
+                    "error".to_string(),
+                    Json::Str("serve 中断：任务执行被重置".into()),
+                ),
+            ],
+        )
+        .unwrap();
+        // 孤儿执行器补写 ok=true 产物（attack 形态）
+        std::fs::write(
+            dir.join("result.json"),
+            r#"{"ok":true,"content":"孤儿补写","completed":true}"#,
+        )
+        .unwrap();
+        let v = one_job_view(&jobs, &id, 200);
+        assert_eq!(
+            v.get("conflict").and_then(|c| c.as_str()),
+            Some("late_result_after_error"),
+            "矛盾态必须透出 conflict 裁决字段"
+        );
+        // 不静默翻转：error 终态原样保留
+        assert_eq!(v.get("state"), Some(&Json::Str("error".into())));
+        // 不静默合体：补写产物原样透出（result.ok 可见，矛盾双方同屏可裁决）
+        assert_eq!(
+            v.get("result").and_then(|r| r.get("ok")),
+            Some(&Json::Bool(true))
+        );
+        std::fs::remove_dir_all(&jobs).ok();
+    }
+
+    /// R02 负例面（不误报）：done+ok / error+ok=false / error+无产物 均非矛盾态。
+    #[test]
+    fn one_job_view_no_conflict_without_contradiction() {
+        let jobs = tmpdir("noconflict");
+        let spec = parse(r#"{"model":"m","user_prompt":"x"}"#).unwrap();
+        // 负例①：done 终态 + ok=true（正常成功路径）
+        let id = mkjob(&jobs, &spec, 60);
+        let dir = job::job_dir(&jobs, &id);
+        job::patch_status(&dir, vec![("state".to_string(), Json::Str("done".into()))]).unwrap();
+        std::fs::write(
+            dir.join("result.json"),
+            r#"{"ok":true,"content":"正常成功"}"#,
+        )
+        .unwrap();
+        assert_eq!(one_job_view(&jobs, &id, 200).get("conflict"), None);
+        // 负例②：error 终态 + ok=false（凭证门本来就会拒，无矛盾）
+        let id2 = mkjob(&jobs, &spec, 60);
+        let dir2 = job::job_dir(&jobs, &id2);
+        job::patch_status(&dir2, vec![("state".to_string(), Json::Str("error".into()))]).unwrap();
+        std::fs::write(dir2.join("result.json"), r#"{"ok":false,"error":"x"}"#).unwrap();
+        assert_eq!(one_job_view(&jobs, &id2, 200).get("conflict"), None);
+        // 负例③：error 终态 + 无产物（recover_orphans 刚标完、孤儿还没写完）
+        let id3 = mkjob(&jobs, &spec, 60);
+        let dir3 = job::job_dir(&jobs, &id3);
+        job::patch_status(&dir3, vec![("state".to_string(), Json::Str("error".into()))]).unwrap();
+        assert_eq!(one_job_view(&jobs, &id3, 200).get("conflict"), None);
+        std::fs::remove_dir_all(&jobs).ok();
     }
 }

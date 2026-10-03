@@ -52,6 +52,23 @@ import sys
 import tempfile
 import time
 
+# ---------------------------------------------------------------- 入口自保证 UTF-8
+# 约束（工作纪律第 15 条）：本调用必须在**任何文件/库 I/O 之前**——utf8_boot.ensure_utf8
+# 在解释器未开 UTF-8 模式时以相同 argv 重启自身（-X utf8），早于它的任何 open/stdio
+# 读写都走 locale 编码（Windows 中文机 = cp936：裸 open 抛 UnicodeDecodeError、中文写
+# 落 GBK 字节）。本文件下方 `import exec` 会拉起执行器（读 spec 前必须先有保证），故本行
+# 必须早于它。仓库根入 sys.path 的形态照 hive/exec.py::_md_cg_import 的最小写法
+# （助手在仓根，不是 md_cg 包目录）。
+# 被 import（本模块非 __main__）时助手只置子进程继承面、绝不重启/退出——F6：静默重启
+# 会吞掉调用方输入。
+_UTF8_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _UTF8_ROOT not in sys.path:
+    sys.path.insert(0, _UTF8_ROOT)
+from utf8_boot import ensure_utf8  # noqa: E402
+
+ensure_utf8(__file__)
+
+
 HIVE_DIR = os.path.dirname(os.path.abspath(__file__))
 REPO = os.path.dirname(HIVE_DIR)
 if HIVE_DIR not in sys.path:
@@ -138,6 +155,32 @@ def _spawn_schema() -> dict:
                     "timeout_s": {"type": "integer", "description": "缺省 600"},
                     "context_budget_tokens": {"type": "integer", "description": "缺省 200000"},
                     "reasoning_effort": {"type": "string", "description": "缺省 high"},
+                    "depends_on": {
+                        "type": "array", "items": {"type": "string"},
+                        "description": (
+                            "上游子任务 job_id 列表（可选；H-6 依赖门禁）：全部 done "
+                            "才被领取，任一上游 error/timeout/killed/needs_review → "
+                            "本子任务直接 error（失败传播）。id 形如 poll_subtasks "
+                            "返回的 job_id（h 开头），且该任务必须已提交存在——"
+                            "不过闸即拒（不静默忽略、不降级为「无依赖」）。"
+                            "缺省 = 无依赖（立即并发跑）。")},
+                    "identity": {
+                        "type": "string",
+                        "description": ("id 契约 v2 身份槽（可选，缺省继承编排者自身 "
+                                        "spec 的同名槽）：落进子任务 id = "
+                                        "h_<身份>_<任务>_<单元>_<编号>；只收 Unicode "
+                                        "字母/数字且须已是 NFC 稳定形态。")},
+                    "task": {
+                        "type": "string",
+                        "description": ("id 契约 v2 任务槽（可选，缺省继承编排者自身 "
+                                        "spec 的同名槽）：工作流/迭代名。")},
+                    "unit": {
+                        "type": "string",
+                        "description": ("id 契约 v2 单元槽（可选，缺省继承编排者自身 "
+                                        "spec 的同名槽）：蜂巢五单元**闭集**——记录单元 / "
+                                        "反思单元 / 验证单元 / 输出单元 / 维生系统"
+                                        "（英文键 record/reflect/verify/output/sustain "
+                                        "亦可）。子任务按职能归单元时显式指定。")},
                 },
                 "required": ["user_prompt"],
             },
@@ -243,7 +286,16 @@ _CFG = {
     "model": "",
     "max_subtasks": DEFAULT_MAX_SUBTASKS,
     "children": [],
+    # id 契约 v2（B8）：编排者自身的四槽之三（身份/任务/单元）——由 main() 从
+    # 本编排者 spec 的同名键读入，供 `_spawn` **透传**给子任务（唯一实现是
+    # Rust 侧分配器：子任务 id = `h_<身份>_<任务>_<单元>_<编号>`）。
+    # 空 = spec 未带槽：`_spawn` **显式报错**，绝不兜底造 id（B8）。
+    "slots": {},
 }
+
+# id 契约 v2（B8）：`spawn_subtask` 的四槽之三——编排者可在单次派发里显式指定
+# （如把某个子任务定向到「验证单元」），缺省继承编排者自身 spec 的同名槽。
+SLOT_KEYS = ("identity", "task", "unit")
 
 
 # 生效条件：无入参，模块级常量 CHILDREN_FILE 与 _CFG['job_dir'] 可用时返回 os.path.join(_CFG['job_dir'], CHILDREN_FILE)。
@@ -323,6 +375,15 @@ def _save_children() -> None:
 # ------------------------------------------------------------- 身份（Q3 落地）
 
 # 生效条件：无入参，环境变量 HIVE_ORCH_TOKEN 去空白后非空则返回该值；否则读 HIVE_ORCH_TOKEN_FILE 去空白后非空才尝试打开并返回文件内容 strip 值，path 为空串则返回 ''，打开 OSError 抛 OrcError。
+#
+# 身份面**不折小写**（2026-09-28 使用者裁定「HIVE_ORCH_TOKEN 使用小写读取」的边界）：
+# 同一环境变量的**锚面**读取点（`hive/src/keyres.rs::resolve_key_from_env`、
+# `hive/hive_mcp/mcp_server.py::_result_anchor_key`）折 ASCII 小写——那里的值只作 HMAC
+# 密钥，无逐字节对照物，折小写不误判；本函数的值**要与令牌库比对**（load_principal →
+# verify_token → md_cg/tokens.parse_token），而 secret 是 `secrets.token_urlsafe` 产的
+# base64url **必含大写**（parse_token 明写 secret 不受「只认小写」限制）——在此折小写
+# 即把合法令牌改成查不到的形态（令牌全废）。故两面有意不同，勿「统一」。
+# 守卫：hive/test_result_anchor_chain.py 的 [F] 组把两侧一并钉死（F1–F3 折、F4 不折）。
 def _read_token() -> str:
     tok = (os.environ.get("HIVE_ORCH_TOKEN") or "").strip()
     if tok:
@@ -421,7 +482,41 @@ def _known_children() -> list:
 
 # -------------------------------------------------------------- 工具实现（三）
 
-# 生效条件：a 为 dict，在 len(_CFG['children']) < _CFG['max_subtasks']、a.get('user_prompt') 去空白后非空、a.get('model') 或 _CFG['model'] 去空白后非空、a.get('tools') 各项（缺省/空列表回落 list(SUB_TOOLS_ALLOW)）均属 SUB_TOOLS_ALLOW、a.get('context_files') 每项对应路径 isfile 为真时，构造 sub 白名单键（仅当 a.get(k) not in (None, '', [], {}) 才写入 system_prompt/context_files/max_tool_rounds/web_search_backend/mdcg_root/max_tokens/temperature/thinking），timeout_s 取 _ex._int_arg(a,'timeout_s',_hm.DEFAULT_TIMEOUT_S,hi=sys.maxsize)、context_budget_tokens 取 _ex._int_arg(a,'context_budget_tokens',_hm.DEFAULT_CONTEXT_BUDGET_TOKENS,hi=sys.maxsize)（脏值/非正回落默认，不夹紧），reasoning_effort 取 a.get('reasoning_effort') or _hm.DEFAULT_REASONING_EFFORT，提交后 append 到 _CFG['children']、_save_children()、_ex.progress(kind='spawn_subtask') 并返回 ok=True 及 defaults；上述前置失败则返回对应 {'ok': False, 'error': ...}。
+# 生效条件：job_dir=None 为可选入参；① env 或 config 任一显式设 HIVE_JOBS_DIR（含 config 胜出合并语义）→ 返回 _hm._jobs_dir() 原样（N89 批次 49 一致语义不动）；② 两键皆空（或皆空串）且 job_dir（缺省取 _CFG['job_dir']）去空白非空时，返回 os.path.dirname(os.path.abspath(job_dir))——serve 以 `hive serve --jobs X` 显式钉池启动且未设键时，本编排器的 job_dir 必在真实池 X 之下，父目录即 serve 实际监听池（N145，2026-09-28 第 23 轮）；推导池不是目录（job_dir 未就位/伪造路径）时回落 ①，不引入新失败面。
+def _resolve_jobs_dir(job_dir: str | None = None) -> str:
+    """子任务池解析：显式键 > job_dir 父目录推导 > 默认池（N145）。
+
+    历史缺陷（历轮口径 N142，v17 重编 N145）：_spawn(:477) 与 main() 的
+    _CFG['jobs'](:662) 只经 _hm._jobs_dir() 吃 env+config（N89 修复面），
+    不含 job_dir 推导——rust spawn_executor（src/exec.rs:91-107）Command
+    继承 serve env 且仅注入 HIVE_RESULT_ANCHOR 不注入 HIVE_JOBS_DIR，
+    `hive serve --jobs X`（env/config 均无键）形态下回落 REPO/hive/jobs
+    默认池 ≠ X：spawn_subtask 把子任务提交进默认池，serve 在池 X 无人
+    领取，子任务永久饿死且 spawn 返回 ok=True（观测面全绿与实况相悖）。
+
+    诚实边界：独立编排（orch.py <任意目录> 直跑、无 serve）时父目录推导
+    指向该目录父级——此时本无「真实池」可言，推导值与旧默认值同为约定
+    面；生产面（serve spawn 的编排器）job_dir 恒为 <池>/<job_id>，推导
+    即真实池。设键形态（显式 env/config）不受本函数影响（N89 不动）。
+    """
+    env_set = bool((os.environ.get("HIVE_JOBS_DIR") or "").strip())
+    cfg_set = False
+    try:
+        cfg, _err = _hm._load_local_config()
+        cfg_set = bool(str((cfg or {}).get("HIVE_JOBS_DIR") or "").strip())
+    except Exception:  # noqa: BLE001 —— config 读不了按未设处理，回落口径不变
+        cfg_set = False
+    if env_set or cfg_set:
+        return _hm._jobs_dir()
+    jd = job_dir if job_dir is not None else (_CFG.get("job_dir") or "")
+    if str(jd).strip():
+        pool = os.path.dirname(os.path.abspath(str(jd)))
+        if os.path.isdir(pool):
+            return pool
+    return _hm._jobs_dir()
+
+
+# 生效条件：a 为 dict，当 a.get('depends_on') 非 None 时先过 pool 解析后的 _hm._dep_gate（H-6：格式 = h 开头且不含路径成分的 job_id，与 rust job::valid_job_id 同判据；存在性 = pool/<dep> 是目录，与 CLI `hive submit` 同口径）——不过闸即返回 {'ok': False, 'error': ...}（**不写子 spec、不静默丢弃、不降级为「无依赖」**）；随后在 len(_CFG['children']) < _CFG['max_subtasks']、a.get('user_prompt') 去空白后非空、a.get('model') 或 _CFG['model'] 去空白后非空、a.get('tools') 各项（缺省/空列表回落 list(SUB_TOOLS_ALLOW)）均属 SUB_TOOLS_ALLOW、a.get('context_files') 每项对应路径 isfile 为真、**四槽之三 identity/task/unit 齐备**（显式传值优先，缺省继承 _CFG['slots']——即本编排者 spec 的同名键；两处都缺即 {'ok': False, 'error': '缺四槽入参…'}，绝不兜底造 id）时，构造 sub 白名单键（仅当 a.get(k) not in (None, '', [], {}) 才写入 system_prompt/context_files/max_tool_rounds/web_search_backend/mdcg_root/max_tokens/temperature/thinking/depends_on），timeout_s 取 _ex._int_arg(a,'timeout_s',_hm.DEFAULT_TIMEOUT_S,hi=sys.maxsize)、context_budget_tokens 取 _ex._int_arg(a,'context_budget_tokens',_hm.DEFAULT_CONTEXT_BUDGET_TOKENS,hi=sys.maxsize)（脏值/非正回落默认，不夹紧），reasoning_effort 取 a.get('reasoning_effort') or _hm.DEFAULT_REASONING_EFFORT，pool 解析经 _resolve_jobs_dir()（N145：双键皆空时从 _CFG['job_dir'] 父目录推导真实池，设键时 N89 语义原样）、env HIVE_SUBAGENT_API_KEY 去空白非空时 sub 加布尔键 use_subagent_llm=True（C4：只写布尔，不写值/不写 env 名/不写地址；为假时该键不出现）提交（_hm._submit：内部调 Rust 侧 `hive alloc-id` 分配 id，本面不自造；SubmitError → {'ok': False, 'error': …}）后 append 到 _CFG['children']、_save_children()、_ex.progress(kind='spawn_subtask') 并返回 ok=True 及 defaults；上述前置失败则返回对应 {'ok': False, 'error': ...}。
 def _spawn(a: dict) -> dict:
     """派发子任务。
 
@@ -429,6 +524,10 @@ def _spawn(a: dict) -> dict:
       · tools 只允许 SUB_TOOLS_ALLOW 的子集 —— 编排工具不外传，子代理无法再编排
       · 子 spec 由**白名单键**构造，`orchestrate` 不可能出现 → 结构上防无限递归
       · 子任务数达上限即诚实报错（不静默丢弃、不静默排队）
+      · depends_on（H-6）透传但先过 `_hm._dep_gate` 两道闸（格式 + 存在性，与 CLI
+        同判据）：不过闸即回 ok=False，**不写子 spec、不降级为「无依赖」**
+      · 四槽（B8）必填：显式传值优先、缺省继承编排者 spec 的同名槽、两处都缺即
+        诚实报错——**不兜底造 id**（id 的唯一来源 = Rust 侧分配器）
     提交走 _hm._submit（与 MCP 面**同一份** job 契约，避免第二份实现漂移）；
     但**不**走 _hm._t_spawn —— 它内含 _ensure_serve，而编排者本身就跑在 serve 的
     worker 里，serve 必然存活，无需（也不应从 worker 内）尝试拉起第二个 serve。
@@ -453,13 +552,33 @@ def _spawn(a: dict) -> dict:
         p = rel if os.path.isabs(rel) else os.path.join(os.getcwd(), rel)
         if not os.path.isfile(p):
             return {"ok": False, "error": f"context 文件不存在: {p}"}
+    # 四槽（id 契约 v2 · B8）：显式传值优先，缺省继承编排者自身 spec 的同名槽
+    # （`_CFG["slots"]`，由 main() 从本编排者 spec 读入）；**两处都缺即 fail-closed
+    # 报错**——绝不兜底造 id（旧 `h{毫秒}_{uuid6}` 已退场：它会绕过 Rust 侧分配器的
+    # 独占创建与五单元闭集，正是 H-1 那半边缺陷的形状）。
+    slots = {k: str(a.get(k) or _CFG["slots"].get(k) or "").strip()
+             for k in SLOT_KEYS}
+    missing = [k for k, v in slots.items() if not v]
+    if missing:
+        return {"ok": False, "error": (
+            f"缺四槽入参——四槽 = 身份/任务/单元/编号，其中 identity / task / unit "
+            f"**必填**（编号由分配器独占创建给出），不许兜底造 id。缺："
+            f"{'、'.join(missing)}。来源二选一：① 本工具的 identity/task/unit 参数"
+            f"（显式传值）；② 编排者自身 spec 的同名键 identity/task/unit"
+            f"（当前 spec 值：{_CFG['slots'] or '（未带）'}）。"
+            "可照抄示例：spawn_subtask(user_prompt=…, identity=\"zcode端\", "
+            "task=\"灵枢迭代\", unit=\"反思单元\")——单元槽取蜂巢五单元闭集"
+            "（记录单元/反思单元/验证单元/输出单元/维生系统）。")}
     sub = {"model": model, "user_prompt": prompt, "tools": tools,
            "workdir": os.getcwd(),
            # M3.2 来源行「父任务」链路：子任务 spec 带父编排任务 id，
            # exec.py main() 读入后由工具层注入 worker 直写来源行
            "orch_job": _CFG.get("job_id") or ""}
+    # 白名单透传键（H-6 补 depends_on：子任务依赖门禁的透传面——编排者把上游
+    # 子任务 job_id（如 poll_subtasks 看到的 id）填进来，子任务即受调度侧
+    # deps_gate 约束（全 done 才领取）。显式传值优先、缺省不写。）
     for k in ("system_prompt", "context_files", "max_tool_rounds", "web_search_backend",
-              "mdcg_root", "max_tokens", "temperature", "thinking"):
+              "mdcg_root", "max_tokens", "temperature", "thinking", "depends_on"):
         if a.get(k) not in (None, "", [], {}):
             sub[k] = a[k]
     # 统一子代理默认注入（与 MCP 面同源常量，显式传值优先）。
@@ -474,8 +593,31 @@ def _spawn(a: dict) -> dict:
     sub["context_budget_tokens"] = _ex._int_arg(
         a, "context_budget_tokens", _hm.DEFAULT_CONTEXT_BUDGET_TOKENS,
         hi=sys.maxsize)
-    jobs = _hm._jobs_dir()
-    cid = _hm._submit(jobs, sub)
+    # C4（批次69）：子代理模型端点开关——**只写布尔**。是否用
+    # HIVE_SUBAGENT_API_KEY 覆盖由子任务执行器按**自己的 env** 解析；密钥/base
+    # 的值绝不进 spec（spec 落盘、进 result/log、被读取方与编排链看见 → 写 spec
+    # 者即可让执行器把任意凭据发往任意地址）。编排者 env 没有该键时**不写**该键
+    # （子任务继承主配置，与历史行为逐位一致）。
+    if (os.environ.get("HIVE_SUBAGENT_API_KEY") or "").strip():
+        sub["use_subagent_llm"] = True
+    jobs = _resolve_jobs_dir()
+    # 依赖门禁（H-6）：子任务 depends_on 由**模型可控**的 function calling 参数而来，
+    # 故与 MCP 面同闸同判据——_hm._dep_gate（格式 = h 开头且不含路径成分的 job_id，
+    # 与 rust job::valid_job_id 同口径；存在性 = pool/<dep> 是目录，与 CLI
+    # `hive submit` 同口径）。不过闸即 fail-closed 回 {'ok': False, ...}：不写子
+    # spec、不静默丢弃、不降级为「无依赖」（静默丢弃 = 模型以为串好了 DAG、实际
+    # 子任务无依赖并发跑，正是本仓第 4 条禁止的静默错执行；判据实现只此一份，
+    # 勿在此另立第二套）。
+    dep_err = _hm._dep_gate(jobs, a.get("depends_on"))
+    if dep_err:
+        return {"ok": False, "error": dep_err}
+    try:
+        # 分配 id 的唯一通道（B7/B8）：`_hm._submit` 内部调 Rust 侧
+        # `hive alloc-id`——编排面**不自造 id**（§五 裁决 3：分配器唯一实现在
+        # Rust 侧）；HIVE_EXE 不可用/槽非法/号位用尽 → 显式 ok:False（不静默降级）。
+        cid = _hm._submit(jobs, sub, slots["identity"], slots["task"], slots["unit"])
+    except _hm.SubmitError as e:
+        return {"ok": False, "error": str(e)}
     _CFG["children"].append({
         "job_id": cid, "prompt_head": prompt[:160], "tools": tools,
         "model": model, "ts": time.time(),
@@ -610,7 +752,7 @@ def merge_tools(spec: dict) -> tuple:
     return tools, added
 
 
-# 生效条件：len(sys.argv)<2 时输出 usage 并返回 EXIT_SPEC；否则 job_dir=normpath(sys.argv[1])、job_id=basename(job_dir)，read_spec 异常则写 result 返回 EXIT_SPEC，spec.orchestrate.max_subtasks 为真值时尝试 _CFG['max_subtasks']=max(1,int(...))（TypeError/ValueError 静默跳过），load_principal(job_id) 抛 OrcError 则写 result 返回 EXIT_SPEC，成功则先 _CFG.update({job_id, job_dir, jobs=_hm._jobs_dir(), model=(spec.get('model') or '').strip()}) 再 _CFG.update({children: _load_children()})（v10 N87：children 装载必须后于 job_dir 就位——单字面量会在构造期以初态空 job_dir 求值 _load_children，恒读 CWD 相对 _children.json）、merge_tools 补 tools、缺 system_prompt 填 ORCH_SYSTEM_PROMPT、写回 spec、register_tools(ORCH_SCHEMAS, orch_handler)、set_principal_factory(...)、log/progress，最后返回 _ex.main() 并在 finally 调 _save_children()。
+# 生效条件：len(sys.argv)<2 时输出 usage 并返回 EXIT_SPEC；否则 job_dir=normpath(sys.argv[1])、job_id=basename(job_dir)，read_spec 异常则写 result 返回 EXIT_SPEC，spec.orchestrate.max_subtasks 为真值时尝试 _CFG['max_subtasks']=max(1,int(...))（TypeError/ValueError 静默跳过），load_principal(job_id) 抛 OrcError 则写 result 返回 EXIT_SPEC，成功则先 _CFG.update({job_id, job_dir, jobs=_resolve_jobs_dir(job_dir)（N145：双键皆空时从 job_dir 父目录推导真实池，设键时 N89 语义原样；显式传局部 job_dir 防字面量构造期读旧值）, model=(spec.get('model') or '').strip()}) 再 _CFG.update({children: _load_children()})（v10 N87：children 装载必须后于 job_dir 就位——单字面量会在构造期以初态空 job_dir 求值 _load_children，恒读 CWD 相对 _children.json）、merge_tools 补 tools、缺 system_prompt 填 ORCH_SYSTEM_PROMPT、写回 spec、register_tools(ORCH_SCHEMAS, orch_handler)、set_principal_factory(...)、log/progress，最后返回 _ex.main() 并在 finally 调 _save_children()。
 def main() -> int:
     if len(sys.argv) < 2:
         sys.stderr.write("usage: orch.py <job_dir>\n")
@@ -659,8 +801,14 @@ def main() -> int:
     _CFG.update({
         "job_id": job_id,
         "job_dir": job_dir,
-        "jobs": _hm._jobs_dir(),
+        # N145：显式传本函数局部 job_dir——update 字面量在构造期求值，此刻
+        # _CFG['job_dir'] 尚为旧值（N87 同款求值顺序陷阱），不能靠函数内读。
+        "jobs": _resolve_jobs_dir(job_dir),
         "model": (spec.get("model") or "").strip(),
+        # id 契约 v2（B8）：编排者自身的四槽之三从**本编排者 spec 的同名键**读入
+        # （spec 带则透传，缺则 `_spawn` 显式报错）——不推导、不从 job_id 反解
+        # （反解是「静默推导」，B1 明令禁止），更不自造 id。
+        "slots": {k: str(spec.get(k) or "").strip() for k in SLOT_KEYS},
     })
     _CFG.update({"children": _load_children()})
 
