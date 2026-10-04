@@ -126,11 +126,13 @@ _MUTATION_SNIPPET = (
     "    print(json.dumps({'raised': None}, ensure_ascii=False))\n"
 )
 
+# 读与写都带 newline=''：fingerprint 按文件字节计算，通用换行读会把 CRLF 折成 LF，
+# 写回就不再逐字节复原，恢复态永远回不到原代。
 _STALE_SNIPPET = (
     "import io, json, os\n"
     "from md_cg import generation as g\n"
     "target = os.path.join(os.path.dirname(g.__file__), 'fsutil.py')\n"
-    "raw = io.open(target, encoding='utf-8').read()\n"
+    "raw = io.open(target, encoding='utf-8', newline='').read()\n"
     "clean = g.is_stale()\n"
     "io.open(target, 'w', encoding='utf-8', newline='').write(raw + '\\n# 守卫临时改动\\n')\n"
     "modified = g.is_stale()\n"
@@ -173,7 +175,8 @@ def check_verify_and_mutation(tmp):
 
     # 二：定点变异——改名 mdcg.py 里的 mint_auto_id 定义
     mdcg_path = os.path.join(tmp, "md_cg", "mdcg.py")
-    with open(mdcg_path, encoding="utf-8") as fh:
+    # newline=''：同 _STALE_SNIPPET，恢复必须逐字节复原，否则三的收尾指纹对不上原代。
+    with open(mdcg_path, encoding="utf-8", newline="") as fh:
         original = fh.read()
     mutated = original.replace("def mint_auto_id(", "def mint_auto_id_renamed(", 1)
     if mutated == original:

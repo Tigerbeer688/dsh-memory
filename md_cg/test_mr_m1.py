@@ -628,6 +628,10 @@ def phase_d(tmp):
 
 # ---------------------------- E 集成（真源存在才跑） ----------------------------
 
+#: 2026-09-15 审计（node_26b0973a，欠账 11195）对应的真源库；E2 的量级窗口只描述它。
+AUDITED_BASELINE_ROOT = "D:/Program Files/2_ai/AEIS/data/mdcg"
+
+
 def _real_root():
     cands = [os.environ.get("MDCG_ROOT")]
     try:
@@ -635,7 +639,7 @@ def _real_root():
         cands.append(mdcg_root())
     except Exception:
         pass
-    cands.append("D:/Program Files/2_ai/AEIS/data/mdcg")
+    cands.append(AUDITED_BASELINE_ROOT)
     for r in cands:
         if r and os.path.exists(os.path.join(r, "_index.json")):
             return r
@@ -656,8 +660,16 @@ def phase_e():
     bb = d["bundle_stats"]
     ok(bb["candidates"] == d["candidates"]["total"] and bb["candidates"] > 0,
        "E1 捆绑条目数与候选同口径")
-    ok(8000 <= d["candidates"]["total"] <= 20000,
-       f"E2 真源欠账规模与基线 11195 同量级（实得 {d['candidates']['total']}）")
+    # 8000~20000 复现的是审计库快照；其它真源的欠账规模由 E1（非空）与
+    # E4（≤节点×4）把守，报现场值不判红。
+    if os.path.normcase(os.path.realpath(root)) == \
+            os.path.normcase(os.path.realpath(AUDITED_BASELINE_ROOT)):
+        ok(8000 <= d["candidates"]["total"] <= 20000,
+           f"E2 真源欠账规模与基线 11195 同量级（实得 {d['candidates']['total']}）")
+    else:
+        print(f"  E2 不适用：基线 11195 为 2026-09-15 审计库 {AUDITED_BASELINE_ROOT} "
+              f"快照，当前真源 {root} 未经该审计 → 量级窗口不描述本真源；"
+              f"现场值 候选 {d['candidates']['total']}（非失败）")
     ok(bb["bundles"] <= 3000, f"E3 包数在可评审规模内（实得 {bb['bundles']}）")
     ok(len(nodes) > 0 and d["candidates"]["total"] <= len(nodes) * 4,
        "E4 候选量级与真源节点数相容")

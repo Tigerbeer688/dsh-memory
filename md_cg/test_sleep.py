@@ -68,7 +68,9 @@ _SRC = {}
 #: 断言就对「不校验锁」的变异失明——本机实测过一次）。
 _MUT_CTX = {}
 _GEN = [0]
-_TMP = tempfile.mkdtemp(prefix="mdcg_sleep_")
+#: realpath 展开 8.3 短名：git 写进影子 .git 的 gitdir: 是规范化长名，
+#: 测试派生的沙箱路径须同形，否则 G2e2 这类前缀比较按字面失配。
+_TMP = os.path.realpath(tempfile.mkdtemp(prefix="mdcg_sleep_"))
 _SAVED = {}
 _REAL_SL = SL
 
