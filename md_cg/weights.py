@@ -554,7 +554,11 @@ def recalc(cg, layer=None, limit=None, apply=False, min_delta=APPLY_DELTA,
                 e["importance"] = plan["after"]
                 if fm.get("protected"):
                     e["protected"] = True
-                    e["protection_reason"] = fm["protection_reason"]
+                    # 防御：sync_to_lingshu 等历史写入方只写 protected 不写
+                    # protection_reason（KeyError 根因，2026-10-03）——缺键时
+                    # 保持索引条目与 frontmatter 一致（同为无 reason），不臆造。
+                    if "protection_reason" in fm:
+                        e["protection_reason"] = fm["protection_reason"]
             rec = {"t": time.time(), "action": "importance", "batch": batch,
                    "id": nid, "layer": (e or {}).get("layer"),
                    "before": plan["before"], "after": plan["after"],
