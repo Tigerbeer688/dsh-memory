@@ -214,7 +214,7 @@ test('⑦ 教训召回限定 knowledge 层：查询词是刚落盘的同一句�
 
   const knowledgeRead = readCalls.find((c) => c.extra['layer'] === 'knowledge')
   assert.ok(knowledgeRead, '应发起 layer=knowledge 的语义召回')
-  assert.deepEqual(knowledgeRead!.extra, { k: 8, layer: 'knowledge' },
+  assert.deepEqual(knowledgeRead!.extra, { k: 16, layer: 'knowledge' },
     'cg(op=read) 必须显式带 layer：缺省搜全部层会返回用户原话的自匹配回声')
   const block = a.contexts.find((c) => c.name === 'lingshu:knowledge-recall')
   assert.ok(block, '应注入【灵枢交易教训】块')

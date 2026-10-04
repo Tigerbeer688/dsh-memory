@@ -410,6 +410,8 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     // 去重状态：同一块内容只保留一份 surface 节点，避免随步数线性增长。
     let lastRecallText = ''
     let skippedSincePush = 0
+    // 跨轮轮换：最近注入过的 knowledge 节点 id，窗口内不重复注入同一节点。
+    const recentInjected: string[] = []
     ctx.on('system-prompt/assemble', async (assembly, _ctx, next) => {
       try {
         // 异步取最近记忆节点（失败静默——不阻塞模型请求）
@@ -426,6 +428,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
           const sid = sessionIdOf(hostCtx?.agent?.session) || lastSession
           const text = formatTimelineDecayed(
             await graph.timeline(recallLimit, sid ? { session: sid } : {}))
+            .replace(/\uFFFD/g, '')
           if (text) {
             // 注入边界转义（issue #16）：宿主 system-prompt 对 context 文本做严格
             // `{{variable}}` 插值，裸 `{{` 会 throw → 该轮请求整体失败。记忆原文
@@ -450,23 +453,64 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
               // 自匹配高分回声会把真正的教训挤出 top-k（【灵枢交易教训】
               // 因此回显用户原话）。
               const query = lastUserMsg.slice(0, 80) + ' 教训 经验 错误'
-              const kr = await graph.read(query, { k: 8, layer: 'knowledge' })
+              const kr = await graph.read(query, { k: 16, layer: 'knowledge' })
               const kItems = (kr && Array.isArray((kr as any).pack)) ? (kr as any).pack : (kr && Array.isArray((kr as any).results)) ? (kr as any).results : (Array.isArray(kr) ? kr : [])
               ctx.logger.info(`dsh-memory: knowledge-recall(query="${query.slice(0, 40)}") 返回 ${kItems.length} 条`)
-              const kText = kItems
-                .filter((r: any) => {
-                  const content = (r && r.content) || (r && r.node && r.node.content) || ''
-                  const score = r && r.score ? r.score : 0
-                  return content.length > 20 && score >= 0.15
+              // 候选策略（与 lib 同步，重编译以 src 为准）：排除 code_/doc_ 节点（knowledge 层
+              // 716/58 条是源码 JSDoc 与本地文档仓，通用词易命中并霸占注入位，交易教训是 mem_*）；
+              // 访问次数高的节点按 log 降权，避免少数热点长期霸占；同轮内按摘要前 160 字去重，
+              // 跨轮跳过 recentInjected 窗口内已注入的节点，注入不足 5 条再回补，保证长尾轮换。
+              interface KnowledgeCandidate {
+                nid: string
+                score: number
+                preview: string
+                key: string
+                adjusted: number
+              }
+              const candidates: KnowledgeCandidate[] = []
+              for (const r of kItems as any[]) {
+                const content = String((r && r.content) || (r && r.node && r.node.content) || '')
+                const fm = (r && r.node && r.node.frontmatter) || {}
+                const idRaw = String((r && r.id) || (r && r.node && r.node.id) || '')
+                const nid = (idRaw.replace(/\\/g, '/').split('/').pop() || '').replace(/\.md$/, '')
+                const score = Number((r && r.score) || 0)
+                const access = Math.max(0, Number(fm.access_count || 0))
+                const preview = content
+                  .replace(/\[ENC[^\]]*\]/g, '')
+                  .replace(/\uFFFD/g, '')
+                  .replace(/\s+/g, ' ')
+                  .trim()
+                  .slice(0, 200)
+                if (nid.startsWith('code_') || nid.startsWith('doc_')) continue
+                if (!(preview.length > 20 && score >= 0.1)) continue
+                candidates.push({
+                  nid,
+                  score,
+                  preview,
+                  key: preview.slice(0, 160),
+                  adjusted: score / (1 + Math.log1p(access) / Math.log(21)),
                 })
-                .slice(0, 5)
-                .map((r: any) => {
-                  const content = (r && r.content) || (r && r.node && r.node.content) || ''
-                  const score = r && r.score ? r.score.toFixed(2) : '?'
-                  const preview = String(content).replace(/\s+/g, ' ').trim().slice(0, 200)
-                  return `- [knowledge|score=${score}] ${preview}`
-                })
-                .join('\n')
+              }
+              candidates.sort((left, right) => right.adjusted - left.adjusted)
+              const chosen: KnowledgeCandidate[] = []
+              const kSeen = new Set<string>()
+              for (const allowRecent of [false, true]) {
+                for (const c of candidates) {
+                  if (chosen.length >= 5) break
+                  if (kSeen.has(c.key)) continue
+                  if (!allowRecent && recentInjected.includes(c.nid)) continue
+                  kSeen.add(c.key)
+                  chosen.push(c)
+                }
+                if (chosen.length >= 5) break
+              }
+              for (const c of chosen) {
+                const at = recentInjected.indexOf(c.nid)
+                if (at >= 0) recentInjected.splice(at, 1)
+                recentInjected.push(c.nid)
+              }
+              while (recentInjected.length > 40) recentInjected.shift()
+              const kText = chosen.map(c => `- [knowledge|score=${c.score.toFixed(2)}] ${c.preview}`).join('\n')
               if (kText) {
                 assembly.contexts.push({
                   name: 'lingshu:knowledge-recall',
