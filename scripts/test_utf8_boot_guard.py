@@ -884,12 +884,17 @@ def _launch_argv(entry_src: str, form: tuple, argv_extra=()) -> list:
     return head + list(argv_extra)
 
 
-# 生效条件：entry_src 为入口绝对路径、form 为 ("m", 模块名) 或 ("f", None)；返回该入口**真实接入形态**的 argv（**不带** -X utf8 —— 采 fail-fast 指引必须在「解释器未开 UTF-8 模式」的现场，带了 -X utf8 就永远采不到指引）。
-def _entry_argv(entry_src: str, form: tuple) -> list:
-    """入口的真实接入形态 argv（无 -X utf8）：采指引 / 复现「宿主直连」现场用。"""
-    if form[0] == "m":
-        return [sys.executable, "-m", form[1]]
-    return [sys.executable, entry_src]
+# 生效条件：entry_src 为入口绝对路径、form 为 ("m", 模块名) 或 ("f", None)、argv_extra 为可迭代追加参数；返回该入口**真实接入形态**的 argv（**不带** -X utf8 —— 采 fail-fast 指引必须在「解释器未开 UTF-8 模式」的现场，带了 -X utf8 就永远采不到指引）。
+def _entry_argv(entry_src: str, form: tuple, argv_extra=()) -> list:
+    """入口的真实接入形态 argv（无 -X utf8）：采指引 / 复现「宿主直连」现场用。
+
+    追加参数与指引命令同参（M4「NO_REEXEC 失效」下采指引退化成**真跑入口**）：
+    两个 run_tests 入口不带 `--list` 会真跑整个套件——拉起源仓副本里的用例，
+    还以固定日志文件名覆盖外层运行的逐用例日志。
+    """
+    head = ([sys.executable, "-m", form[1]] if form[0] == "m"
+            else [sys.executable, entry_src])
+    return head + list(argv_extra)
 
 
 # 生效条件：text 为 fail-fast 指引文本；返回其中以 GUIDE_CMD_PREFIX 开头那一行**去掉该前缀后的命令串**（即 `-X utf8` 之后的形态，如 `-m md_cg.mcp_server` 或入口绝对路径），无该行返回 None。
@@ -965,7 +970,10 @@ def check_guide(root: str, tmp: str, fusedir: str) -> tuple[bool, str]:
                          counter=_fresh_counter(tmp, tag + "_h"), fuse=3)
         # 采指引必须走**真实接入形态且不带 -X utf8**（否则 utf8 模式已开、早退分支先命中，
         # 永远采不到指引）；超时收紧到 60s——采不到就该红，绝不能把入口的活干一遍。
-        rc, _o, err = _talk(_entry_argv(entry_src, form), env, [], root, timeout=60)
+        # argv_extra 与指引命令同参：M4 下这一步退化成真跑入口，run_tests 两入口
+        # 带 --list 才不会真跑整个套件（连带覆盖外层逐用例日志，见 _entry_argv）。
+        rc, _o, err = _talk(_entry_argv(entry_src, form, sp["argv"]), env, [], root,
+                            timeout=60)
         text = err.decode("utf-8", "replace")
         cmd = _parse_guide_cmd(text)
         if rc != FAILFAST_EXIT or cmd is None:

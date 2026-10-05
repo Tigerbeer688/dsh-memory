@@ -14,7 +14,8 @@
 与 scripts/ 版的两点差异（都是为了在受限宿主里可跑）：
   ① 子进程输出**重定向到文件**，不用 capture_output（管道）：DSH 文件沙箱
      禁 CreatePipe（WinError 5），旧写法在受限环境里每个用例都 PermissionError
-     ——表现为「全部失败」，与代码无关。日志落在 `<testlogs>/` 便于事后查。
+     ——表现为「全部失败」，与代码无关。日志落在 `<testlogs>/run_<pid>_<开跑时刻>/`
+     便于事后查（按运行实例隔离，见 `_LOG_DIR`）。
   ② 组集合按**存在性**发现：compiler / swarm / scripts / hive 不在（安装态）
      就自然没有目标，不报错。
 
@@ -56,9 +57,15 @@ ensure_utf8(__file__)
 
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-#: 逐用例日志目录（重定向目标；默认临时目录，避免污染仓）
+#: 逐用例日志目录（重定向目标；默认临时目录，避免污染仓）。
+#: **按运行实例隔离**：`_run_one` 以 "wb" 打开固定文件名，两个 run_tests 实例
+#: （并行跑、或守卫定点变异拉起的嵌套全量跑）落进同一目录会互相截断——2026-10-04
+#: 实测嵌套跑把外层 285/312 份用例日志清成一行熔断输出。故默认目录按
+#: pid + 开跑时刻 + 随机段分片，每次运行自成一份（单次总量 ~120KB，留在临时目录
+#: 供事后查证）；显式给 MDCG_TESTLOG_DIR 时按原值使用（调用方自担隔离）。
 _LOG_DIR = os.environ.get("MDCG_TESTLOG_DIR") or os.path.join(
-    tempfile.gettempdir(), "md_cg_testlogs")
+    tempfile.gettempdir(), "md_cg_testlogs",
+    "run_%d_%d_%s" % (os.getpid(), int(time.time()), os.urandom(3).hex()))
 
 
 def _discover():
