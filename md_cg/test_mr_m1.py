@@ -639,6 +639,7 @@ def _real_root():
         cands.append(mdcg_root())
     except Exception:
         pass
+    cands.append(os.environ.get("MDCG_CONFORMANCE_ROOT"))
     cands.append(AUDITED_BASELINE_ROOT)
     for r in cands:
         if r and os.path.exists(os.path.join(r, "_index.json")):

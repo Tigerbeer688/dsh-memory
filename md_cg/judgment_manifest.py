@@ -33,6 +33,7 @@ hive serve 心跳）用的是 `scripts/judgment_manifest.py`，两侧 PATTERNS �
   md_cg/test_*.py         Python 侧测试套件
   compiler/tests/*.py     compiler 测试
   swarm/tests/*.py        swarm 测试
+  test/{hive_exec,hive_wm}_test.py   test/ 侧逐文件裁决可收件（A6；精确名冻结）
 
 安装态（出货包）只有 `md_cg/test_*.py` 一组可得——其余组命中数为 0，
 `missing_patterns` 显式随清单与冻结凭证落盘（不静默少算）；A3 两侧必须在
@@ -55,6 +56,12 @@ PATTERNS = [
     ("md_cg", "test_*.py"),
     ("compiler/tests", "*.py"),
     ("swarm/tests", "*.py"),
+    # test/（A6，2026-10-05）：与 scripts/ 版逐字同步——test/ 侧逐文件裁决可收件的
+    # 精确名冻结（未过裁决的件不进判据面）。批次99 补收：chaos 套件的陈旧登记已
+    # 同步（FI-M04 读码代理断言改 AST 语义判据 + 去锁定点变异自证）。
+    ("test", "hive_exec_test.py"),
+    ("test", "hive_wm_test.py"),
+    ("test/chaos_injection", "run_all.py"),
 ]
 
 

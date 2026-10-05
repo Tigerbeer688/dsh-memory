@@ -24,6 +24,7 @@
   md_cg/test_*.py         Python 侧测试套件
   compiler/tests/*.py     compiler 测试（#36 前漏冻）
   swarm/tests/*.py        swarm 测试（#36 前漏冻）
+  test/{hive_exec,hive_wm}_test.py   test/ 侧逐文件裁决可收件（A6；精确名冻结）
 """
 import hashlib
 import json
@@ -40,6 +41,13 @@ PATTERNS = [
     ("md_cg", "test_*.py"),
     ("compiler/tests", "*.py"),
     ("swarm/tests", "*.py"),
+    # test/（A6，2026-10-05）：与 scripts/run_tests.py 的 TEST_DIR_TESTS 具名裁决
+    # 清单同步——逐文件**精确名**冻结（fnmatch 无通配＝只认具名件）；未过逐文件
+    # 裁决的件不得进判据面。批次99 补收：chaos 套件的陈旧登记已同步（FI-M04 读码
+    # 代理断言改 AST 语义判据 + 去锁定点变异自证），其全量入口按预注追加。
+    ("test", "hive_exec_test.py"),
+    ("test", "hive_wm_test.py"),
+    ("test/chaos_injection", "run_all.py"),
 ]
 
 

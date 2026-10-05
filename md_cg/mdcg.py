@@ -244,6 +244,8 @@ STATE_BLINDSPOT = "BLINDSPOT"     # 无法建立可靠归属，停止猜测
 
 # 验证基底（白箱第 2 篇第 7 章：能被验证才能被信任）
 VERIFICATION_BASIS = nodefile.VERIFICATION_BASIS
+# 检验强度（多主体世界模型对齐 v0.1 §2 L1；真源 nodefile.CHECK_STRENGTHS）
+CHECK_STRENGTHS = nodefile.CHECK_STRENGTHS
 
 
 # 英→中语素召回中的代词黑名单（超泛词，进召回词只添噪声）
@@ -1950,6 +1952,13 @@ class MdCG:
             "importance_source": fm.get("importance_source"),
             "created_at": fm.get("created_at", 0),
             "verification_basis": fm.get("verification_basis"),
+            # 多主体世界模型对齐 v0.1（L1）：检验强度入快照（与写入路径 _stage
+            # 同口径——重建后与写入后的条目形态一致，N137 同款纪律）。
+            nodefile.CHECK_STRENGTH_FIELD: fm.get(nodefile.CHECK_STRENGTH_FIELD),
+            # A2（2026-10-05，复核 info-①）：幽灵标记也入快照——该键**不继承**
+            # （正文属性），入条目是为**字段级可见性**（索引筛选/快照统计不必读盘
+            # 开 fm），非继承源；与 check_strength 同口径仅为形态一致。
+            nodefile.UNCERTAIN_REFS_FIELD: fm.get(nodefile.UNCERTAIN_REFS_FIELD),
             "has_neg_conditions": nodefile.has_non_applicable(content),
             # ── P2-1（§5.1 六要素 6 行）：后两行的**索引键**入快照 ──────────
             # 验证方式 → 后置条件词；不适用条件 → 拒绝域词。与既有
@@ -2124,7 +2133,8 @@ class MdCG:
             semantic: str = None, depends_on=None, valid_from=None,
             valid_until=None, effective_from=None, effective_until=None,
             believed_at=None, verification_state: str = None,
-            importance_source: str = None, **extra) -> str:
+            importance_source: str = None, check_strength: str = None,
+            uncertain_refs=None, **extra) -> str:
         """写入一个节点。
 
         verification_basis: 外部验证基底（白箱信任的硬门槛），
@@ -2161,6 +2171,16 @@ class MdCG:
                     真源 trust.py）。**覆写既有节点时默认继承**——add 是全量重建
                     fm，不显式继承会把已 verified 静默打回 unverified（与
                     lifecycle_state 同构的坑）；显式传入则走迁移裁决，非法即拒。
+        check_strength: 检验强度（hoop/smoking_gun/doubly_decisive，真源
+                    nodefile.CHECK_STRENGTHS）——与 verification_basis（来源**类型**）
+                    正交的**裁决力**分级（多主体世界模型对齐 v0.1 §2 L1）。
+                    **覆写既有节点时默认继承**（同 verification_state 的坑）；
+                    缺省 None 不落键（存量零迁移）。
+        uncertain_refs: 幽灵引用标记（真源 nodefile.UNCERTAIN_REFS_FIELD）——
+                    写入链检测到的**无可解析出处**的回指短语清单（检测在
+                    writepipe._gate_ghostref，多主体世界模型对齐 v0.1 §2 L1）。
+                    与 check_strength **相反不继承**：这是正文属性，正文变了
+                    检测就该变（覆写按当次检测重算，缺省 None 不落键）。
         """
         if layer not in LAYERS:
             raise ValueError(f"未知层：{layer}（允许：{LAYERS}）")
@@ -2201,6 +2221,10 @@ class MdCG:
                 f"（DSH 在役库实测缺陷 P3）；fail-closed，如为合法业务 id 请改名）")
         if verification_basis is not None and verification_basis not in VERIFICATION_BASIS:
             raise ValueError(f"未知验证基底：{verification_basis}（允许：{VERIFICATION_BASIS}）")
+        if check_strength is not None and check_strength not in CHECK_STRENGTHS:
+            raise ValueError(f"未知检验强度：{check_strength}（允许：{CHECK_STRENGTHS}）")
+        if uncertain_refs is not None and not isinstance(uncertain_refs, (list, tuple)):
+            raise ValueError("uncertain_refs 须为短语列表（list/tuple）")
         # 写保护：self/anchor 层、protected 标记、importance≥0.7 的**既有**节点
         # 不可被任意覆写；覆盖需 override=True（旧版本自动快照 + 审计留痕）。
         # N195（2026-09-28，多进程共享库形态）：写路径同样必须做代际感知——
@@ -2382,6 +2406,23 @@ class MdCG:
         if prev_entry and lifecycle.STATE_FIELD not in prev_entry:
             prev_state = lifecycle.state_of(
                 (self.get(node_id) or {}).get("frontmatter"))
+        # check_strength（多主体世界模型对齐 v0.1 §2 L1）：覆写继承——fm 是**全量
+        # 重建**，不继承会把已声明的检验强度静默抹掉（与 verification_state /
+        # lifecycle_state 同构的坑）。传入优先；否则取旧值；仍无则**不落键**。
+        # 继承值防御：只在闭集内继承（存量无非法值；防的是外部改盘注入）。
+        _cs = check_strength if check_strength is not None else (
+            (prev_entry or {}).get(nodefile.CHECK_STRENGTH_FIELD))
+        if _cs is not None and _cs not in CHECK_STRENGTHS:
+            _cs = None
+        if _cs is not None:
+            fm[nodefile.CHECK_STRENGTH_FIELD] = _cs
+        # uncertain_refs（A2 幽灵引用标记）：**正文属性、不继承**——覆写时 fm
+        # 全量重建，若沿用旧值会把「已改写掉幽灵回指的新正文」误标为仍有幽灵
+        # （与 check_strength 的声明继承语义相反）。仅在当次检测/显式传入非空
+        # 时落键；cap 16 只防直调灌超长（检测面本身已去重保序）。
+        if uncertain_refs:
+            fm[nodefile.UNCERTAIN_REFS_FIELD] = [
+                str(x) for x in uncertain_refs][:16]
         # 显式入口兼容两种写法：`state=`（调用方直觉）与 `lifecycle_state=`。
         # `state` 必须 **pop 掉**——该键名已属裁决四态（ACCEPT/REJECT/DEFER/
         # BLINDSPOT），落进 frontmatter 只会在读面制造同名歧义；归一到真字段名后
@@ -2548,15 +2589,12 @@ class MdCG:
                     os.remove(_old_real)
             except OSError:
                 pass  # 删除失败不阻断主写路径（残留双文件退回旧行为，可重建兜底）
-            # 旧桶计数递减（与 _unstage 同口径），否则 buckets 计数漂移；
-            # 仅在桶变化时做——同桶覆写的 _stage 自增是既有口径，不在此对账。
-            _ob = prev_entry.get("bucket")
-            if _ob and _ob != bucket:
-                _left = self.index["buckets"].get(_ob, 1) - 1
-                if _left > 0:
-                    self.index["buckets"][_ob] = _left
-                else:
-                    self.index["buckets"].pop(_ob, None)
+            # 旧桶计数递减由 `_set_index_entry` 单点接管（issue #53-B）：本处
+            # 原先手写一份「仅桶变化时撤旧」——并有一句注释把「同桶覆写的
+            # _stage 自增」当成既有口径，而实测那正是计数虚高的病灶（覆写一次
+            # counts +1，{'orphan': 1} → 2）。撤旧/加新统一在单点按**归属
+            # 变化**判定；若此处再手写一份，换桶覆写会被撤两次、同桶覆写
+            # 仍虚高，两处口径必然分叉。本处不再动计数。
         self._stage(node_id, _strip_empty_gate_fields({
             "path": os.path.relpath(path, self.root).replace("\\", "/"),
             "layer": layer, "tags": tags, "bucket": bucket,
@@ -2566,6 +2604,12 @@ class MdCG:
             # 免读文件判「0.8 是显式 hint 还是启发式」，不等全量重建）。
             "importance_source": fm.get("importance_source"),
             "verification_basis": verification_basis,
+            # 多主体世界模型对齐 v0.1（L1）：检验强度入快照——覆写继承免读文件
+            # （prev_entry 取值）且与 _node_entry 同口径（N137 同款纪律）。
+            nodefile.CHECK_STRENGTH_FIELD: fm.get(nodefile.CHECK_STRENGTH_FIELD),
+            # A2（2026-10-05，复核 info-①）：幽灵标记入快照（字段级可见性；
+            # 不继承——见 _node_entry 同款注释）。
+            nodefile.UNCERTAIN_REFS_FIELD: fm.get(nodefile.UNCERTAIN_REFS_FIELD),
             "has_neg_conditions": nodefile.has_non_applicable(sealed),
             # P2-1 / P4-2①：与 `_node_entry`（重建路径）**同口径**——写路径的
             # 定向 upsert 若漏这两组键，就得等下一次全量重建才补上（N137 同款
@@ -3072,7 +3116,7 @@ class MdCG:
         if len(self._dirty) >= self.autoflush:
             self.flush()
 
-# 生效条件：无条件把 entry 写入 index["nodes"][node_id]（同键覆写 = dict 原地更新，物理位序不变）；entry.get("bucket") 为真值时该桶计数 +1；self._stg_index 非 None（第 3 层结构索引已构建）时同钩增量增/改该 id，为 None（未构建/已失效）时**不构建**——首次 stg 访问才构建，写路径零额外成本；返回 None。
+# 生效条件：无条件把 entry 写入 index["nodes"][node_id]（同键覆写 = dict 原地更新，物理位序不变）；桶计数只在该 id 的桶归属**变化**时调整（经 _bucket_shift 撤旧加新，同归属零动作）；self._stg_index 非 None（第 3 层结构索引已构建）时同钩增量增/改该 id，为 None（未构建/已失效）时**不构建**——首次 stg 访问才构建，写路径零额外成本；返回 None。
     def _set_index_entry(self, node_id, entry):
         """索引条目写入的**单点**（桶计数 + stg 结构索引同钩）。
 
@@ -3080,30 +3124,49 @@ class MdCG:
         两处口径必然漂开（本仓既有教训：同一判据写两份 = 迟早各漏一次）。
         无效化（rebuild/compact/重载）后 `_stg_index` 为 None ⇒ 这里退化为
         无操作，读侧「首次需要时构建」的惰性路径接管。
+
+        issue #53-B：同 id 再装入（add 覆写 / backfill 等 _stage）此前对 entry
+        的桶**无条件 +1**——旧条目的计数从不撤下，覆写一次即虚高 1（实测
+        {'orphan': 1} → 覆写后 {'orphan': 2}），health 分桶读数随之失真。
+        改为「归属变化才动计数」：撤旧、加新，同桶覆写零动作。
         """
+        _old = self.index["nodes"].get(node_id)
         self.index["nodes"][node_id] = entry
-        b = entry.get("bucket")
-        if b:
-            self.index["buckets"][b] = self.index["buckets"].get(b, 0) + 1
+        _ob = _old.get("bucket") if _old is not None else None
+        _nb = entry.get("bucket")
+        if _ob != _nb:
+            self._bucket_shift(_ob, -1)
+            self._bucket_shift(_nb, +1)
         ix = getattr(self, "_stg_index", None)
         if ix is not None:
             ix.add(node_id, entry)
 
-# 生效条件：无条件 pop index["nodes"][node_id]（不存在则无操作）；被 pop 的条目有真值 bucket 时该桶计数 -1，减后 <=0 则删除该桶键；self._stg_index 非 None 时同钩摘除该 id（未构建即不动）；返回被摘除的条目（不存在返回 None）。
+# 生效条件：无条件 pop index["nodes"][node_id]（不存在则无操作）；被 pop 的条目经 _bucket_shift 撤其桶一票；self._stg_index 非 None 时同钩摘除该 id（未构建即不动）；返回被摘除的条目（不存在返回 None）。
     def _remove_index_entry(self, node_id):
         """索引条目摘除的**单点**（与 `_set_index_entry` 对称：桶计数 + 结构索引同钩）。"""
         e = self.index["nodes"].pop(node_id, None)
-        if e and e.get("bucket"):
-            b = e["bucket"]
-            left = self.index["buckets"].get(b, 0) - 1
-            if left > 0:
-                self.index["buckets"][b] = left
-            else:
-                self.index["buckets"].pop(b, None)
+        if e:
+            self._bucket_shift(e.get("bucket"), -1)
         ix = getattr(self, "_stg_index", None)
         if ix is not None:
             ix.remove(node_id)
         return e
+
+# 生效条件：bucket 为假值时直接返回；否则 index["buckets"][bucket] 计数 +delta，结果 >0 时写回、<=0 时删除该键；无返回值。
+    def _bucket_shift(self, bucket, delta):
+        """桶计数 ±1 的**唯一实现**（归零删键）——issue #53-B 的单点收口。
+
+        此前 `_set_index_entry` 只加不减、`_remove_index_entry` 与 `add()` 内
+        各手写一份递减——同一判据三份实现，旧条目归属变化时三处口径必然分叉
+        （本仓既有教训：「同一判据写两份 = 迟早各漏一次」）。
+        """
+        if not bucket:
+            return
+        left = self.index["buckets"].get(bucket, 0) + delta
+        if left > 0:
+            self.index["buckets"][bucket] = left
+        else:
+            self.index["buckets"].pop(bucket, None)
 
 # 生效条件：恒把 self._stg_index 置 None（丢弃已构建的第 3 层结构索引）——凡**整体替换 self.index** 的路径（重载/compact/rebuild）调它：表按身份判代际（`StgIndex.index_obj is self.index`），显式失效让下次 stg 访问重新按新快照构建（惰性失效重建，设计稿 §3.2 二选一之选）；恒返回 None、不抛。
     def _invalidate_stg_index(self):
@@ -3151,6 +3214,17 @@ class MdCG:
             node_id, fm.get("sensitivity"), declared_sensitivity, sealed,
             has_sealer=(type(self)._seal_content is not MdCG._seal_content))
         atomic_write(path, nodefile.dumps(fm, sealed), durable=durable)
+        # issue #53-C：写盘口同步索引内容指纹——「所有写盘点都应走这里」的
+        # 同一收口面延伸。元数据更新族写点（update_tags / append_edge /
+        # append_subgraph_node / set_edge_condition / backfill_* …）走
+        # 「get() 解密 → 本方法重封」时密文每次变化（AEAD 随机 nonce），
+        # 而它们只同步自己关心的索引键——本键若不在此收口，索引 hash 会停在
+        # **旧密文**上 ⇒ 启动对账每次报 hash_drift 假阳性（实测可经 compact
+        # 快照与进程重开持久存活，直到某次全量重建；报告 issue #53-C）。
+        # 新节点首次写入时条目尚未装入（_stage 紧随其后，值同源）→ 取不到即跳过。
+        _entry = self.index["nodes"].get(node_id)
+        if _entry is not None:
+            _entry["content_hash"] = nodefile.content_hash(sealed)
         return sealed
 
     # ---------- S1 前置元数据：域标签回填 ----------
@@ -3165,7 +3239,8 @@ class MdCG:
         走 `get()`（解密）→ `_write_node()`（重新封装），保证加密库不会双重封装。
         """
         st = {"seen": 0, "already": 0, "written": 0, "no_signal": 0,
-              "unreadable": 0, "index_synced": 0, "dry_run": bool(dry_run)}
+              "unreadable": 0, "ciphertext": 0, "index_synced": 0,
+              "dry_run": bool(dry_run)}
         # 前置：功能未开启时**不做任何写入**——域标签是 S1 的元数据，默认口径不得被改变：
         # 否则「回填写索引」会与「_scan_nodes 默认关剥键」冲突，写/重建两条路口径不一致。
         if os.environ.get("MDCG_RETRIEVAL_PIPELINE") != "1":
@@ -3194,6 +3269,17 @@ class MdCG:
                 continue
             if content is None:
                 st["unreadable"] += 1
+                continue
+            from . import crypto
+            if crypto.is_encrypted(content):
+                # issue #53-A：密文不可分类——无密钥实例（backfill CLI 以基类
+                # MdCG 打开库）的 get() 把密文**原样**交出，base64 噪声会碰巧
+                # 命中大域词表（实测唯一命中＝「经济」：词表唯一拉丁词 GDP 被
+                # 三连子串撞上），假标签再被 already 分支永久固化。此处**单列
+                # 计数**并跳过（不与 no_signal 叠加：各计数是互斥分区）；
+                # classify_text 单点也已同源设防（双层：此层给可观测计数，
+                # 单点层保证任何调用方都不会误分类密文）。
+                st["ciphertext"] += 1
                 continue
             try:
                 dom = routing.classify_text(content)
@@ -3279,6 +3365,8 @@ class MdCG:
         try:
             with open(p, encoding="utf-8") as f:
                 fm, content = nodefile.loads(f.read())
+        except UnicodeDecodeError:
+            return None
         except OSError as exc:
             # C-3（FI-M02 / N134）：瞬时读失败**不得静默**——记账（真缺不记）。
             # 返回值语义不变（None = 不可读），本方法不入任何缓存，本处无负缓存
@@ -3319,6 +3407,8 @@ class MdCG:
         try:
             with open(p, encoding="utf-8") as f:
                 return nodefile.loads(f.read()) + (None,)
+        except UnicodeDecodeError:
+            return None, None, None
         except OSError as exc:
             if self._note_read_oserror(p, exc):
                 return None, None, fsutil.READ_FAIL_TRANSIENT
@@ -3731,7 +3821,7 @@ class MdCG:
                 try:
                     with open(full_path, encoding="utf-8") as f:
                         fm, content = nodefile.loads(f.read())
-                except OSError:
+                except (OSError, UnicodeDecodeError):
                     continue
                 if any(t in content for t in terms):
                     neg_coverage.append(e)
@@ -4538,6 +4628,12 @@ class MdCG:
             "bucket": None, "importance": fm.get("importance", 0.5),
             "created_at": fm.get("created_at", 0),
             "verification_basis": fm.get("verification_basis"),
+            # A1（2026-10-05，复核实证）：检验强度随搬迁携带——N137 同款：
+            # 搬迁条目缺键＝「move→普通覆写」链的继承源丢失该值 → 真丢数据。
+            nodefile.CHECK_STRENGTH_FIELD: fm.get(nodefile.CHECK_STRENGTH_FIELD),
+            # A2（2026-10-05，复核 info-①）：幽灵标记随搬迁携带（字段级可见性；
+            # 不继承——搬迁不改正文，值从盘面 fm 读取，形态与重建条目一致）。
+            nodefile.UNCERTAIN_REFS_FIELD: fm.get(nodefile.UNCERTAIN_REFS_FIELD),
             "has_neg_conditions": nodefile.has_non_applicable(node["content"]),
             # P2-1 / P4-2①（与 `_node_entry` / `add()` 同口径；N137 的教训：
             # 搬迁条目缺键 = 新检索路对搬迁后的节点静默不可达）
@@ -4784,15 +4880,29 @@ class MdCG:
         h = routing.bucket_health(self.index.get("buckets", {}),
                                   total_nodes=len(self.index["nodes"]))
         h["total_nodes"] = len(self.index["nodes"])
+        # issue #53-B③：分桶读数的**覆盖范围自述**——分桶物理上只存在于
+        # BUCKETED_LAYERS（只 knowledge），非分桶层节点不进 buckets 计数。
+        # 此前读数不带范围，报告方把「nodes=4 / total_nodes=505」读成
+        # 「统计建立在个位数样本上」（实为「knowledge 层 4 个带桶条目」）
+        # ——加一行的成本买断这个歧义。
+        h["bucket_scope"] = list(BUCKETED_LAYERS)
         # 5 要素完整度（全节点扫一遍，可能慢但只在 health() 调用）
         layer_stats = {}
         neg_stats = {}
+        # PR #54 的跳过是**静默**的：被跳过的节点不进 layer_stats，读数对
+        # 「少算了几个」无自述（跳过与不存在在统计上同形）。加显式计数：
+        # 纯增量、与既有键无冲突，与 bucket_scope 同构的扩键流程。
+        # skipped_unreadable=0 ⇔ 索引内每个节点本进程都读盘成功。
+        skipped_unreadable = 0
         for e in list(self.index["nodes"].values()):
             full_path = self._node_disk_path(e)
             try:
                 with open(full_path, encoding="utf-8") as f:
                     fm, content = nodefile.loads(f.read())
-            except OSError:
+            except (OSError, UnicodeDecodeError):
+                # 与索引重建同口径：损坏的非 UTF-8 节点不应让健康端点
+                # 整体崩溃；跳过该节点，保留其余盘面读数。
+                skipped_unreadable += 1
                 continue
             cpl = nodefile.ccg_completeness(content)
             layer = e["layer"]
@@ -4813,4 +4923,5 @@ class MdCG:
                 neg_stats[layer] += 1
         h["ccg_by_layer"] = layer_stats
         h["neg_memory_counts"] = neg_stats
+        h["skipped_unreadable"] = skipped_unreadable
         return h

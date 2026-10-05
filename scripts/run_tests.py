@@ -12,6 +12,7 @@
   swarm/      tests/*.py（脚本式 assert+sys.exit）→ -m swarm.tests.<name>
   scripts/    test_*.py（脚本式，非包无 __init__）→ 直跑 python scripts/<name>.py
   hive/       test_*.py（包内，脚本式）→ python -m hive.<name>
+  test/       逐文件裁决可收的测试（TEST_DIR_TESTS 具名清单）→ 直跑 python test/<name>.py
 
 用法（任意 cwd 均可，内部以仓库根为 subprocess cwd）：
   python scripts/run_tests.py                  # 全量
@@ -48,6 +49,27 @@ ensure_utf8(__file__)
 
 _REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 
+#: `test/` 下**已逐文件裁决可收**的测试（A6，2026-10-05 使用者裁决「测试文件是
+#: 检验系统稳定性的支柱」）。准入判据＝有明确退出码约定 ∧ 零外部依赖 ∧ 快 ∧
+#: 裸 clone 可直接跑。**具名而非 glob**：`test/` 同时住着支撑模块、评测脚本与
+#: 待同步的套件，glob 会把未裁决件一并拖进收集面。**补收（批次99，2026-10-05）**：
+#:   · chaos_injection/run_all.py —— 原「实跑退 1」已修：FI-M04 的读码代理断言原钉
+#:     「sustain.py 的 `with self._lock:` 恰 4 处」，陈旧于 9db1bcb7 新增的 sleeps
+#:     记账面（该提交已同步主守卫 test_h4_sustain_snapshot G0 的 4→5，漏同步本副本）。
+#:     修法＝本副本改 **AST 语义判据**（五个记账面的 append 必须全在 `with self._lock:`
+#:     体内；**计数基线归 G0 单点**，副本不再钉数——就地补 5 只是复制漂移源）；
+#:     定点变异自证（去 sleeps 锁→红点名 `未在锁内的记账面=['sleeps']`、恢复→绿）。
+#:     现 18 case 全一致（含 3 个 EXPECTED_GAP 基线维持）、EXIT 0、实跑 ~23s ⇒ 收。
+#:   · mock_mcp.py（stdio 模拟服务，非测试；跑起来等 stdin 会挂住套件）
+#:   · orchestrator_memory.py（自述「演示/参考脚本——selftest() 只 print 不 assert，
+#:     退出码恒 0，跑绿不代表功能验证」）
+#:   · locomo_independent_eval.py / locomo_jaccard_probe.py（第三方评测脚本：
+#:     硬编码测试机绝对路径（POSIX 形态，不写字面）+ 外部数据集
+#:     data/benchmarks/locomo-zh-500，print-only 无退出码判据）
+#:   · chaos_injection/{harness,mdcg_support,registry}.py（支撑模块，无退出码面）
+TEST_DIR_TESTS = ("hive_exec_test.py", "hive_wm_test.py",
+                  "chaos_injection/run_all.py")
+
 
 # 生效条件：以模块级常量 _REPO 为根，返回全量套件实际执行的测试文件路径列表（相对 _REPO 的正斜杠路径）——md_cg/test_*.py、compiler 与 swarm 下 tests/*.py（basename 以 "_" 开头者跳过）、scripts/test_*.py、hive/test_*.py，按组序拼接。
 def _discovered_files():
@@ -66,6 +88,9 @@ def _discovered_files():
             files.append(f)
     files += sorted(glob.glob(os.path.join(_REPO, "scripts", "test_*.py")))
     files += sorted(glob.glob(os.path.join(_REPO, "hive", "test_*.py")))
+    # test/（A6）：只收具名裁决清单（见 TEST_DIR_TESTS 注释——含不收件与理由）。
+    # 不设 os.path.isfile 过滤：目标被改名/删除时须**响亮 FAIL**，不得静默缩面。
+    files += [os.path.join(_REPO, "test", name) for name in TEST_DIR_TESTS]
     return [os.path.relpath(f, _REPO).replace("\\", "/") for f in files]
 
 
@@ -90,6 +115,12 @@ def _discover():
             # scripts/ 不是包（无 __init__.py）→ 只能直跑；脚本内自带 sys.path 注入
             out.append(("scripts", f"scripts.{stem}",
                         [[sys.executable, "-X", "utf8", f]]))
+        elif rel.startswith("test/"):
+            # test/（A6）同理非包；且顶层名与 stdlib 的 `test` 包冲突（实测
+            # Python 3.12 下 `-m test.x` 解析到 Lib\test\__init__.py）→ 只能直跑。
+            # 显示名保子路径：test/chaos_injection/run_all.py → test.chaos_injection.run_all
+            out.append(("test", "test." + rel[len("test/"):-3].replace("/", "."),
+                        [[sys.executable, "-X", "utf8", f]]))
         else:
             # hive/ 是包（有 __init__.py，与 md_cg 同形）→ -m 优先；测试内用
             # importlib 直载 exec.py/wm.py，-m 下 __file__ 正常，直跑同样可用。
@@ -99,9 +130,21 @@ def _discover():
     return out
 
 
-# 生效条件：给定 name、候选命令列表 argvs、超时秒数 timeout，逐个 subprocess.run（cwd 为模块级常量 _REPO，env 在 os.environ 基础上覆盖 PYTHONUTF8=1/PYTHONIOENCODING=utf-8，shell=False，encoding="utf-8"/errors="replace"）：抛 TimeoutExpired 即返回 (name, False, f"超时（>{timeout}s）")；若 returncode!=0 且 stderr 含 "No module named" 且 len(argvs)>1 则记下该 stderr 末 300 字符继续下一候选，否则返回 (name, returncode==0, stdout+stderr 拼接后末 800 字符)；所有候选都命中回退条件时返回 (name, False, 最后记下的片段)；
-def _run_one(name, argvs, timeout):
+# 生效条件：给定 name、候选命令列表 argvs、超时秒数 timeout（parallel=True 时向子进程
+# 加传 MDCG_RUN_TESTS_PARALLEL=1 的并行信号），逐个 subprocess.run（cwd 为模块级常量
+# _REPO，env 在 os.environ 基础上覆盖 PYTHONUTF8=1/PYTHONIOENCODING=utf-8，shell=False，
+# encoding="utf-8"/errors="replace"）：抛 TimeoutExpired 即返回 (name, False,
+# f"超时（>{timeout}s）")；若 returncode!=0 且 stderr 含 "No module named" 且
+# len(argvs)>1 则记下该 stderr 末 300 字符继续下一候选，否则返回 (name,
+# returncode==0, stdout+stderr 拼接后末 800 字符)；所有候选都命中回退条件时返回
+# (name, False, 最后记下的片段)；
+def _run_one(name, argvs, timeout, parallel=False):
+    # parallel（2026-10-03 外部报告核验新增）：负载敏感的性能断言（见
+    # md_cg/test_index_crossprocess_reload ⑥）据此在并行下明示豁免、串行照测——
+    # 语义断言不受影响，覆盖不丢（对比 _SERIAL_ONLY 的整测试跳过——那个教训在集合注释里）。
     env = dict(os.environ, PYTHONUTF8="1", PYTHONIOENCODING="utf-8")
+    if parallel:
+        env["MDCG_RUN_TESTS_PARALLEL"] = "1"
     last = ""
     for argv in argvs:                    # -m 优先；No module named 时回退直跑
         try:
@@ -186,7 +229,7 @@ def main():
     # 注：不用 argparse choices——部分 Python 版本对 nargs="*" 无值时
     # 以空列表过 choices 校验会误报 invalid choice（bpo-27227 老行为）。
     ap.add_argument("group", nargs="*", default=None,
-                    help="只跑指定组，可多选：md_cg compiler swarm scripts hive"
+                    help="只跑指定组，可多选：md_cg compiler swarm scripts hive test"
                          "（缺省全量）")
     ap.add_argument("-k", default="", help="按关键字过滤模块名")
     ap.add_argument("--jobs", type=int, default=4, help="并发数（默认 4）")
@@ -194,7 +237,7 @@ def main():
     ap.add_argument("--list", action="store_true", help="只列出目标不执行")
     args = ap.parse_args()
 
-    _known = ("md_cg", "compiler", "swarm", "scripts", "hive")
+    _known = ("md_cg", "compiler", "swarm", "scripts", "hive", "test")
     _bad = [g for g in (args.group or ()) if g not in _known]
     if _bad:
         ap.error(f"invalid group: {', '.join(_bad)}（可选：{'/'.join(_known)}）")
@@ -226,7 +269,8 @@ def main():
     bad = []
     with concurrent.futures.ThreadPoolExecutor(
             max_workers=max(1, args.jobs)) as ex:
-        futs = {ex.submit(_run_one, n, a, args.timeout): (g, n)
+        _par = max(1, args.jobs) > 1
+        futs = {ex.submit(_run_one, n, a, args.timeout, _par): (g, n)
                 for g, n, a in runnable}
         for fu in concurrent.futures.as_completed(futs):
             name, ok, tail = fu.result()
