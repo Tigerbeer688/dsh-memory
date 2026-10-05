@@ -1472,7 +1472,7 @@ class MdCG:
 
     # ---------- 索引（派生物，可重建） ----------
 
-# 生效条件：os.path.exists(self.index_path) 为真、json.load 成功、解析结果为 dict（顶层非对象=null/[]/123/"abc" 视同损坏）且其 "schema" 等于模块级 SCHEMA、且其 "_fingerprint"（目录树 mtime 指纹）等于当前 self._dir_fingerprint() 时以该快照为基底；快照缺失/损坏/顶层非对象/无指纹/指纹不符（盘面在快照写入后有增删——其它存活实例未 flush 的写入或外部改盘）均回退 self._scan_nodes() 全库扫描为基底；随后经 self._apply_log 重放分片日志（N225 补强：与 compact 面**同一实现**——无 id 跳过、e 为 None 则 pop 该 nid（tombstone）、e 非 dict 且非 None 则跳过并记账、其余覆盖），最终 buckets 由 _count_buckets 重算；
+# 生效条件：os.path.exists(self.index_path) 为真、json.load 成功、解析结果为 dict（顶层非对象=null/[]/123/"abc" 视同损坏）且其 "schema" 等于模块级 SCHEMA、且其 "_fingerprint"（目录树 mtime + 直接文件名摘要指纹）等于当前 self._dir_fingerprint() 时以该快照为基底；快照缺失/损坏/顶层非对象/无指纹/指纹不符（盘面在快照写入后有增删——其它存活实例未 flush 的写入或外部改盘）均回退 self._scan_nodes() 全库扫描为基底；随后经 self._apply_log 重放分片日志（N225 补强：与 compact 面**同一实现**——无 id 跳过、e 为 None 则 pop 该 nid（tombstone）、e 非 dict 且非 None 则跳过并记账、其余覆盖），最终 buckets 由 _count_buckets 重算；
     def _load_index(self):
         idx = None
         if os.path.exists(self.index_path):
@@ -1496,8 +1496,8 @@ class MdCG:
             # 其它存活实例未 flush 的写入（文件已落盘、索引增量还在其
             # _dirty）会从索引不可见。指纹不符 → 回退全库扫描（即原
             # 「无快照」路径的兜底行为，成本不劣于改动前）。旧快照无
-            # _fingerprint 键 → 同样回退一次（迁移窗口），下次 close
-            # 落新快照后恢复快照路径。
+            # _fingerprint 键、或存的是旧形态（纯 mtime，值为 int）→ 同样
+            # 回退一次（迁移窗口），下次 close 落新快照后恢复快照路径。
             fp = idx.get("_fingerprint")
             if fp is None or fp != self._dir_fingerprint():
                 idx = None
@@ -1704,26 +1704,36 @@ class MdCG:
         trust.invalidate_cache(self)
         return True
 
-# 生效条件：遍历 LAYERS 各层目录树（os.walk，不读文件内容），对每个可达目录记录其相对 root 的正斜杠路径到 os.stat().st_mtime_ns 的映射；stat 抛 OSError 的目录跳过；返回该映射。
+# 生效条件：遍历 LAYERS 各层目录树（os.walk，不读文件内容），对每个可达目录以相对 root 的正斜杠路径为键记录两元素列表 [os.stat().st_mtime_ns, 该目录直接文件名排序后以 NUL 连接字节的 sha256 十六进制前 16 位]（列表形态：与 JSON 快照往返后逐值相等）；stat 抛 OSError 的目录跳过；返回该映射。
     def _dir_fingerprint(self):
-        """盘面目录树 mtime 指纹——检测「快照写入后盘面有增删」的廉价哨兵。
+        """盘面目录树 mtime + 直接文件名摘要指纹——检测「快照写入后盘面有增删」的廉价哨兵。
 
-        只 walk 目录 + 每目录一次 stat（不 open/不解析任何 .md），成本
-        与目录数成正比、与节点数无关（平铺库 ~LAYERS 次 stat）。目录
-        mtime 在直接子项增删时变化（NTFS 100ns / ext4 ns 粒度）。
+        只 walk 目录 + 每目录一次 stat（不 open/不解析任何 .md），文件名摘要取自
+        walk 已列出的直接子文件名，不新增系统调用；成本随目录数与文件名总长走，
+        与节点内容无关（平铺库 ~LAYERS 次 stat + 一次排序/哈希）。
+
+        为什么必须带文件名摘要（2026-10-04 满载实测）：目录 mtime 出自系统时钟，
+        负载下同一时钟桶可覆盖 148ms——子进程在快照写入后 148ms 落盘的新节点，
+        其所在目录 mtime 可能纹丝不动（836 样本中 18 次），指纹校验因此放行旧
+        快照、新节点「在盘上但索引不可见」。文件名摘要与时钟无关，增/删/改名
+        必然不同。
         边界：同目录**内容级**改写（不动文件名）不触发——合作写路径
         （add/update）都同步走索引增量日志，不依赖本指纹；外部直改
         文件内容属非合作写者协议（见 readcache 同款声明）。
+        旧快照存的是纯 mtime（值为 int）→ 与本形态失配 → 回退全库扫描一次，
+        下次 close 落新形态后恢复快照路径。
         """
         fp = {}
         for layer in LAYERS:
             base = os.path.join(self.root, layer)
-            for dirpath, _dirs, _files in os.walk(base):
+            for dirpath, _dirs, files in os.walk(base):
                 try:
-                    fp[os.path.relpath(dirpath, self.root).replace("\\", "/")] = \
-                        os.stat(dirpath).st_mtime_ns
+                    mtime_ns = os.stat(dirpath).st_mtime_ns
                 except OSError:
                     continue
+                names = os.fsencode("\0".join(sorted(files)))
+                fp[os.path.relpath(dirpath, self.root).replace("\\", "/")] = [
+                    mtime_ns, hashlib.sha256(names).hexdigest()[:16]]
         return fp
 
 # 生效条件：遍历 LAYERS 各层目录树（os.walk，不读文件内容），统计文件名以 ".md" 结尾的文件总数并返回。

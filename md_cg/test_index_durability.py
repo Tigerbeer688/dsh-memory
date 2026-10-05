@@ -11,24 +11,28 @@
   其它进程与重载后的长驻进程都检索不到，只能靠某次全量 `rebuild_index()` 偶然救回。
   表象极易被误判为「写入丢失」——故本测试以**索引可见性**（而非 `get()`）为判据。
 
-固化三处修复 + 一处反证（防测试空转）：
+固化三处修复 + 两处反证（防测试空转）：
   ① 库层进程退出兜底（`mdcg._LIVE_CGS` + atexit）：子进程不显式收尾也能落盘；
   ② `review_decide` 统一收尾：目标节点 **与** 审计记录节点双落盘
      （accept/edit 写前者、`_record_decision` 写后者；reject 路径**只**写后者）；
   ③ `review_cli` 显式 `close()`：真实缺陷现场（一次性 CLI 裁决）端到端；
-  ④ 反证组：清空兜底登记 → 复现「索引不可见」，证明 ①② 确在生效。
+  ④ 反证组：清空兜底登记 → 复现「索引不可见」，证明 ①② 确在生效；
+  ⑤ 盘面指纹不靠时钟：把目录 mtime 钉回旧值后，「快照写入后落盘的新节点」
+     仍须可见（指纹含直接文件名摘要；只靠 mtime 会因时钟撞桶放行陈旧快照）。
 
   `_index.json` 快照是「贴真实库形态」的必要前提：空 root 首开会全扫目录，
   恰好掩盖本缺陷（这也是首版复现实验失败的教训）。
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
 
+from .mdcg import LAYERS
 from .mdcos import MdCGOS
 
 PASS = FAIL = 0
@@ -152,6 +156,50 @@ def main():
                  if os.path.isdir(log_dir) else 0)
         check("反证：增量日志零记录（atexit flush 是有效变量，防【①】空转）",
               n_log == 0, f"log_files={n_log}")
+
+        # ---------------- ⑤ 盘面指纹不靠时钟（文件名摘要兜底） ----------------
+        # 取证（2026-10-04 满载实测）：目录 mtime 出自系统时钟，负载下同一时钟桶
+        # 可覆盖 148ms——「快照写入后 148ms 落盘的新节点」所在目录可能 mtime 纹丝
+        # 不动（836 样本 18 次），只看 mtime 的指纹会放行陈旧快照。这里把撞桶现场
+        # **钉死**（还原旧快照 + 各层目录 mtime 钉回旧值），只让文件名集合变。
+        print("\n【⑤】盘面指纹不靠时钟：mtime 撞桶也须识破陈旧快照")
+        root_f = tempfile.mkdtemp(prefix="idxdur_f_")
+        roots.append(root_f)
+        _seed(root_f, nid="seed_f")
+        idx_path = os.path.join(root_f, "_index.json")
+        cgw = MdCGOS(root_f, actor="writer")
+        with open(idx_path, "rb") as f:
+            snap_old = f.read()
+        dirs = {}
+        for _layer in LAYERS:
+            for dp, _subs, _f in os.walk(os.path.join(root_f, _layer)):
+                dirs[dp] = os.stat(dp).st_mtime_ns
+        cgw.add("n_late", mk("迟到节点", "问迟到", "快照写入后才落盘的新节点"),
+                verification_basis="test")
+        cgw.close()
+        with open(idx_path, "wb") as f:            # 还原**旧**快照：盘面有、账面无
+            f.write(snap_old)
+        for dp, ns in dirs.items():                # 目录 mtime 钉回写前值（撞 tick）
+            os.utime(dp, ns=(ns, ns))
+        stored = (json.loads(snap_old) or {}).get("_fingerprint") or {}
+        live_ns = {}
+        for _layer in LAYERS:
+            for dp, _subs, _f in os.walk(os.path.join(root_f, _layer)):
+                rel = os.path.relpath(dp, root_f).replace("\\", "/")
+                live_ns[rel] = os.stat(dp).st_mtime_ns
+        check("⑤ 前置：各层目录 mtime 逐目录等于快照所记（撞桶现场成立）",
+              set(stored) == set(live_ns) and all(
+                  (v[0] if isinstance(v, list) else v) == live_ns.get(k)
+                  for k, v in stored.items()), f"dirs={len(live_ns)}")
+        check("⑤ 前置：陈旧快照的 nodes 不含新节点（盘面与账面已分叉）",
+              "n_late" not in ((json.loads(snap_old) or {}).get("nodes") or {}))
+        log_dir_f = os.path.join(root_f, "_index_log")
+        n_log_f = (sum(1 for fn in os.listdir(log_dir_f) if fn.endswith(".log"))
+                   if os.path.isdir(log_dir_f) else 0)
+        check("⑤ 前置：增量日志零记录（可见性只能靠指纹识破，不靠日志重放）",
+              n_log_f == 0, f"log_files={n_log_f}")
+        check("⑤ 新节点仍索引可见（文件名摘要识破陈旧快照→回退全库扫描）",
+              _visible(root_f, "n_late"))
 
         # ---------------- ③ 显式 close 对照（原有正路不回归） ----------------
         print("\n【③】显式收尾对照：close() 仍是正路")
