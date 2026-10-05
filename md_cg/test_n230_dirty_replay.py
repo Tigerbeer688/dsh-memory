@@ -21,6 +21,13 @@
 重放——「本实例未落盘写入不因重载从检索面消失」这条既有不变量一并保留。
 tombstone（`None`）语义**一字不改**（`_unstage` 立即 flush，不跨重载存活）。
 
+**第二层：内容复核（2026-10-04）**。见证那两个读数都出自系统时钟与长度：同
+尺寸改写落进同一时钟桶时 (mtime_ns, size) 逐字相同、字节却已换（满载实测 6/6 次
+dmtime=0，G1 因此只在 size 恰好不同才转绿）。故见证一致时再读一次节点文件，
+比盘面正文的 `content_hash`（双形态：原文 / 去尾换行，与 add、rebuild 两种摘要
+口径同宽）——不等即判陈旧；条目无 `content_hash`、或文件读不回/读不懂，一律放行
+（沿用「证不出陈旧就不当陈旧」）。
+
 断言分组：
 
   G0 前置——站点在位：`_dirty_entry_superseded` / `_note_witness` 各一处；`_dirty.root` 已挂。
@@ -32,6 +39,9 @@ tombstone（`None`）语义**一字不改**（`_unstage` 立即 flush，不跨�
   G4 见证判据的判别力（正/负对照）——`_dirty_entry_superseded` 的四条边界逐一断言。
   G5 单点结构（静态）——`for nid, e in self._dirty.items():` 的重放体内**必须**
      经过 `_dirty_entry_superseded`（副本回归/裸赋值回归即红）。
+  G6 内容复核的判别力（正/负对照）——同 tick 同尺寸改写（mtime 钉回见证值、
+     stat 逐字相同）由**正文**判陈旧；正文相同、条目无 `content_hash` 两种情形
+     必须放行。退回「只看 stat 见证」时 G6a 必红。
 
 运行：python -X utf8 -m md_cg.test_n230_dirty_replay
       python -X utf8 -m md_cg.test_n230_dirty_replay --head-baseline  # 红基线自证
@@ -252,7 +262,45 @@ def g5():
        "G5c 跳过条数落在可判读数 `_dirty_replay_superseded` 上")
 
 
-_GROUPS = (g0, g1, g2, g3, g4, g5)
+# ---------------------------------------------------------------- G6
+def g6():
+    print("== G6 见证一致（同 tick 同尺寸改写）时的内容复核正/负对照 ==")
+    r = _sandbox("g6")
+    a = MdCG(r, autoflush=1000)
+    a.add("c_node", BODY % ("c", "V1"), layer="knowledge",
+          verification_basis="test")
+    st = a._dirty.staged_stat.get("c_node")
+    ok(st is not None, "G6 前置：A 标脏时登记了见证", st)
+    path = os.path.join(r, a._dirty["c_node"]["path"])
+    with open(path, encoding="utf-8") as f:
+        text = f.read()
+
+    def rewrite_and_pin(bump):
+        """外部改写为 bump 正文并把 mtime 钉回见证值 ⇒ 构造 stat 见证撞桶现场。"""
+        with open(path, "w", encoding="utf-8", newline="\n") as f:
+            f.write(text.replace("V1", bump))
+        os.utime(path, ns=(st[0], st[0]))
+        cur = os.stat(path)
+        return (cur.st_mtime_ns, cur.st_size) == st
+
+    ok(rewrite_and_pin("V2"),
+       "G6 前置：同尺寸改写 + mtime 钉回 ⇒ 与见证逐字相同", st)
+    ok(a._dirty_entry_superseded("c_node") is True,
+       "G6a 见证一致但盘面正文已换 ⇒ 内容复核判陈旧（旧不得盖新）")
+    ok(rewrite_and_pin("V1"),
+       "G6 前置：改回本条原正文后仍与见证逐字相同", st)
+    ok(a._dirty_entry_superseded("c_node") is False,
+       "G6b 正文与本条相同 ⇒ 不判陈旧（未 flush 写入不被误杀）")
+    ok(rewrite_and_pin("V3"),
+       "G6 前置：再次同尺寸改写且与见证逐字相同", st)
+    saved = a._dirty["c_node"].pop("content_hash")
+    ok(a._dirty_entry_superseded("c_node") is False,
+       "G6c 条目无 content_hash 可比 ⇒ 证不出陈旧就不当陈旧")
+    a._dirty["c_node"]["content_hash"] = saved
+    a.close()
+
+
+_GROUPS = (g0, g1, g2, g3, g4, g5, g6)
 
 
 def _run_groups() -> int:
@@ -271,19 +319,27 @@ def _run_groups() -> int:
 # ---------------------------------------------------------------- 变异表
 # 锚点 = (名字, rel, old, new)。每次变异必须让套件**转红**：
 #   M1 重放体恢复无条件覆盖（= 改动前形态）→ G1c/G1d/G5 红
-#   M2 判据恒 False（见证照记但不采信）→ G1c/G1d 红
+#   M2 见证与内容两层恒不采信 → G1c/G1d/G4b/G6a 红
 #   M3 见证完全不登记 → 判据永远拿不到见证 ⇒ 同 M2
+#   M4 内容复核恒不采信（退回「只看 stat 见证」）→ G6a 红
 _MUTATIONS = (
     ("重放体恢复无条件覆盖（改动前形态）", "md_cg/mdcg.py",
      "            if self._dirty_entry_superseded(nid):\n"
      "                superseded += 1\n                continue",
      "            if False:\n                superseded += 1\n                continue"),
-    ("判据恒 False（见证不采信）", "md_cg/mdcg.py",
-     "        return (cur.st_mtime_ns, cur.st_size) != st",
+    ("两层判据恒不采信（见证+内容）", "md_cg/mdcg.py",
+     "        if (cur.st_mtime_ns, cur.st_size) != st:\n"
+     "            return True\n"
+     "        return self._disk_content_differs(path, e)",
+     "        if (cur.st_mtime_ns, cur.st_size) != st:\n"
+     "            return False\n"
      "        return False"),
     ("见证完全不登记", "md_cg/mdcg.py",
      "        self.staged_stat[k] = (st.st_mtime_ns, st.st_size)",
      "        self.staged_stat.pop(k, None)"),
+    ("内容复核恒不采信（退回只看 stat 见证）", "md_cg/mdcg.py",
+     "        return self._disk_content_differs(path, e)",
+     "        return False"),
 )
 
 

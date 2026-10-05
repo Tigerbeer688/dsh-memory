@@ -1211,7 +1211,9 @@ class _DirtyDict(dict):
         为什么记 (mtime_ns, size)：`_maybe_reload_index` 需要判「本实例这条
         未 flush 的写入，是不是已经被他进程后来写下的**更新**记录盖过」。节点
         文件是唯一真源——标脏时它长什么样，重放时再 stat 一次，不一样就说明
-        盘面已被别人改过（改写内容必然改 mtime_ns；NTFS 粒度 100ns）。
+        盘面已被别人改过。两者都来自系统时钟与长度，**同尺寸改写落进同一时钟桶
+        时会逐字相同**（满载实测 6/6 次 dmtime=0），故见证一致还要由
+        `MdCG._disk_content_differs` 比盘面正文兜底。
         stat 失败与无 path 一律不登记：**证不出陈旧就不当陈旧**——「本实例未
         落盘写入不因重载从检索面消失」是既有不变量，宁可漏挡也不误杀。
         """
@@ -1598,22 +1600,31 @@ class MdCG:
             parts.append((fn, s.st_size, s.st_mtime_ns))
         return (snap, tuple(parts))
 
-# 生效条件：self._dirty.staged_stat 中无该 nid 的见证、或 self._dirty[nid] 非含非空 path 的 dict 时返回 False；有见证时对 root/path 再 stat 一次——OSError（文件已不在，标脏时在）返回 True，成功则返回 (st_mtime_ns, st_size) 与见证不等的布尔（不等即 True）。
+# 生效条件：self._dirty.staged_stat 中无该 nid 的见证、或 self._dirty[nid] 非含非空 path 的 dict 时返回 False；有见证时对 root/path 再 stat 一次——OSError（文件已不在，标脏时在）返回 True，(st_mtime_ns, st_size) 与见证不等返回 True，两者全等时转 _disk_content_differs(path, entry) 按盘面正文复核（其返回值即本函数返回值）。
     def _dirty_entry_superseded(self, nid) -> bool:
         """本实例 `_dirty[nid]` 是否**已被盘面更新盖过**（N230：旧不得盖新）。
 
-        判据是**节点文件的逐字见证**：标脏那一刻记下 `(st_mtime_ns, st_size)`，
-        重放前再 stat 一次；不相等 ⇒ 盘面已被他进程改写过 ⇒ 本实例这条是旧的，
-        重放必须放行盘面（`_maybe_reload_index` 据此跳过本条）。
+        判据是**节点文件上的两层证据**，第一层拿不准才动用第二层：
+        · **逐字见证**——标脏那一刻的 `(st_mtime_ns, st_size)` 与重放前再 stat
+          一次的读数不等 ⇒ 盘面已被他进程改写过。
+        · **内容复核**——见证一致才走：文件 mtime 出自系统时钟，同一时钟桶可被
+          一次**同尺寸**改写占满（(mtime_ns, size) 逐字相同、字节却已换，满载
+          实测 6/6 次 dmtime=0），此时只有比内容才证得出陈旧。
+        任一层判真 ⇒ 本实例这条是旧的，重放必须放行盘面（`_maybe_reload_index`
+        据此跳过本条）。
 
-        三条边界（都是有意的）：
+        四条边界（都是有意的）：
         · **证不出陈旧就不当陈旧**：无见证（无 path / stat 失败 / `_dirty` 未挂
-          root）返回 False ⇒ 照旧重放——「本实例未落盘写入不因重载从检索面消失」
-          这条既有不变量优先于本缺陷的覆盖面。
+          root）、条目无 `content_hash` 可比、或盘面读不回/读不懂时返回 False ⇒
+          照旧重放——「本实例未落盘写入不因重载从检索面消失」这条既有不变量优先
+          于本缺陷的覆盖面。
         · **tombstone（`None`）不走本判据**：`_unstage` 立即 flush（删除不延迟到
           autoflush 阈值），故 tombstone 实际上极少跨重载存活；其语义一字不改。
-        · **同内容改写**：他进程用同样的字节重写（size 同）时 mtime_ns 仍会变，
-          故仍判陈旧——放行的盘面条目与本条同义，结果无差。
+        · **同内容改写**：见证失配（mtime_ns 变了）时照判陈旧——放行的盘面条目与
+          本条同义，结果无差；见证一致时内容复核也相等，判不陈旧，同样无差。
+        · **内容层按正文双形态比对**：原文与去尾换行两种摘要任一相等即算相同，
+          与 add 写路径、rebuild 重建路径两种 `content_hash` 摘要口径同宽
+          （同 `reconcile._disk_hashes`）。
         """
         st = self._dirty.staged_stat.get(nid)
         if st is None:
@@ -1622,13 +1633,42 @@ class MdCG:
         p = e.get("path") if isinstance(e, dict) else None
         if not p:
             return False
+        path = os.path.join(self.root, p)
         try:
-            cur = os.stat(os.path.join(self.root, p))
+            cur = os.stat(path)
         except OSError:
             return True                # 标脏时文件在、现在不在 ⇒ 盘面确已变
-        return (cur.st_mtime_ns, cur.st_size) != st
+        if (cur.st_mtime_ns, cur.st_size) != st:
+            return True
+        return self._disk_content_differs(path, e)
 
-# 生效条件：stat 对比 _index_signature() 与 self._index_sig，相等（含双侧 None）即返回 False 不做任何事；不等则调 _load_index() 重载，OSError/ValueError 时静默放弃并返回 False（重载失败不阻塞读，沿用旧内存态）；成功后把 self._dirty 重放回新索引（None=tombstone pop、否则覆盖，与 _load_index 的日志重放同语义——本实例未 flush 的写入不得因重载从检索面消失；N230：见证失配者判为陈旧，**跳过重放**并计入 self._dirty_replay_superseded）并重算 buckets，替换 self.index、刷新 self._index_sig、返回 True；
+# 生效条件：path 为节点文件绝对路径、entry 为本实例 `_dirty` 条目；entry 的 `content_hash` 缺失或非字符串、或打开/UTF-8 解码失败、或读出的正文非字符串时返回 False（证不出陈旧就不当陈旧）；否则以 nodefile.loads 取盘面正文，仅当其双形态摘要（原文、去尾换行）均不等于 entry 的 `content_hash` 时返回 True。
+    def _disk_content_differs(self, path: str, entry: dict) -> bool:
+        """stat 见证一致时的**内容复核**（N230：同 tick 同尺寸改写）。
+
+        文件 mtime 与 size 都对得上时，(mtime_ns, size) 这双证据已经用尽——同
+        尺寸改写落进同一时钟桶即两者逐字相同。此时唯一能证伪的证据是**盘面字节
+        本身**：本条 `content_hash` 与盘面正文的摘要不等 ⇒ 盘面已被他进程改写。
+
+        读不回（OSError）、读不懂（UnicodeError）、条目没带 `content_hash` 一律
+        返回 False——沿用「证不出陈旧就不当陈旧」，宁可漏挡也不误杀本实例未落盘
+        的写入。只在见证一致的窄条件、且只对本实例 `_dirty` 条目（规模受
+        autoflush 阈值约束）读盘，正常路径零额外 I/O。
+        """
+        want = entry.get("content_hash")
+        if not (isinstance(want, str) and want):
+            return False
+        try:
+            with open(path, encoding="utf-8") as f:
+                body = nodefile.loads(f.read())[1]
+        except (OSError, UnicodeError):
+            return False
+        if not isinstance(body, str):
+            return False
+        return want not in (nodefile.content_hash(body),
+                            nodefile.content_hash(body.rstrip("\n")))
+
+# 生效条件：stat 对比 _index_signature() 与 self._index_sig，相等（含双侧 None）即返回 False 不做任何事；不等则调 _load_index() 重载，OSError/ValueError 时静默放弃并返回 False（重载失败不阻塞读，沿用旧内存态）；成功后把 self._dirty 重放回新索引（None=tombstone pop、否则覆盖，与 _load_index 的日志重放同语义——本实例未 flush 的写入不得因重载从检索面消失；N230：见证失配者、或见证一致而 _disk_content_differs 判盘面正文已改者，判为陈旧，**跳过重放**并计入 self._dirty_replay_superseded）并重算 buckets，替换 self.index、刷新 self._index_sig、返回 True；
     def _maybe_reload_index(self):
         """读路径入口的索引代际感知（P1b-2）：签名变化才重载。
 
@@ -1648,9 +1688,10 @@ class MdCG:
         N230（2026-10-01，**旧盖新**）：原实现无条件 `idx["nodes"][nid] = e`——
         本实例标脏后**他进程重写过同一节点**时，重载取回的是更新记录，随即被
         本地这条更旧的盖了回去（实测：盘面与新建读者实例都是 NEW，本实例索引
-        仍停在 OLD，`content_hash` 与盘面撕裂）。现按「**逐字见证**」判陈旧：
+        仍停在 OLD，`content_hash` 与盘面撕裂）。现按「**逐字见证 + 内容复核**」
+        两层判陈旧（见证失配直接判，见证一致再比盘面正文——同 tick 同尺寸改写）：
         `_dirty_entry_superseded` 为真即**放行盘面**（跳过本条重放），并在
-        `self._dirty_replay_superseded` 留下条数读数。见证拿不到的条目照旧重放
+        `self._dirty_replay_superseded` 留下条数读数。证不出陈旧的条目照旧重放
         ——「本实例未落盘写入不因重载从检索侧消失」这条不变量一并保留。
         """
         sig = self._index_signature()
@@ -1668,8 +1709,9 @@ class MdCG:
             # N230（2026-10-01）：**新记录必须能盖住旧记录，旧不得盖新**。
             # 重载后的 idx 来自快照（指纹校验过盘面）或全库扫描，两者都反映
             # **当前盘面**；本实例这条 `_dirty` 若在标脏后盘面已被改过（逐字
-            # 见证失配），它就是旧的——放行盘面，不得盖回去。见证拿不到时
-            # 照旧重放（见 _note_witness 的「证不出陈旧就不当陈旧」）。
+            # 见证失配，或见证一致但盘面正文已不同），它就是旧的——放行盘面，
+            # 不得盖回去。证不出陈旧时照旧重放（见 _note_witness 的
+            # 「证不出陈旧就不当陈旧」）。
             if self._dirty_entry_superseded(nid):
                 superseded += 1
                 continue
