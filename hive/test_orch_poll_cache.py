@@ -114,6 +114,17 @@ def _count_opens(fn):
         builtins.open = real
 
 
+def _bump_mtime(path, delta_ns=1_000_000_000):
+    """把 mtime 显式抬 delta_ns（size 不动）——「只动 mtime」由构造保证。
+
+    为什么构造而不赌 OS：文件 mtime 出自系统时钟，同尺寸改写常与首写落在同一
+    时钟桶（满载背靠背实测 97% 的 mtime_ns 相同），签名 (mtime_ns, size) 不变
+    会让「只动 mtime 必被识别」这条判据退化成赌时钟。
+    """
+    st = os.stat(path)
+    os.utime(path, ns=(st.st_atime_ns, st.st_mtime_ns + delta_ns))
+
+
 IDS = ["h_pc%03d" % i for i in range(N)]
 for _jid in IDS:
     _mk(_jid)
@@ -143,8 +154,9 @@ try:
           seq == [0, 0, 0], f"opens={seq}")
 
     print("[C2] 同尺寸改写（只动 mtime）被识别")
-    # content A*400 → B*400：字节数不变，只有 mtime 变——签名须含 mtime_ns
+    # content A*400 → B*400：字节数不变，只有 mtime 变——签名须含 mtime_ns。
     _mk(IDS[0], content="B" * 400)
+    _bump_mtime(os.path.join(JOBS, IDS[0], "result.json"))
     r2, n2 = _count_opens(lambda: orc._poll({}))
     c2 = {c["job_id"]: c for c in r2["children"]}
     check("C2a 同尺寸改写后卡片见新内容（content_head 以 B 起）",
