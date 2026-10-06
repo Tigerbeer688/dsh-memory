@@ -23,7 +23,7 @@ from .fsutil import publish
 SCHEMA = 1
 EXPORT_ACTIONS = ("graph", "nodes", "slice", "stat")
 
-# 导出行的字段（顺序即 JSON 键顺序，便于 diff 与人工核对）
+# 导出行的固定键前缀（顺序即 JSON 键顺序，便于 diff 与人工核对）；frontmatter 其余键在 _row 中按名追加
 _ROW_KEYS = ("id", "layer", "path", "tags", "importance", "confidence",
              "condition_space", "non_applicable_conditions", "verification_basis",
              "created_at", "edges", "protected", "sensitivity", "content")
@@ -36,7 +36,7 @@ def _default_out(cg, kind: str) -> str:
     return os.path.join(cg.root, f"export_{kind}_{ts}.jsonl")
 
 
-# 生效条件：cg.get(nid) 为 None 时返回 None；否则以 fm = node.get("frontmatter") or {}（缺键或假值回落空 dict）与 entry 组装行，layer 取 fm 的 layer、为假值时回落 entry.get("layer")，include_content 为真值时追加 content = node.get("content") or ""，最终只保留 _ROW_KEYS 中实际存在的键。
+# 生效条件：cg.get(nid) 为 None 时返回 None；否则以 fm = node.get("frontmatter") or {}（缺键或假值回落空 dict）与 entry 组装行：id/layer/path/content 无条件取（layer 为假值时回落 entry.get("layer")，path 取 entry，content 仅 include_content 为真值时取 node），fm 派生的固定键（tags/importance/confidence/condition_space/non_applicable_conditions/verification_basis/created_at/edges/sensitivity，其中 tags/non_applicable_conditions/edges 转 list）**仅在 fm 中确实存在该键时才写入行**（protected 额外允许"entry 为真"兜底，取 fm 或 entry 的真值），再把 fm 中其余键（键名排序）全部追加——归档要能脱离索引独立重建节点（_index.json 与节点同目录、一并被清时它才是唯一真相），因此 frontmatter 全量带出且不凭空造键；索引派生键（content_hash/bucket/role 等若不在 fm）仍不导出（可重建）。
 def _row(cg, nid: str, entry: dict, include_content: bool = True):
     """索引条目 → 导出行（回读节点拿到 frontmatter + 正文）。
 
@@ -50,20 +50,27 @@ def _row(cg, nid: str, entry: dict, include_content: bool = True):
         "id": nid,
         "layer": fm.get("layer") or entry.get("layer"),
         "path": entry.get("path"),
-        "tags": list(fm.get("tags") or []),
-        "importance": fm.get("importance"),
-        "confidence": fm.get("confidence"),
-        "condition_space": fm.get("condition_space"),
-        "non_applicable_conditions": list(fm.get("non_applicable_conditions") or []),
-        "verification_basis": fm.get("verification_basis"),
-        "created_at": fm.get("created_at"),
-        "edges": list(fm.get("edges") or []),
-        "protected": bool(entry.get("protected")),
-        "sensitivity": fm.get("sensitivity"),
     }
+    for k in ("tags", "importance", "confidence", "condition_space",
+              "non_applicable_conditions", "verification_basis",
+              "created_at", "edges"):
+        if k in fm:
+            row[k] = list(fm[k] or []) if k in (
+                "tags", "non_applicable_conditions", "edges") else fm[k]
+    if "protected" in fm or entry.get("protected"):
+        row["protected"] = bool(fm.get("protected") or entry.get("protected"))
+    if "sensitivity" in fm:
+        row["sensitivity"] = fm["sensitivity"]
     if include_content:
         row["content"] = node.get("content") or ""
-    return {k: row[k] for k in _ROW_KEYS if k in row}
+    # 灾备保真：frontmatter 其余键全量带出（含显式 null——键存在就还原，不凭空造键）
+    for k in sorted(fm):
+        if k not in row:
+            row[k] = fm[k]
+    # 固定前缀按 _ROW_KEYS 收口顺序，扩展键保持按键名排序（diff 稳定）
+    ordered = {k: row[k] for k in _ROW_KEYS if k in row}
+    ordered.update({k: v for k, v in row.items() if k not in ordered})
+    return ordered
 
 
 # 生效条件：源为 cg.index 的 nodes（缺 "nodes" 键或假值回落空 dict）——ids 为真值时只取其中确实在 nodes 里的 id，否则取全部——按 (float(created_at or 0), id) 排序后逐个产出同时满足 layer（为真时须 (e.layer or "") == layer）、tag（为真时须在 e.tags or [] 中）、since/until（非 None 时按 float 比较 created_at）的条目，limit 为真值且已产出 n 条并 n >= int(limit) 时停止（limit 为 0 或 None 不设上限）。
