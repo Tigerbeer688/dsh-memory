@@ -330,9 +330,11 @@ def dumps(frontmatter: dict, content: str) -> str:
     return "\n".join(lines) + "\n" + body
 
 
-# 生效条件：text 以 "---\n" 开头且其后存在 "\n---\n" 时才解析——head 段内含 ":" 的行按首个 ":" 拆键值（json.loads 成功取值、抛 ValueError 则保留原字符串），不含 ":" 的行跳过，返回 (fm, content)；不满足上述两个起始条件时返回 ({}, text)。
+# 生效条件：text 首字符为 BOM（"\ufeff"）时先剥掉再判起始——2026-10-07 批量写入方误加 UTF-8 BOM，使 starts("---\n") 失败、frontmatter 整体丢失（151 节点读面失明、教训召回归零），容忍 BOM 后其余解析口径不变；随后 text 以 "---\n" 开头且其后存在 "\n---\n" 时才解析——head 段内含 ":" 的行按首个 ":" 拆键值（json.loads 成功取值、抛 ValueError 则保留原字符串），不含 ":" 的行跳过，返回 (fm, content)；不满足上述两个起始条件时返回 ({}, text)。
 def loads(text: str):
     """返回 (frontmatter dict, content str)。非法格式返回 ({}, 原文)。"""
+    if text.startswith("\ufeff"):
+        text = text[1:]
     if not text.startswith(_DELIM + "\n"):
         return {}, text
     rest = text[len(_DELIM) + 1:]

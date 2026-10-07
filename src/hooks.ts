@@ -452,12 +452,19 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
               // 而查询词就是几秒前刚落盘 contextual 层的同一句用户消息，
               // 自匹配高分回声会把真正的教训挤出 top-k（【灵枢交易教训】
               // 因此回显用户原话）。
+              // ⚠️ 只允许传 md_cg/protocol.py「read」面 optional 白名单内的参数
+              // （k/layer/context/goal/limit/session/validity/branch 等）。
+              // 2026-10-07 教训：这里曾改走 graph.recall 并传 paths=[...,'semantic']，
+              // 但 read 处理器（mcp_server.py cg(op=read)）与协议白名单都不收该参数
+              // ——被静默丢弃、semantic 从未参与召回（A/B 逐位相同）。契约由
+              // test/recall-params-contract.test.ts 钉死，传未声明参数即红。
               const query = lastUserMsg.slice(0, 80) + ' 教训 经验 错误'
               const kr = await graph.read(query, { k: 16, layer: 'knowledge' })
               const kItems = (kr && Array.isArray((kr as any).pack)) ? (kr as any).pack : (kr && Array.isArray((kr as any).results)) ? (kr as any).results : (Array.isArray(kr) ? kr : [])
               ctx.logger.info(`dsh-memory: knowledge-recall(query="${query.slice(0, 40)}") 返回 ${kItems.length} 条`)
               // 候选策略（与 lib 同步，重编译以 src 为准）：排除 code_/doc_ 节点（knowledge 层
               // 716/58 条是源码 JSDoc 与本地文档仓，通用词易命中并霸占注入位，交易教训是 mem_*）；
+              // 日志节点按正文「## yyyy-mm-dd」段排除（correction 已确认教训豁免，见下方内联注释）；
               // 访问次数高的节点按 log 降权，避免少数热点长期霸占；同轮内按摘要前 160 字去重，
               // 跨轮跳过 recentInjected 窗口内已注入的节点，注入不足 5 条再回补，保证长尾轮换。
               interface KnowledgeCandidate {
@@ -482,6 +489,13 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
                   .trim()
                   .slice(0, 200)
                 if (nid.startsWith('code_') || nid.startsWith('doc_')) continue
+                // 日志节点黑名单：正文含「## yyyy-mm-dd」日志段的节点不注入，
+                // 但**已确认教训（correction）先放行**——日期段落里混着 2 条真教训，
+                // 按内容匹配必须先豁免，否则误杀。旧版对 preview 头部做
+                // /^##\s*2026-/ 匹配，CCG 六要素回填顶掉头部后永久失效（实测命中 0）。
+                const tagText = Array.isArray(fm.tags) ? (fm.tags as unknown[]).map(String).join(' ') : String(fm.tags || '')
+                const isConfirmedLesson = tagText.includes('correction') || tagText.includes('已确认教训')
+                if (!isConfirmedLesson && /^##\s*\d{4}-\d{2}-\d{2}/m.test(content)) continue
                 if (!(preview.length > 20 && score >= 0.1)) continue
                 candidates.push({
                   nid,
