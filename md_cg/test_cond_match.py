@@ -151,6 +151,27 @@ def main():
         j = MdCGOS.judge_qualification({"frontmatter": fm, "content": c},
                                        "问浮力", {"query": "问浮力"})
         ok(j["state"] == STATE_DEFER, "⑫legacy ccg_exempt 仍短路 DEFER（不被正条件段覆盖）")
+
+        # ---------- ⑬ 已知通用模板：词面零命中 → 豁免 DEFER（修复3A） ----------
+        j = MdCG.judge_qualification(
+            _node(doc=_doc(cond_line="# 生效条件：复盘/分析时适用")),
+            "问电磁感应", None)
+        ok(j["state"] == STATE_ACCEPT and "通用模板" in j["reason"],
+           "⑬通用模板词面零命中 → ACCEPT 且 reason 标注豁免")
+
+        # ---------- ⑭ 模板豁免不越过验证基底闸（修复3A 边界） ----------
+        no_basis = _node(doc=_doc(cond_line="# 生效条件：复盘/分析时适用"))
+        no_basis["frontmatter"] = {}
+        j = MdCG.judge_qualification(no_basis, "问电磁感应", None)
+        ok(j["state"] == STATE_DEFER and "验证基底" in j["reason"],
+           "⑭模板豁免后仍受 verification_basis 闸（无基底照旧 DEFER）")
+
+        # ---------- ⑮ 白名单精确匹配：近似串不豁免（修复3A 不扩面） ----------
+        j = MdCG.judge_qualification(
+            _node(doc=_doc(cond_line="# 生效条件：复盘/分析时适用时")),
+            "问电磁感应", None)
+        ok(j["state"] == STATE_DEFER and "未在情境确认" in j["reason"],
+           "⑮非白名单近似串 → 照旧 DEFER（豁免不扩面）")
     finally:
         shutil.rmtree(tmp, ignore_errors=True)
 

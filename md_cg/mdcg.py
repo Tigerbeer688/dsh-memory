@@ -242,6 +242,9 @@ STATE_REJECT = "REJECT"           # 条件冲突/不适用条件命中，明确�
 STATE_DEFER = "DEFER"             # 条件不足但可继续寻找缺失条件
 STATE_BLINDSPOT = "BLINDSPOT"     # 无法建立可靠归属，停止猜测
 
+# 已知通用模板生效条件（回填套话、无槽位信息量；白名单精确匹配，词面未命中不构成降级依据）
+COND_TEMPLATE_EXEMPT = frozenset({"复盘/分析时适用"})
+
 # 验证基底（白箱第 2 篇第 7 章：能被验证才能被信任）
 VERIFICATION_BASIS = nodefile.VERIFICATION_BASIS
 # 检验强度（多主体世界模型对齐 v0.1 §2 L1；真源 nodefile.CHECK_STRENGTHS）
@@ -3503,7 +3506,7 @@ class MdCG:
         return out
 
     @staticmethod
-# 生效条件：node_dict 的 content 经 ccg_completeness 判为不完整 → BLINDSPOT；否则由 query 与 context（仅当 context 为 dict 时并入）合成情境串，命中 frontmatter 的任一 non_applicable_conditions 词 → REJECT；否则情境非空（query 去空白后非空，或 context 为真）且「生效条件」文本非空、非"无条件"、其词项全未命中且词项非空 → DEFER；否则无 verification_basis → DEFER；否则 ACCEPT；
+# 生效条件：node_dict 的 content 经 ccg_completeness 判为不完整 → BLINDSPOT；否则由 query 与 context（仅当 context 为 dict 时并入）合成情境串，命中 frontmatter 的任一 non_applicable_conditions 词 → REJECT；否则情境非空（query 去空白后非空，或 context 为真）且「生效条件」文本非空、非"无条件"、其词项全未命中且词项非空且生效条件非已知通用模板（COND_TEMPLATE_EXEMPT 精确匹配）→ DEFER；生效条件恰为已知通用模板而词项未命中 → 跳过词面确认（ACCEPT 的 reason 标注豁免）；否则无 verification_basis → DEFER；否则 ACCEPT；
     def judge_qualification(node_dict, query: str, context=None):
         """四态判定（白箱第 1/2 篇）。
 
@@ -3553,6 +3556,7 @@ class MdCG:
         #    情境为空（无 query 且无 context）→ 无可判定依据，跳过本段不降级：
         #    「无情境」不能被误判成「不适用」。
         cond_hit = None
+        cond_exempt = False
         has_scene = bool((query or "").strip()) or bool(context)
         if has_scene:
             cond_text = MdCG._ccg_line(content, "生效条件")
@@ -3562,10 +3566,13 @@ class MdCG:
                 terms_ = MdCG._cond_terms(cond_text)
                 cond_hit = next((t for t in terms_ if t in scene_str), None)
                 if cond_hit is None and terms_:
-                    return {"state": STATE_DEFER,
-                            "reason": ("生效条件未在情境确认（未命中任何声明条件："
-                                       + "、".join(terms_[:3])
-                                       + "）；可补充情境或条件词面后重判")}
+                    if cond_text.strip() in COND_TEMPLATE_EXEMPT:
+                        cond_exempt = True
+                    else:
+                        return {"state": STATE_DEFER,
+                                "reason": ("生效条件未在情境确认（未命中任何声明条件："
+                                           + "、".join(terms_[:3])
+                                           + "）；可补充情境或条件词面后重判")}
 
         # 4) DEFER：节点无 verification_basis → 信任根基不足
         if not fm.get("verification_basis"):
@@ -3576,6 +3583,8 @@ class MdCG:
         acc = "5 要素齐全 + 不适用条件未命中 + 验证基底已声明"
         if cond_hit:
             acc = f"生效条件已确认（命中「{cond_hit}」）+ " + acc
+        elif cond_exempt:
+            acc = acc + "；生效条件为已知通用模板（豁免词面确认）"
         elif not has_scene:
             acc = "无情境可比（未做正条件确认）+ " + acc
         return {"state": STATE_ACCEPT, "reason": acc}
