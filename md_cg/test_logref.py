@@ -61,6 +61,27 @@ from md_cg import codeindex, crypto, docindex, logref, refindex, srcindex   # no
 from md_cg.mdcos import MdCGSecure                       # noqa: E402
 from md_cg.security import Principal                     # noqa: E402
 
+
+def _register_ingest_roots() -> None:
+    """上游合并适配（2026-10-11，P1-4/#85 方案A 白名单）。
+
+    本测试沙箱全在系统临时区，`logref`/`refindex` 的 src 校验走
+    `security.check_path_root`——按设计文档「库外读写请显式登记」的指路，
+    把 {系统临时区, 本仓} ∪ 当前回落链允许集登记进**本测试进程**。
+    只影响本进程：不改工具、不改安全判据、不改用户配置。
+    """
+    roots = [tempfile.gettempdir(), REPO]
+    try:
+        from md_cg import security as _sec
+        roots += _sec._whitelist_roots("MDCG_INGEST_ROOT")   # env 空时 = 记忆库根
+    except Exception:                                     # noqa: BLE001 —— 登记失败维持原回落
+        pass
+    os.environ["MDCG_INGEST_ROOT"] = os.pathsep.join(
+        dict.fromkeys(r for r in roots if r))
+
+
+_register_ingest_roots()
+
 PASS = FAIL = 0
 FAILS = []
 RED = []          # 转红项 cid（红基线模式比对用；绿态为空）
@@ -159,6 +180,9 @@ def run_tool(argv: list) -> tuple:
     buf_out, buf_err = io.StringIO(), io.StringIO()
     with contextlib.redirect_stdout(buf_out), contextlib.redirect_stderr(buf_err):
         rc = TOOL.main(list(argv))
+    # TOOL.main 顶部 clean_env() 会清掉白名单 env（ENV_CLEAN「白名单绝不靠环境定」），
+    # 登记在每次调用后补回——否则后续 src 校验回落到记忆库根、拒系统临时区。
+    _register_ingest_roots()
     rows, total = {}, None
     for ln in buf_out.getvalue().splitlines():
         ln = ln.strip()

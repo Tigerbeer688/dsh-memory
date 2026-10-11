@@ -19,3 +19,10 @@ scripts/git-hooks/* text eol=lf
 # 32 CRLF / 11 LF），跨平台一致性与 diff 噪声都要求归一。
 *.yml text eol=lf
 *.yaml text eol=lf
+
+# 同理（上游合并回归，2026-10-11）：源码形态测试对该文件做 **LF 精确计数**
+# （test_issue75_neural_failure A11：newline="" 原样读 +
+# `"@staticmethod\n    def _cosine(a, b):"` count==1），而 autocrlf=true 的
+# checkout 会把它转成 CRLF ⇒ 本机必红（git blob 本为 LF、CI/ubuntu 无此问题）。
+# 钉死行尾 = 「读盘形态 == 入库形态」，与上方钩子/脚本钉 LF 同一理由。
+md_cg/whitebox_kb/wisdom/neural_retrieve.py text eol=lf

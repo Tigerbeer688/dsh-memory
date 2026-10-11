@@ -209,6 +209,19 @@ def main():
     # 会锁住哑库 _index.json 使 rmtree 间歇失败留残留）
     old_cache = os.environ.get("MDCG_READ_CACHE")
     os.environ["MDCG_READ_CACHE"] = "0"
+    # 上游合并适配（2026-10-11，P1-4/#85 方案A 白名单）：沙箱库根在系统临时区，
+    # `_guard_root → security.check_path_root` 需按设计文档「库外读写请显式登记」
+    # 登记 {系统临时区, 本仓} ∪ 当前回落链允许集——只影响本进程，finally 恢复原值。
+    old_ingest = os.environ.get("MDCG_INGEST_ROOT")
+    _roots = [tempfile.gettempdir(),
+              os.path.dirname(os.path.dirname(os.path.abspath(__file__)))]
+    try:
+        from md_cg import security as _sec
+        _roots += _sec._whitelist_roots("MDCG_INGEST_ROOT")   # env 空时 = 记忆库根
+    except Exception:                                     # noqa: BLE001 —— 登记失败维持原回落
+        pass
+    os.environ["MDCG_INGEST_ROOT"] = os.pathsep.join(
+        dict.fromkeys(r for r in _roots if r))
     try:
         for ws, sid, created, fu, body in SCEN:
             _write_log(sroot, ws, sid, _lines(created, fu, body, sid))
@@ -306,6 +319,10 @@ def main():
             os.environ.pop("MDCG_READ_CACHE", None)
         else:
             os.environ["MDCG_READ_CACHE"] = old_cache
+        if old_ingest is None:
+            os.environ.pop("MDCG_INGEST_ROOT", None)
+        else:
+            os.environ["MDCG_INGEST_ROOT"] = old_ingest
         _rmtree_retry(sroot)
         _rmtree_retry(lib_root)
         for ws in _WS_NAMES:                   # 只清守卫专属转写子目录
