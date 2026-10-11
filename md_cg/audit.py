@@ -65,9 +65,17 @@ POLICY_ENV = "MDCG_POLICY_FILE"
 # 根因（第4条取证）：修前 `load_rulebook` 只认 MDCG_POLICY_FILE，未设即返回
 # **空规则库**（无任何默认回落），而 npm 发布面不含 `data/policy.json`、
 # `lingshu-init` 也不生成该 env——「README 说默认 data/policy.json」成为空话。
-# 后果不是「少一条规则」而是**安全面翻转**：空规则让 text 恒判 DEFER，
-# 而 writepipe._gate_audit 的非 ACCEPT/REJECT 出口是 `cg.propose` ⇒ 正文
-# （含凭据）**明文**落 hippocampus/inbox.jsonl，且脱敏只在 REJECT 分支。
+# 后果不是「少一条规则」而是**判定面翻转**：空规则让 text 恒判 DEFER，
+# 而 writepipe._gate_audit 的非 ACCEPT/REJECT 出口是 cg.propose ⇒ 本该
+# ACCEPT 的正常写入被一律送进审核队列——**误判才是这里的真缺陷**。
+#
+# ⇒ 两件事要分开读（issue #69 设计者裁决 2026-10-09，全文见节点 mem_ruling_69_20261009）：
+#   · 误判（本该收的被判 DEFER）＝缺陷，下面两行的 fail-closed 就是治它；
+#   · 正文（含凭据）落 hippocampus/inbox.jsonl、且不在该分支脱敏 ＝ **刻意设计，不是缺陷**。
+#     判据（裁决原文）：「隐私是对外隐私；内部交流都以可追溯为标准」——内部面保留原文
+#     以便裁决与追溯；对外面按纪律 9 隔离：hippocampus 在 admission._SKIP_DIRS 里，
+#     **不入发布件**（由 md_cg/test_issue69_audit_boundary.py 钉住）。
+#     故本文以下凡出现正文明文落 inbox 的表述，均应理解为**预期行为**而非风险描述。
 # 故：未设时回落到包内默认；包内默认也拿不到时 fail-closed——由写入闸门
 # 在**提案入队之前**拦下（见 resolve_rulebook 与 writepipe._gate_audit）。
 DEFAULT_POLICY_REL = ("data", "policy.json")
@@ -112,7 +120,9 @@ def _policy_shape_error(rules):
     ⇒ **server rc=1**（启动即崩＝记忆面整体不可用）；`--show-config` 同 rc=1
     且 stdout 空，与其「恒退出 0」契约相反；写入侧 `_rule_check` 同抛，被
     `audit.py` 验证器兜底 `except Exception → DEFER` 吞掉 ⇒ `moved_to=
-    review_queue`、正文（含凭据）**逐字**落 `hippocampus/inbox.jsonl`。
+    review_queue、正文（含凭据）**逐字**落 hippocampus/inbox.jsonl
+    ——**该逐字保留是刻意设计**（issue #69 裁决甲：内部以可追溯为标准；对外面靠
+    hippocampus 不入发布件隔离）。此处要治的是**误判**（恒 DEFER），不是保留本身。
     `{"forbidden": "sk-…"}` 更隐蔽：**不抛**但**按字符建规则**——`policy_report`
     报 `forbidden=23`（把长度当规则数），写入侧以单字符规则判定 ⇒ 静默错判。
 
@@ -456,11 +466,17 @@ def _verify_code(payload, ctx):
         # 被测命令只要输出非 gbk 字节，读取线程就抛 UnicodeDecodeError →
         # p.stdout/p.stderr 可能为空 → 下一行的失败证据丢失，
         # 「实测失败」会退化成一句没有依据的 REJECT（对齐 whitebox.py 的写法）。
+        # stdin=subprocess.DEVNULL（issue #63 同批加固）：不指定 stdin 时子进程
+        # 继承父进程 stdin（常驻宿主下是 JSON-RPC 活管道），读 stdin 的测试
+        # 命令会悬挂到 timeout 才被 kill——形态对齐 `md_cg/run_tests.py:105`。
         p = subprocess.run(argv, cwd=ctx.get("cwd"), capture_output=True,
                            text=True, encoding="utf-8", errors="replace",
-                           shell=False,
+                           shell=False, stdin=subprocess.DEVNULL,
                            timeout=int(os.environ.get("MDCG_CODE_TEST_TIMEOUT", "60")))
     except (OSError, subprocess.SubprocessError) as exc:
+        # TimeoutExpired（SubprocessError 子类）也走这里：DEFER + 文案带异常
+        # 名与原文（如 "TimeoutExpired: Command '…' timed out after 60 seconds"）
+        # ——超时**不吞**（issue #63）。
         return _verdict(DEFER, "code", f"测试无法执行：{type(exc).__name__}: {exc}")
     if p.returncode == 0:
         return _verdict(ACCEPT, "code", f"实测通过：{cmd}")

@@ -12,6 +12,10 @@
     anchors(...)     落在给定时间窗 / 空间范围内的节点
     consistency()    时空字段自洽性检查
 
+第 5 op（本批）：`state_chain(cg, subject, slot, …)`——L2 **状态槽位投影**
+（某主体某槽位的现值/区间/变迁史；flag `MDCG_STG_STATE`，**默认关**）。语义单点
+在 `md_cg/state_slots.py`（投影不是第二真源：查询时从 append-only 台账现算）。
+
 **分层（issue #52 线）**：
   · 第 1/2 层（已收口）：条件先于限额 + 截断可观测——`_scan` 只做「遍历 +
     layer/可见性过滤」，条件过滤与 `_cap_hits` 截断归各接口。
@@ -28,6 +32,7 @@ from __future__ import annotations
 
 import os
 
+from . import lifecycle
 from . import stgidx
 from . import trust
 
@@ -130,7 +135,7 @@ def _node(cg, node_id):
             "content": n.get("content") or ""}
 
 
-# 生效条件：nid/e 为一条快照条目、layer 为层过滤值时——layer 为真值且 e.get("layer") != layer 即返回 None；cg 带可调用的 _readable（MdCGSecure）且判不可见即返回 None；e 含 "temporal" 或 "spatial" 键时以快照字段构造 frontmatter，否则调用 cg._read(e) 且在 fm 为 None 时返回 None；返回 {"id","frontmatter","layer","path"}。
+# 生效条件：nid/e 为一条快照条目、layer 为层过滤值时——layer 为真值且 e.get("layer") != layer 即返回 None；lifecycle.is_archived(e) 为真即返回 None（退役不参与默认检索，判据单点在 lifecycle.py）；cg 带可调用的 _readable（MdCGSecure）且判不可见即返回 None；e 含 "temporal" 或 "spatial" 键时以快照字段构造 frontmatter，否则调用 cg._read(e) 且在 fm 为 None 时返回 None；返回 {"id","frontmatter","layer","path"}。
 def _scan_one(cg, nid, e, layer=None):
     """单条目 → 候选条目（`_scan` 的逐条实现**单点**：全量遍历与索引子集共用）。
 
@@ -140,6 +145,16 @@ def _scan_one(cg, nid, e, layer=None):
     """
     if layer and e.get("layer") != layer:
         return None
+    if lifecycle.is_archived(e):
+        return None  # lifecycle.py:42 标称兑现：archived 不参与默认检索。
+                     # 本处是 **stg 扫描面单点**（`_scan`(:172) 的全量遍历与
+                     # 索引子集两条分支都经本函数逐条实现）——timeline /
+                     # anchors / consistency 三 op 的候选面同点覆盖；第 5 op
+                     # `state_chain` 走 append-only 台账、不经节点扫描，不受影响；
+                     # `relation` 面是显式 id 直读（`_node`→`cg.get`），也不经此。
+                     # 判据单点在 lifecycle.is_archived（fail-open：缺键=active
+                     # 照常；只剔 archived——converged/demoted 是降权轴仍参与）。
+                     # 直读/审计/恢复面不经本函数：退役不删除、可显式恢复。
     _sec = getattr(cg, "_readable", None)
     if _sec is not None and not _sec(e):
         return None
@@ -164,7 +179,7 @@ def _scan_one(cg, nid, e, layer=None):
             "path": e.get("path")}
 
 
-# 生效条件：nodes 为 None 时**逐条**遍历 cg.index["nodes"] 全部条目（不按索引序切片、不读正文）；nodes 为 (nid, entry) 对的序列时只遍历该序列（第 3 层索引子集，序由调用方保证=索引物理序）；两种形态都逐条经 _scan_one（layer 过滤 + 可见性 + 条目化同一单点）；返回 out 列表（全部 layer/可见性命中，**不做截断**——截断由各接口在条件过滤之后经 _cap_hits 执行，issue #52）；
+# 生效条件：nodes 为 None 时**逐条**遍历 cg.index["nodes"] 全部条目（不按索引序切片、不读正文）；nodes 为 (nid, entry) 对的序列时只遍历该序列（第 3 层索引子集，序由调用方保证=索引物理序）；两种形态都逐条经 _scan_one（layer 过滤 + 退役剔除 + 可见性 + 条目化同一单点）；返回 out 列表（全部 layer/可见性命中，**不做截断**——截断由各接口在条件过滤之后经 _cap_hits 执行，issue #52）；
 def _scan(cg, layer=None, nodes=None):
     """遍历节点：时空字段直接读索引快照（不读文件，O(1)/节点）。
 
@@ -174,6 +189,10 @@ def _scan(cg, layer=None, nodes=None):
     时逐条过读可见性——密级 × 会话绑定档在此与 _candidates 同口径，
     stg 各 op（timeline/relation/anchors）不得成为绕过路径。可见性判定
     **先于一切**（含截断）：不可见节点既不进候选、也不占 kept 名额。
+    退役单点（本轮）：`lifecycle.is_archived` 为真的节点同样不进候选
+    （判据单点在 lifecycle.py，与 cg 读面 `MdCGOS._candidates` 共引一份），
+    两个分支共用的逐条实现单点即 `_scan_one`——flag 开（索引子集）/关
+    （全量遍历）逐位一致，不因取数面不同而漏一次过滤。
 
     issue #52（条件先行于限额）：旧实现在此处 `list(index["nodes"].items())[:max_scan]`
     ——按 id 字典序在**条件过滤之前**砍尾巴，库超 max_scan 后（a）本会话记忆等条件
@@ -269,6 +288,8 @@ def _with_scan_reads(out, *, scanned, hits, kept, truncated, max_scan,
 _INDEX_ENV = "MDCG_STG_INDEX"
 #: 条件资格首验开关（只上报不过滤）。
 _QUALIFY_ENV = "MDCG_STG_QUALIFY"
+#: 状态槽位投影开关（第 5 op；与上两把同纪律：**默认关**，探针全绿后逐档开）。
+_STATE_ENV = "MDCG_STG_STATE"
 
 
 # 生效条件：环境变量 name 取值属 ("1","true","True") 时返回 True，其余（含未设/其它值）返回 False——默认关的开关一律走本判据（与 MDCG_LEGACY_ENV_AUTH 同形）。
@@ -700,3 +721,47 @@ def consistency(cg, layer=None, limit=50, max_scan=5000, time_axis="observed"):
         {"issues": len(issues), "limit": limit, "items": issues[:limit]},
         scanned=scanned, hits=scanned, kept=kept, truncated=truncated,
         max_scan=max_scan, index_meta=imeta)
+
+
+# ---------------------------------------------------------------------------
+# 第 5 op：状态槽位投影（flag MDCG_STG_STATE，默认关）
+# ---------------------------------------------------------------------------
+
+# 生效条件：_flag_on(_STATE_ENV) 为假（含未设）时恒返回 {"error":"disabled","hint":…}（不抛异常、不静默降级、不触台账）；为真时以 state_slots.project(cg, subject, slot, include_retired, history) 为 items 全量（查询时现算，零落盘零缓存），limit 经 int() 归一（负数归 0）后取前 limit 条，返回含 count（命中总数，截断前）/subject/slot/include_retired/limit/items/truncated（count > kept）/kept（len(items)）的 dict；project 抛异常时**不吞**（原样上抛）。
+def state_chain(cg, subject=None, slot=None, include_retired=False, history=True,
+                limit=50):
+    """状态槽位投影（第 5 op）：某主体某槽位的**现值 / 区间 / 变迁史**。
+
+    语义单点在 `md_cg/state_slots.py`（**投影不是第二真源**：查询时从 append-only
+    台账 `<root>/_state_events.jsonl` 现算，不落盘、不缓存）——本函数只做开关与
+    返回体成形，不复制任何回放逻辑（改投影只改那一处）。
+
+    开关（`MDCG_STG_STATE`，**默认关**，与 `MDCG_STG_INDEX`/`MDCG_STG_QUALIFY`
+    同纪律）：关臂返回 `{"error": "disabled", "hint": …}`——**不是异常**，是「本面
+    未启用」的如实答复；不静默降级成空结果（「没开」与「没命中」必须可分辨）。
+
+    返回体沿 stg 既有口径（issue #52：截断可观测）：`count` 为**条件命中总数**
+    （截断前，不受 limit 影响）、`items` 为前 `limit` 条、`kept` 为实际返回条数、
+    `truncated` 为 `count > kept`（limit=0 ⇒ items 空、truncated 随 count 真值）。
+
+    不适用条件：`time_axis` 不适用于本 op（台账事件行只有落账时间戳 `t`，无
+    双轴端点——本面**不伪造**第二轴；需要轴语义请走 timeline/relation/anchors）；
+    `alternatives`/`blindspots` 本批恒空列表（判定口径后置，见 `state_slots` 模块头）。
+    """
+    if not _flag_on(_STATE_ENV):
+        return {"error": "disabled",
+                "hint": "本面默认关：设 MDCG_STG_STATE=1 显式启用"
+                        "（与 MDCG_STG_INDEX/MDCG_STG_QUALIFY 同纪律）"}
+    from . import state_slots
+    units = state_slots.project(cg, subject=subject, slot=slot,
+                                include_retired=include_retired,
+                                history=history)
+    total = len(units)
+    cap = int(limit) if limit is not None else 0
+    if cap < 0:
+        cap = 0
+    items = units[:cap]
+    return {"count": total, "subject": subject, "slot": slot,
+            "include_retired": include_retired, "limit": limit,
+            "items": items, "truncated": total > len(items),
+            "kept": len(items)}

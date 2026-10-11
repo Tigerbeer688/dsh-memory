@@ -97,7 +97,14 @@ ALL_OPS = ("help", "info", "route", "read", "write", "goal", "task", "recent", "
            #        缺省不给（fail-closed，新增 op 默认不在任何清单内）；
            #        本轮开给：designer（* 自动含）+ verify（证据审计＝验证
            #        单元的本职读面，见其 ROLE_SPECS 注释）。
-           "audit")
+           # P3 新增（世界模型功能端 P3，2026-10-06）：
+           #   state_event  状态事件记账（追加一条五元事件到 append-only 台账）
+           #        —— 写口；**角色面零新词**：cg 面作用域闸把它映射到既有
+           #        "write" 词（见 mcp_server._cg_dispatch），各角色
+           #        ROLE_SPECS.ops_allow 白名单零改动；登记于本表只为
+           #        「op 三处同步」契约（ALL_OPS == cg 工具 schema == 分发分支，
+           #        见 test_p27/test_p29/test_p30/test_p31 防漏改守卫）。
+           "audit", "state_event")
 
 
 class TokenError(Exception):
@@ -645,7 +652,7 @@ def derive(parent_token: str, role: str, actor: str = None, ttl: float = None,
             "expires_at": rec["expires_at"]}
 
 
-# 生效条件：normalize_role(unit) 结果不在 POSITION_ROLES 时抛 TokenError；否则返回 Principal：unit/role=u、can_admin 恒 False、clearance=_clamp_level(spec["clearance_cap"], p.clearance)、can_write=bool(spec["can_write"]) and bool(p.can_write)、layers_allow/ops_allow=_narrow(spec 对应值, p 对应值)，tenant/actor/session/harness/token_id/parent/expires_at/auth_mode/theory 等沿用 p。
+# 生效条件：normalize_role(unit) 结果不在 POSITION_ROLES 时抛 TokenError；否则返回 Principal：unit/role=u、can_admin 恒 False、clearance=_clamp_level(spec["clearance_cap"], p.clearance)、can_write=bool(spec["can_write"]) and bool(p.can_write)、layers_allow/ops_allow=_narrow(spec 对应值, p 对应值)，tenant/actor/session/harness/token_id/parent/expires_at/auth_mode/theory 等沿用 p，session_auto 来源标记同款传导（getattr(p, "session_auto", False)）。
 def narrowed_principal(p: Principal, unit: str) -> Principal:
     """按「单元」收窄 principal 权限（**请求级**身份，只能变小不能变大）。
 
@@ -669,7 +676,7 @@ def narrowed_principal(p: Principal, unit: str) -> Principal:
     if u not in POSITION_ROLES:
         raise TokenError(f"未知单元：{unit!r}（可选 {list(POSITION_ROLES)}）")
     spec = role_spec(u)
-    return Principal(
+    q = Principal(
         tenant=p.tenant, actor=p.actor, session=p.session, harness=p.harness,
         unit=u, role=u,
         clearance=_clamp_level(spec["clearance_cap"], p.clearance),
@@ -680,6 +687,11 @@ def narrowed_principal(p: Principal, unit: str) -> Principal:
         token_id=p.token_id, parent=p.parent, expires_at=p.expires_at,
         auth_mode=p.auth_mode,
         theory_ok=p.theory_ok, theory_version=p.theory_version)
+    # 2026-10-07 三态：session 值被**复制**（非空）不等于「声明来源」——来源
+    # 标记必须原样传导，否则写归因三态收口（MdCGSecure._attributed_session）
+    # 会把 owner 的进程自动随机误判为声明值放行（身份收窄不改归因来源）。
+    q.session_auto = getattr(p, "session_auto", False)
+    return q
 
 
 # 生效条件：先以 _store_lock(path) 取令牌库跨进程写锁（超时抛 TokenError），再在临界区内执行 _revoke_locked(token_id, path) 并返回其结果。

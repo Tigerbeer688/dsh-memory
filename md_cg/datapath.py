@@ -50,22 +50,49 @@ ENV_AUX_ROOT = "MDCG_AUX_ROOT"
 DEFAULT_AUX_DIRNAME = ".mdcg"
 
 
+#: Windows 保留设备名全集（末段直判用；比对前统一 .upper()，故此处全大写）：
+#: DOS 设备名 CON/PRN/AUX/NUL、控制台伪设备 CONIN$/CONOUT$、COM1-9/LPT1-9，
+#: 以及 Windows 承认的上标数字变体 COM¹²³/LPT¹²³（上标 0 与 4-9 不是保留名）。
+_RESERVED_DEVICE_NAMES = frozenset(
+    ["CON", "PRN", "AUX", "NUL", "CONIN$", "CONOUT$"]
+    + [f"COM{i}" for i in range(1, 10)]
+    + [f"LPT{i}" for i in range(1, 10)]
+    + ["COM\u00b9", "COM\u00b2", "COM\u00b3",
+       "LPT\u00b9", "LPT\u00b2", "LPT\u00b3"])
+
+
+# 生效条件：纯字符串判定（不触盘、无平台分支——平台闸在调用处 _abs_host_path）；
+# 传入 path 归一（"/" → "\"）后去尾随反斜杠取末段，末段按首个 "." 截断取 stem、
+# 再去尾随空格，stem.upper() 命中 _RESERVED_DEVICE_NAMES 即返回 True，否则 False。
+# 末段直判不依赖 OS/Python 版本的 GetFullPathNameW 吞并行为——较新 Windows 构建
+# 不再把「目录\aux」吞成 \\.\aux（issue #57），前缀判据随之失效，本函数是稳定判据。
+def _reserved_device_tail(path: str) -> bool:
+    seg = path.replace("/", "\\").rstrip("\\").split("\\")[-1]
+    stem = seg.split(".", 1)[0].rstrip(" ")
+    return stem.upper() in _RESERVED_DEVICE_NAMES
+
+
 # 生效条件：p 按仓库既有口径 expanduser+abspath 归一；平台为 Windows（os.name=="nt"）
-# 且归一结果以设备命名空间前缀（"\\\\.\\"）开头时抛 ValueError——保留设备名末段
-# （aux/con/nul/prn/com1-9/lpt1-9 等）会被 GetFullPathNameW 吞成设备路径
-# （例 D:\sandbox\aux → \\.\aux），目录语义静默丢失，密钥/令牌/数据覆盖键随之
-# 静默失联；非 Windows 平台该形态是合法目录名字面量，不判定。归一是纯字符串
-# 操作不触盘，路径无需存在即可复现。env_key 传覆盖键名（env 变量名或 paths.json
-# 键），仅用于错误消息定位误配来源；为空时消息以「该路径」指代。
+# 且命中两因之一时抛 ValueError——① 归一结果以设备命名空间前缀（"\\\\.\\"）开头：
+# 保留设备名末段（aux/con/nul/prn/com1-9/lpt1-9 等）被 GetFullPathNameW 吞成设备
+# 路径（例 D:\sandbox\aux → \\.\aux）；② 归一结果末段直判为保留设备名
+# （_reserved_device_tail）：较新 Windows 构建不再吞并（issue #57），旧前缀判据
+# 失效，末段直判不依赖 OS 行为——两因并置互为兜底。后果同：目录语义静默丢失，
+# 密钥/令牌/数据覆盖键随之静默失联；非 Windows 平台该形态是合法目录名字面量，
+# 不判定。归一是纯字符串操作不触盘，路径无需存在即可复现。env_key 传覆盖键名
+# （env 变量名或 paths.json 键），仅用于错误消息定位误配来源；为空时消息以
+# 「该路径」指代。
 def _abs_host_path(p: str, env_key: str = "") -> str:
     r = os.path.abspath(os.path.expanduser(p))
-    if os.name == "nt" and r.startswith("\\\\.\\"):
+    if os.name == "nt" and (r.startswith("\\\\.\\")
+                            or _reserved_device_tail(r)):
         who = env_key or "该路径"
         raise ValueError(
-            f"{who} 归一后解析为 Windows 设备命名空间路径 {r!r}：末段是 Windows "
-            "保留设备名（aux/con/nul/prn/com1-9/lpt1-9 等），GetFullPathNameW 会把"
-            "整个目录吞成设备路径，目录语义静默丢失（落在此处的密钥/令牌/数据会"
-            f"静默失联）；请把 {who} 改指向末段不含保留设备名的普通目录。")
+            f"{who} 归一后末段是 Windows 保留设备名（{r!r}）：GetFullPathNameW "
+            "可能把整个目录吞成设备路径（\\\\.\\aux 形态，目录语义静默丢失）；"
+            "较新 Windows 构建即便不吞并，保留设备名末段也一律按误配拒绝——"
+            "本守卫末段直判不依赖 OS 吞并行为（issue #57）。请把 "
+            f"{who} 改指向末段不含保留设备名的普通目录。")
     return r
 
 
@@ -239,6 +266,23 @@ def mdcg_root() -> str:
             _abs_host_path(os.path.join(plugin_root(), cfg),
                            "paths.json 的 root")
     return os.path.join(data_root(), "mdcg")
+
+
+# 生效条件：无入参；ENV_DATA_ROOT 或 ENV_MDCG_ROOT 任一为非空真值时返回 True；否则 paths_file() 的 JSON 顶层为 dict 且其 "root" 为非空真值时返回 True；其余（无文件/解析失败/顶层非 dict/无该键/假值）返回 False。**不看目录是否存在**——存在性判据留给调用方。
+def mdcg_root_configured() -> bool:
+    """认知图根是否**被显式配置**（env `MDCG_DATA_ROOT`/`MDCG_ROOT`，或 paths.json 的 "root"）。
+
+    为什么需要它（2026-10-10 设计者裁定「15 a」/ dsh-memory #85 的落地面）：
+    `mdcg_root()` 是**恒有返回值**的回落链（未配置时给默认 `data_root()/mdcg`），
+    单看它的返回值分不出「用户配了」与「走默认」。`security.check_path_root` 的
+    三级回落链要在「连库根也无」时才取工作区，故须一个显式的「配置位」判据——
+    即本函数。**只看显式配置**：默认目录是否存在由调用方另判（`os.path.isdir`），
+    因为「默认库已装记忆」与「默认库位空着」在 check_path_root 里处置不同。
+    """
+    if (os.environ.get(ENV_DATA_ROOT) or "").strip() \
+            or (os.environ.get(ENV_MDCG_ROOT) or "").strip():
+        return True
+    return bool(str(_user_paths().get("root") or "").strip())
 
 
 # 生效条件：parts 非空时路径为 data_root() 与各 part 的 join，parts 为空时路径即 data_root()；create 为真值（默认 True）时对该路径 makedirs(exist_ok=True)，create 为假值时只返回路径不建目录。

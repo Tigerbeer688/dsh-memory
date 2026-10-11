@@ -251,6 +251,47 @@ def _ban_hit(content, neg_texts):
     return False
 
 
+# 结论面字段（issue #88，2026-10-09 DSH 端）——**单点常量，一行可换口径**。
+# 裁定（zcode 2026-10-09）：默认取「子功能 + 执行」。子功能＝主张面、执行＝做法面，
+# 两者任一不同都算真实分歧；「功能名」是标签（易造成片面相似）、「生效条件」已由条件
+# 空间匹配单独处理、「不适用条件」的自否定面已证明必须排除（见 _body_text 说明）。
+# 「验证方式」暂不纳入：它是**证据面**不是结论面，纳进去会让「同一结论、不同取证」
+# 被误报分歧（而分歧的代价是进 DEFER 队列人工裁）。
+CONCLUSION_FIELDS = ("执行",)
+# 是否把**自由正文**（_body_text 剥净六要素后的余文）并入结论面。
+# 实测依据（2026-10-09 DSH 端）：p11 的 G2/G3 标定用例**没有「# 执行」行**，
+# 结论写在自由正文里；若只取字段，这两条会因结论面皆空/皆同而判「重复」，
+# 真分歧被吞（实测 ACCEPT/None/0，43 通过 2 失败）。并入正文后与改前口径
+# 在「无执行行」的形态上完全一致，只在「有执行行」时**补回被剥掉的结论**。
+CONCLUSION_INCLUDE_BODY = True
+
+
+# 生效条件：恒返回 content 中 CONCLUSION_FIELDS 各字段值按序以换行连接后的串；字段缺失或为空则跳过，全空返回空串。
+def _conclusion_text(content):
+    """结论面：只取承载「结论/主张」的 CCG 字段。
+
+    与 `_body_text` **分离**（issue #88）：`_body_text` 把六要素**整段**剥掉，
+    其中包含承载结论的「# 执行」行；而 policy 强制 text 类须写成六要素 ⇒ **最规范的记忆
+    正文恒为空**，结论比较两侧皆空、恒判相等 ⇒ 同条件下 5432 与 6543 判「无冲突」。
+
+    为什么**不就地扩** `_body_text`（路线 B 不成立，纯实证）：它同时被
+    **自否定检测**消费（check 内 `_ban_hit(body, neg)` / `_cov(tw_neg, body)`），
+    那里**必须**剥掉「不适用条件」——否则每个声明了不适用条件的正常节点都会被误判为
+    自相矛盾（见其 docstring）。故本函数独立存在，`_body_text` 的行为**一字不动**。
+    """
+    parts = []
+    for f in CONCLUSION_FIELDS:
+        v = nodefile.ccg_field_value(content, f)
+        if v:
+            parts.append(v)
+    if CONCLUSION_INCLUDE_BODY:
+        # 自由正文：_body_text 剥净六要素后的余文（**只读复用**，不改其行为）
+        _b = _body_text(content)
+        if _b and _b.strip():
+            parts.append(_b.strip())
+    return "\n".join(parts)
+
+
 # 生效条件：委托 nodefile._strip_ccg_segments(content, nodefile.CCG_MARKS)（剥除算法单点）——命中 CCG 要素标题行（判据单点 nodefile._ccg_heading_rest，`^#\s*<要素>` 冒号可有可无）即整段剥除：行内带值（`# 生效条件：v`／前缀式）只剥该行，裸标题（`# 不适用条件`）连同其后首个非空、非标题行（该字段的值行，取值口径同 nodefile.ccg_field_value）一并剥除；其余原行以换行连接返回；content 假值按空串返回 "";
 def _body_text(content):
     """去掉 CCG 声明**整段字段**后的正文。
@@ -492,7 +533,7 @@ def _recursive_reflect(cg, seeds, tw_pos, tw_neg, max_depth=MAX_DEPTH,
 # 主入口：三级决策
 # --------------------------------------------------------------------------
 
-# 生效条件：以 cg.index.nodes 为既有节点、content（假值按 ""）经 _new_terms 得 pos/neg 并算 tw_pos/tw_neg（non_applicable_conditions 入参先按 mdcos._is_null_condition 剔除空值语义哨兵——⑧ 漏斗单点）；选面（cons200；收口轮①加面内例外）：快照级预筛剔「tw_pos 与 tw_neg 皆空（新节点未声明可展开条件）时的非纪律候选」，且**剔除永不触及修前扫描面**（过滤后索引序前 limit 内候选一律保留——面内例外；「修后检出 ⊇ 修前」由此成为与「条目 tags 与盘面 fm.tags 同源」无关的结构保证），候选超 limit 时精比面＝相关面（_sift_score 序）前 limit ∪ 保底面（过滤后索引序前 limit ∩ 候选），记 scanned（候选数）/kept（精比数）/truncated（scanned>kept）/hint；按循环中 hard（自否定或纪律命中）→ divergences（同条件槽且 concl < CONCLUSION_SAME）→ strength ≥ CLASH_HIGH → strength ≥ CLASH_LOW → comparable==0 且 (pos or neg) → 否则 ACCEPT 的顺序定 verdict；DEFER 且 int(depth)>0 且 emo["bias"] != "approaching" 时调 _recursive_reflect 补 recursion，auto_flywheel 且 verdict == REJECT 时加 unresolved_id，最后 log_write 为真时 log 并返回 rec；
+# 生效条件：以 cg.index.nodes 为既有节点、content（假值按 ""）经 _new_terms 得 pos/neg 并算 tw_pos/tw_neg（non_applicable_conditions 入参先按 mdcos._is_null_condition 剔除空值语义哨兵——⑧ 漏斗单点）；选面（cons200；收口轮①加面内例外）：快照级预筛剔「tw_pos 与 tw_neg 皆空（新节点未声明可展开条件）时的非纪律候选」，且**剔除永不触及修前扫描面**（过滤后索引序前 limit 内候选一律保留——面内例外；「修后检出 ⊇ 修前」由此成为与「条目 tags 与盘面 fm.tags 同源」无关的结构保证），候选超 limit 时精比面＝相关面（_sift_score 序）前 limit ∪ 保底面（过滤后索引序前 limit ∩ 候选），记 scanned（候选数）/kept（精比数）/truncated（scanned>kept）/hint；按循环中 hard（自否定或纪律命中）→ divergences（同条件槽且 concl < CONCLUSION_SAME）→ strength ≥ CLASH_HIGH → strength ≥ CLASH_LOW → comparable==0 且 (pos or neg) → 否则 ACCEPT 的顺序定 verdict；DEFER 且 int(depth)>0 且 emo["bias"] != "approaching" 时调 _recursive_reflect 补 recursion，auto_flywheel 且 verdict == REJECT 时加 unresolved_id，最后 log_write 为真时 log 并返回 rec；N276：精比环的索引代际探针循环外单探一次（环内 cg.get(nid, probe=False)；无探活面载体回落 cg.get(nid)，行为零变）；
 def check(cg, content, layer=None, condition_space=None,
           non_applicable_conditions=None, tags=None, exclude=None,
           limit=MAX_SCAN, depth=MAX_DEPTH, auto_flywheel=False,
@@ -570,9 +611,11 @@ def check(cg, content, layer=None, condition_space=None,
     # 逐字重复仅 0.32、同槽不同值 0.61，与异属性（0.62）不可分。去模板才可判。
     # H8：**两侧还要同一套空白归一化**（`_norm_ws`）——见 `_norm_ws` 说明；
     # `n_body_tight` 是去全部空白的形态，只供 L1-c 的相等短路用。
-    n_body = _body_text(content)
-    tw_content = expand_query_terms_weighted(_norm_ws(n_body)) if n_body else {}
-    n_body_tight = _nows(n_body)
+    # issue #88：结论比对改看**结论面**（不再看被剥空的正文）——`_body_text` 仍归
+    # 自否定面单独使用（见下方那处独立调用），两处口径互不牵连。
+    n_concl = _conclusion_text(content)
+    tw_content = expand_query_terms_weighted(_norm_ws(n_concl)) if n_concl else {}
+    n_body_tight = _nows(n_concl)
     # 结论槽（CCG 结构字段）——「是否同一件事」的代理，见 _slot_text 说明
     n_fn, n_sb = _slot_text(content)
 
@@ -632,9 +675,20 @@ def check(cg, content, layer=None, condition_space=None,
     scanned = len(cand)                  # 预筛后候选数（截断前）
     kept = len(scan_face)                # 实际精比数（相关面 ∪ 保底面）
     truncated = scanned > kept
+    # N276（第 32 轮性能面）：scan_face 精比环内逐节点 cg.get 会各自重探索引
+    # 签名（快照 stat + listdir + 逐分片 stat，单点实测 ~38µs；本库 200 次/
+    # 调用全同签名重探）——循环外单探一次、环内 probe=False；语义窗口=本批
+    # 读期间「他进程写入」不被探知（毫秒级，与读缓存已声明的进程内一致性
+    # 边界同款）；无探活面的载体（测试桩）回落原 cg.get(nid)，行为零变。
+    _probe = getattr(cg, "_maybe_reload_index", None)
+    if callable(_probe):
+        _probe()
+    else:
+        _probe = None
     seeds = []
     for nid, e in scan_face:
-        node = cg.get(nid) or {}
+        node = (cg.get(nid, probe=False) if _probe is not None
+                else cg.get(nid)) or {}
         fm = node.get("frontmatter") or {}
         body = node.get("content") or ""
         e_pos, e_neg = _declared(fm, body)
@@ -675,7 +729,7 @@ def check(cg, content, layer=None, condition_space=None,
             if slot >= SLOT_HIGH:
                 # 同口径比对（正文↔正文）：tw_content 已去模板行 + 两侧同一套
                 # 空白归一化（H8），见上文与 `_norm_ws` / `_nows` 说明。
-                e_body = _body_text(body)
+                e_body = _conclusion_text(body)      # issue #88：同看结论面
                 if n_body_tight == _nows(e_body):
                     # 差异只在空白（\r\n↔\n / 缩进 / 空行 / 行尾空格 / 词内插空白）
                     # ⇒ 归一化后逐字相同，必判**重复**（该合并），不判分歧。

@@ -56,6 +56,7 @@ import contextlib
 import io
 import os
 import shutil
+import subprocess
 import sys
 import tempfile
 import types
@@ -96,10 +97,43 @@ def _rel_text(rel: str) -> str:
         return f.read()
 
 
+def _tracked_rels():
+    """git 追踪面（仓根相对 · posix 分隔）集合；git 不可用/非仓 ⇒ None（调用方降级）。
+
+    G3 静态判据面须锚在**追踪面**而非文件系统面：本地工作树的 gitignore 产物
+    （`.tmp/` 草稿、`md_cg/_md_cg_eval_*/` 评测灌库、`md_cg/knowledge/` 运行态）
+    不在 CI 干净克隆里，用文件系统面判定会让「本地红 / CI 绿」分裂。`.tmp` 只是
+    当前最大污染源，故按「是否被 git 追踪」这个**性质**判，不逐个硬编码排除目录。
+    """
+    try:
+        proc = subprocess.run(["git", "-C", _repo_root(), "ls-files", "-z"],
+                              capture_output=True, check=True)
+    except Exception:                                  # noqa: BLE001 —— 兜底见下
+        return None
+    return {p.replace("\\", "/") for p in
+            proc.stdout.decode("utf-8", "replace").split("\0") if p}
+
+
 def _md_cg_py_texts():
+    """静态判据面 = `md_cg/` 下全部 `.py` ∩ **git 追踪面**（非追踪件不入面）。
+
+    降级（明示，非静默改语义）：git 不可用或非仓环境 ⇒ 退化为原文件系统走查，
+    并打印 `[降级]` 一行——此时判据面可能与 CI 干净克隆不一致，读数须按降级看待。
+    """
+    tracked = _tracked_rels()
+    if tracked is None:
+        print("  [降级] git 不可用：G3 静态扫描面退化为文件系统走查"
+              "（可能与 CI 干净克隆不一致）")
     d = os.path.join(_repo_root(), "md_cg")
-    return {"md_cg/" + fn: _rel_text("md_cg/" + fn)
-            for fn in sorted(os.listdir(d)) if fn.endswith(".py")}
+    out = {}
+    for fn in sorted(os.listdir(d)):
+        if not fn.endswith(".py"):
+            continue
+        rel = "md_cg/" + fn
+        if tracked is not None and rel not in tracked:
+            continue          # 非追踪件不入判据面（保留原 .py 语义）
+        out[rel] = _rel_text(rel)
+    return out
 
 
 # ---------------------------------------------------------------- 沙箱
@@ -309,10 +343,15 @@ _MUTATIONS = (
     ("op 路径读取器不回落真源（旧「另一处字面量」）", "mod", "md_cg/sustain.py",
      "        return bool(args[name])\n    return auto_default(name)",
      "        return bool(args[name])\n    return False", 1),
+    # 锚点 = **布局无关的唯一子串**：只取到 `("auto_tidy")` 为止，不带尾括号——
+    # `ensure_loop(` 的收尾随「单行参数 / 多行关键字实参」而变（现役实现是多行、
+    # 行尾 `,`），把 `))` 写进锚点即把变异项钉死在某一版行布局上（S4a 缺陷：
+    # 实现改成多行后锚点漂移、`--mutate` 误判为 fail-closed 退出码 2）。
+    # 该串在 mcp_server.py 恰 1 处（与 G3e 同一子串，唯一性由 G3e 守卫）。
     ("env 路径改回手写 env 读取（第二处 MDCG_AUTO_TIDY 字面量）", "src",
      "md_cg/mcp_server.py",
-     'auto_tidy=sustain.auto_from_env("auto_tidy"))',
-     'auto_tidy=os.environ.get("MDCG_AUTO_TIDY", "1") not in ("0", "false", "False"))',
+     'auto_tidy=sustain.auto_from_env("auto_tidy")',
+     'auto_tidy=os.environ.get("MDCG_AUTO_TIDY", "1") not in ("0", "false", "False")',
      1),
 )
 

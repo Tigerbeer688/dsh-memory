@@ -55,6 +55,17 @@ S3 契约不变量 · G8 缺省与分路开关（mdcos 缺省集 + mcp_server �
 G9 N137 搬迁后边集合逐项相等 · G10 双侧同改披露面（键定义一致 + Rust 缺省路集差异）·
 G11 **Rust 侧指数核登记**（常量单源 + 核表达式从源码抽出逐点等价 + 非空转反证）。
 
+## 耗时须知（issue #84.3，2026-10-09 DSH 端实测）
+
+本件是本仓**最慢的单件守卫之一**：本机（Windows / MDCG_PYTHON 3.13.12）实测
+**232.7 秒**（约 3 分 53 秒，78 通过 / 0 失败 / 0 跳过）。慢的来源是 **G11 组**——
+它要从 **Rust 源码**抽常量与核表达式，再在多个 Δt 点上逐点等价求值，并做扰动反证。
+
+⇒ **CI 侧请把本件单列并给足超时**（建议 ≥ 600s；共享 runner 常比本机慢 1.5~3×）。
+⇒ **不要**为迁就超时去删断言或缩判据：G11e 的「扰动 ×2 后 5/8 点不再相等」是防
+『自说自话』的那一条，削弱它等于把守卫变成装饰。
+⇒ 本口径由 zcode 端 2026-10-09 裁定 (b)：**承认它慢、单列长超时**，而非删断言换绿灯。
+
 运行：
     python -X utf8 -m md_cg.test_time_core_lint
     python -X utf8 -m md_cg.test_time_core_lint --mutate
@@ -150,8 +161,31 @@ def _reg_lines():
 
 
 
+def _tracked_rels():
+    """git 追踪面（仓根相对 · posix 分隔）集合；git 不可用/非仓 ⇒ None（降级）。
+
+    审计面须锚在**追踪面**而非文件系统面：`audit()` 默认 root=仓根，若按文件
+    系统面走查，本地 gitignore 产物（`.tmp/` 等）会被当成源码审计——与 CI 干净
+    克隆分裂（本件实证：`.tmp/aeis_base_156/**` 曾致 G1c 假红 117 条）。按
+    「是否被 git 追踪」这个性质判，不逐个硬编码排除目录。
+    """
+    try:
+        proc = subprocess.run(["git", "-C", _REPO, "ls-files", "-z"],
+                              capture_output=True, check=True)
+    except Exception:                                  # noqa: BLE001 —— 兜底见下
+        return None
+    return {p.replace("\\", "/") for p in
+            proc.stdout.decode("utf-8", "replace").split("\0") if p}
+
+
 def _iter_files(root):
-    """审计面：root 下所有 .py / .rs（跳过 _SKIP_DIRS）→ [(rel, abspath)]。"""
+    """审计面：root 下所有 .py / .rs（跳过 _SKIP_DIRS）→ [(rel, abspath)]。
+
+    root 为仓根时再按**追踪面**过滤（非追踪件不入审计面）——降级口径：git 不可
+    用（含 `--mutate` 的最小镜像树：非 git 仓）⇒ 该 root 走全盘走查，与原行为
+    一致，判据语义不静默变更。
+    """
+    tracked = _tracked_rels() if os.path.abspath(root) == _REPO else None
     out = []
     for dp, dn, fn in os.walk(root):
         dn[:] = [d for d in dn if d not in _SKIP_DIRS]
@@ -160,6 +194,8 @@ def _iter_files(root):
                 continue
             p = os.path.join(dp, f)
             rel = os.path.relpath(p, root).replace("\\", "/")
+            if tracked is not None and rel not in tracked:
+                continue        # 非追踪件不入审计面
             out.append((rel, p))
     return sorted(out)
 

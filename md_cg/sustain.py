@@ -58,7 +58,8 @@ import time
 
 from . import crypto
 from .datapath import aux_root
-from .fsutil import append_jsonl, atomic_write, ends_mid_line
+from .fsutil import (FileLock, append_jsonl, atomic_write, count_jsonl,
+                     ends_mid_line, publish, read_jsonl)
 from .mdcg import LAYERS
 
 STAMP_VERSION = 1
@@ -70,6 +71,17 @@ DEFAULT_HEAL_INTERVAL = 300.0     # 自愈巡检 5min
 DEFAULT_SCRUB_INTERVAL = 3600.0   # 记忆自净（抽查/去污染/校准）1h
 DEFAULT_EVOLVE_INTERVAL = 7200.0  # 演化巡检（固化/重要性候选盘点）2h；只读
 DEFAULT_TIDY_INTERVAL = 21600.0   # 整理巡检（contextual 同构组聚合）6h
+
+#: 六档 tick 的（档名 → interval 属性名）映射——进度面与 stale 阈值的取值面，
+#: 顺序即 `SustainLoop._run()` 的执行序（单一真源：改档名/加点只改这里）。
+TICK_INTERVAL_ATTRS = (("beat", "beat_interval"), ("heal", "heal_interval"),
+                       ("scrub", "scrub_interval"), ("evolve", "evolve_interval"),
+                       ("tidy", "tidy_interval"), ("sleep", "sleep_interval"))
+#: 活体进度面的 stale 阈值下限（秒）——issue #63：某档 tick 运行超过
+#: `max(2×该档 interval, TICK_STALE_MIN_S)` 时，状态面显式给 `stale_tick`
+#: 告警。**只上报，不杀线程**（线程不可安全强杀；处置=人工重启常驻进程，
+#: 见 `docs/mdcg/睡眠周期_运维前提与维护指南_v1.0.md`）。
+TICK_STALE_MIN_S = 1800.0
 
 # ---- 四档 `auto_*` 缺省的**单一真源**（P0-2，2026-10-01）--------------------
 # 为什么要有这张表：同一组缺省此前在**三处**各写一份——op 路径
@@ -227,6 +239,287 @@ def peers(d: str = None):
             rec["state"] = judge(rec["age"],
                                  task_running=bool(rec.get("task_running")))
             out.append(rec)
+    return out
+
+
+# --------------------------------------------------------------------------
+# 心跳台账（append-only · 有界分片轮转）—— 让「连续 N 周期无断」可严格测得
+#
+# 缺口（答卷 `docs/plans/灵枢1.0_最小智能系统实存答卷_v1.1.md` §八 分诊第 4 项 ·
+# **甲类能力缺口**）：`_sustain.jsonl` 是 heal **动作**台账（有动作才写，平静期与
+# 停摆期不可区分），心跳戳是**覆盖式单点**（无历史序列）——故「连续 N 周期无断」
+# 在现数据结构下**不可严格测得**（取证见 `docs/eval/W7v11_结构面局限取证_v0.1.md`
+# §丁）。
+#
+# 本台账补此缺口：**每个心跳周期追加一行**（append-only、只追加不改写历史行），
+# 配合 **分片轮转 + 保留片数上限**（有界，形态照抄 `_audit.jsonl` 轮转）与
+# **节流探测**（把 stat 写入税摊到 1/N），并由只读统计
+# `heartbeat_ledger_stats()` 直接算出「最长连续无断区间 / 断点数 / 最近一次周期
+# 时刻」。位置与 `_sustain.jsonl` **同域**（库根 `<root>/_heartbeat.jsonl`）。
+#
+# **零判定变更**（硬边界）：本台账只新增写入与只读统计，不改变任何既有读面——
+# `beat()` 的返回、心跳戳字段、`_sustain.jsonl` 既有记录、`judge()`/`heal()` 的
+# 返回均逐位不变（守卫 `md_cg/test_heartbeat_ledger.py` L1 钉死）。
+#
+# **写点边界**：只有**常驻循环**的 `SustainLoop.beat()` 记台账（那才是「心跳
+# 周期」）；`write_stamp` 的其它调用点不记——进度面刷新 `_flush_progress` 非心跳
+# 周期（进/出六档各刷一次，会把「停摆」稀释），MCP 手动 `action=beat` 非循环
+# 自证（人可手动补戳，不能当「循环活着」的证据）。故台账是**循环自证面**。
+# --------------------------------------------------------------------------
+
+HEARTBEAT_LOG = "_heartbeat.jsonl"        # 活动台账（与 _sustain.jsonl 同域：库根）
+HEARTBEAT_ARCHIVE = "_heartbeat_archive"  # 分片归档目录（不在 LAYERS，不参与节点索引）
+HEARTBEAT_INDEX = "_index.json"           # 归档索引：分片 bytes/events 缓存（稳态 O(1)）
+HEARTBEAT_ROTATE_BYTES = 4 << 20          # 活动台账轮转阈值（≤0 关闭轮转＝退回无上界）
+HEARTBEAT_KEEP_SHARDS = 4                 # 归档分片保留数（≤0 不淘汰；淘汰必留痕）
+HEARTBEAT_PROBE_EVERY = 8                 # 每 N 次写入探测一次大小（把写入税摊到 1/N）
+HEARTBEAT_ENV = "MDCG_HEARTBEAT_LEDGER"   # 开关（缺省开；"0"/"false"/"False" 关）
+#: 相邻心跳周期间隔 ≤ 该阈值即视为「连续」；缺省 2× 心跳间隔（600s）= 1200s。
+HEARTBEAT_GAP_THRESHOLD = 2.0 * DEFAULT_BEAT_INTERVAL
+#: 轮转自述行与心跳周期行的区分标记（统计只取 kind=="beat"，轮转痕不进时间序列）。
+HB_KIND_BEAT = "beat"
+HB_KIND_ROTATE = "rotate"
+
+#: root → 已写次数（进程内；仅用于节流探测步长。跨进程各自计数，不影响正确性
+#: ——多写者共享同一活动文件时，任一方到点都会做一次 stat，只是探测得更密）。
+_HB_WRITES: dict = {}
+
+
+# 生效条件：environ 缺省取 os.environ，读 HEARTBEAT_ENV 键，其 str() 值不在 AUTO_OFF_VALUES 中即返回 True（缺键回落 "1"＝开）；否则 False。
+def heartbeat_ledger_enabled(environ=None) -> bool:
+    """心跳台账开关（缺省**开**）：`MDCG_HEARTBEAT_LEDGER` ∈ 关断字面量即关。"""
+    env = os.environ if environ is None else environ
+    return str(env.get(HEARTBEAT_ENV, "1")) not in AUTO_OFF_VALUES
+
+
+# 生效条件：给定库根 root，返回 root/HEARTBEAT_LOG 的拼接路径。
+def heartbeat_path(root: str) -> str:
+    return os.path.join(root, HEARTBEAT_LOG)
+
+
+# 生效条件：给定库根 root，返回 root/HEARTBEAT_ARCHIVE 的拼接路径。
+def heartbeat_archive_dir(root: str) -> str:
+    return os.path.join(root, HEARTBEAT_ARCHIVE)
+
+
+# 生效条件：t 为数值时间戳时返回 "%Y-%m-%dT%H:%M:%S" 本地时间字符串。
+def _iso(t) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(float(t)))
+
+
+# 生效条件：root/HEARTBEAT_ARCHIVE 可列目录时返回其中以 "_heartbeat." 开头、".jsonl" 结尾的名字升序列表（序号零填充 ⇒ 字典序==时间序）；listdir 抛 OSError 时返回 []。
+def _hb_shards(root: str):
+    try:
+        names = os.listdir(heartbeat_archive_dir(root))
+    except OSError:
+        return []
+    return sorted(n for n in names
+                  if n.startswith("_heartbeat.") and n.endswith(".jsonl"))
+
+
+# 生效条件：遍历 _hb_shards(root) 中 "_heartbeat.<n>.jsonl" 形式取 int(n) 最大值 top（解析失败 continue、无可解析项 top=0），返回 top+1。
+def _hb_next_seq(root: str) -> int:
+    top = 0
+    for n in _hb_shards(root):
+        try:
+            top = max(top, int(n[len("_heartbeat."):-len(".jsonl")]))
+        except ValueError:
+            continue
+    return top + 1
+
+
+# 生效条件：读 root/HEARTBEAT_ARCHIVE/HEARTBEAT_INDEX（json）；不可读/损坏/非 dict 时回落 {}，只保留 value 为 dict 的项。
+def _hb_load_index(root: str) -> dict:
+    try:
+        with open(os.path.join(heartbeat_archive_dir(root), HEARTBEAT_INDEX),
+                  "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict):
+            return {k: v for k, v in data.items() if isinstance(v, dict)}
+    except (OSError, ValueError):
+        pass
+    return {}
+
+
+# 生效条件：把 idx 以 JSON（ensure_ascii=False, indent=1, sort_keys=True）原子写入 root/HEARTBEAT_ARCHIVE/HEARTBEAT_INDEX；OSError 被吞掉。
+def _hb_save_index(root: str, idx: dict):
+    try:
+        os.makedirs(heartbeat_archive_dir(root), exist_ok=True)
+        atomic_write(os.path.join(heartbeat_archive_dir(root), HEARTBEAT_INDEX),
+                     json.dumps(idx, ensure_ascii=False, indent=1, sort_keys=True))
+    except OSError:
+        pass
+
+
+# 生效条件：HEARTBEAT_ROTATE_BYTES <= 0 时直接返回（轮转关闭）；否则 root 写计数自增，未到 HEARTBEAT_PROBE_EVERY 倍数即返回；到倍数且活动台账 size ≥ 阈值时调用 rotate_heartbeat(root)。
+def _hb_rotate_if_needed(root: str):
+    """写前闸门：活动台账达阈值即切分（把 stat 摊到 1/HEARTBEAT_PROBE_EVERY）。"""
+    limit = HEARTBEAT_ROTATE_BYTES
+    if limit <= 0:
+        return
+    n = _HB_WRITES.get(root, 0) + 1
+    _HB_WRITES[root] = n
+    if n % HEARTBEAT_PROBE_EVERY:
+        return
+    try:
+        if os.path.getsize(heartbeat_path(root)) < limit:
+            return
+    except OSError:
+        return
+    rotate_heartbeat(root)
+
+
+# 生效条件：在 FileLock(root/_heartbeat.rotate.lock) 下，若活动台账 size ≥ HEARTBEAT_ROTATE_BYTES 则 publish 为 HEARTBEAT_ARCHIVE/_heartbeat.%06d.jsonl，登记索引、淘汰越限分片，并在新活动台账追加一条 kind="rotate" 自述行后返回 {"shard","bytes","events","pruned"}；size 不足、getsize OSError 或 rename 失败时返回 None。
+def rotate_heartbeat(root: str, reason: str = "size"):
+    """把活动心跳台账切分为归档分片（publish 原子 rename，不重写一个字节）。
+
+    语义边界（诚实面）：
+    · 分片内容与轮转前**逐行一致**（rename 不动字节）；轮转前记录序列是轮转后
+      （跨分片按时间序合并）序列的**前缀**——append-only 指「分片内只追加」，
+      分片封存后不再改写；
+    · 并发由 FileLock + 「rename 前复检大小 / 失败即返回 None」兜住；
+    · 保留策略只淘汰**分片**，且淘汰名单写进新台账的 rotate 自述行（不静默丢证据）。
+    """
+    path = heartbeat_path(root)
+    with FileLock(os.path.join(root, "_heartbeat.rotate.lock"), timeout=5.0):
+        try:
+            size = os.path.getsize(path)
+        except OSError:
+            return None
+        if size < HEARTBEAT_ROTATE_BYTES:
+            return None                    # 已被并发写者轮转
+        arc = heartbeat_archive_dir(root)
+        os.makedirs(arc, exist_ok=True)
+        name = "_heartbeat.%06d.jsonl" % _hb_next_seq(root)
+        try:
+            publish(path, os.path.join(arc, name))
+        except OSError:
+            return None                    # 抢输（文件已被移走）→ 让位，不报错
+        events = count_jsonl(os.path.join(arc, name))
+        idx = _hb_load_index(root)
+        idx[name] = {"bytes": size, "events": events,
+                     "t": round(time.time(), 3), "reason": reason}
+        _hb_save_index(root, idx)
+        pruned = _hb_prune_shards(root)
+        _HB_WRITES[root] = 0
+        row = {"t": time.time(), "name": "_rotate", "pid": os.getpid(),
+               "kind": HB_KIND_ROTATE, "ok": True, "shard": name,
+               "bytes": size, "events": events, "pruned": pruned, "reason": reason}
+        try:                               # 自述留痕：轮转本身可审计
+            append_jsonl(path, row)
+        except OSError:
+            pass
+        return {"shard": name, "bytes": size, "events": events, "pruned": pruned}
+
+
+# 生效条件：HEARTBEAT_KEEP_SHARDS <= 0 时返回 []（不淘汰）；否则保留最近 keep 个分片，越限的逐个 os.remove 并从索引 pop（OSError 则 continue），最后保存索引并返回被淘汰分片名列表。
+def _hb_prune_shards(root: str):
+    """保留最近 HEARTBEAT_KEEP_SHARDS 个分片、淘汰更旧的（≤0 表示不淘汰）。"""
+    keep = HEARTBEAT_KEEP_SHARDS
+    if keep <= 0:
+        return []
+    shards = _hb_shards(root)
+    gone = shards[:-keep] if len(shards) > keep else []
+    if not gone:
+        return []
+    idx = _hb_load_index(root)
+    for n in gone:
+        try:
+            os.remove(os.path.join(heartbeat_archive_dir(root), n))
+        except OSError:
+            continue                       # 删不掉就留着：不假装已淘汰
+        idx.pop(n, None)
+    _hb_save_index(root, idx)
+    return gone
+
+
+# 生效条件：开关关（heartbeat_ledger_enabled() 为假）时返回 None 且不写盘；否则先经 _hb_rotate_if_needed(root) 有界闸门，再向 root/HEARTBEAT_LOG 追加一行 {"t","name","pid","kind":"beat","ok"(,"error")}，返回该行；任何写入异常被吞掉并返回 None（心跳不可因台账而中断）。
+def record_heartbeat(root: str, name: str, *, ok: bool = True, error=None,
+                     t=None, pid=None, extra=None) -> dict:
+    """追加一条**心跳周期**记录（append-only）——「连续 N 周期无断」的原始证据。
+
+    字段（至少）：`t`（时间戳）+`name`（周期名）+`pid`+`ok`（该周期结果）；
+    失败时附 `error`（摘要，截 200）。写路径 best-effort：开关关 / 任何异常都
+    返回 None 且不外溢（与心跳写戳同纪律）。
+    """
+    if not heartbeat_ledger_enabled():
+        return None
+    row = {"t": float(t) if t is not None else time.time(),
+           "name": name, "pid": os.getpid() if pid is None else pid,
+           "kind": HB_KIND_BEAT, "ok": bool(ok)}
+    if error is not None:
+        row["error"] = str(error)[:200]
+    if extra:
+        row.update(extra)
+    try:
+        _hb_rotate_if_needed(root)
+        append_jsonl(heartbeat_path(root), row)
+    except Exception:                      # noqa: BLE001 —— 台账永不拖垮心跳
+        return None
+    return row
+
+
+# 生效条件：按 _hb_shards(root)（时间序，旧片在前）再活动台账的顺序流式产出各 JSONL 记录（read_jsonl 自动跳过坏行）；文件/目录缺失即跳过。
+def _hb_records(root: str):
+    arc = heartbeat_archive_dir(root)
+    for n in _hb_shards(root):
+        for r in read_jsonl(os.path.join(arc, n)):
+            yield r
+    for r in read_jsonl(heartbeat_path(root)):
+        yield r
+
+
+# 生效条件：只读统计 root 下全部 kind="beat" 记录（name 非 None 时按周期名过滤）的 t 序列——以相邻 t 间隔 > threshold_s 为断点，返回 {n, threshold_s, shards, file, absent, span_s, span_iso, last_iso, last_age_s, segments, longest_s, longest_iso, count_in_longest, breaks, breaks_top}；无记录时 absent=True 且各读数 None。
+def heartbeat_ledger_stats(root: str, *, name: str = None,
+                           threshold_s: float = HEARTBEAT_GAP_THRESHOLD) -> dict:
+    """只读统计：**最长连续无断区间 / 断点数 / 最近一次周期时刻**。
+
+    用途＝闭合答卷 §八 分诊第 4 项的「不可严格测得」——`_sustain.jsonl`（heal 动作
+    台账）与心跳戳（覆盖式单点）都答不了，本台账答得了。**只读**：不写、不轮转。
+    有界台账（分片 ≤ 保留片数 × 轮转阈值）使该读数代价有界。
+    """
+    ts = []
+    for r in _hb_records(root):
+        if not isinstance(r, dict) or r.get("kind") != HB_KIND_BEAT:
+            continue
+        if name is not None and r.get("name") != name:
+            continue
+        v = r.get("t")
+        if isinstance(v, (int, float)) and not isinstance(v, bool):
+            ts.append(float(v))
+    ts.sort()
+    out = {"n": len(ts), "threshold_s": float(threshold_s),
+           "shards": len(_hb_shards(root)), "file": HEARTBEAT_LOG}
+    if not ts:
+        out.update({"absent": True, "segments": 0, "longest_s": None,
+                    "longest_iso": None, "count_in_longest": 0,
+                    "breaks": 0, "breaks_top": [], "span_s": None,
+                    "span_iso": None, "last_iso": None, "last_age_s": None})
+        return out
+    runs, breaks = [], []
+    start = prev = ts[0]
+    for t in ts[1:]:
+        if t - prev > threshold_s:
+            runs.append((start, prev))
+            breaks.append({"at_iso": _iso(prev), "next_iso": _iso(t),
+                           "gap_s": round(t - prev, 1)})
+            start = t
+        prev = t
+    runs.append((start, prev))
+    best = max(runs, key=lambda r: r[1] - r[0])
+    out.update({
+        "absent": False,
+        "span_s": round(ts[-1] - ts[0], 1),
+        "span_iso": "%s → %s" % (_iso(ts[0]), _iso(ts[-1])),
+        "last_iso": _iso(ts[-1]),
+        "last_age_s": round(max(0.0, time.time() - ts[-1]), 1),
+        "segments": len(runs),
+        "longest_s": round(best[1] - best[0], 1),
+        "longest_iso": "%s → %s" % (_iso(best[0]), _iso(best[1])),
+        "count_in_longest": sum(1 for t in ts if best[0] <= t <= best[1]),
+        "breaks": len(breaks),
+        "breaks_top": sorted(breaks, key=lambda b: -b["gap_s"])[:5],
+    })
     return out
 
 
@@ -1071,12 +1364,22 @@ class SustainLoop:
         self.heals = []
         self.last_scrub = None
         self.scrubs = []
+        # 自净轮次（issue #66）：`_tick_scrub` 每轮自增，用作抽样 seed 的
+        # 轮次分量——固定 seed 会让每轮样本逐字相同（抽样面冻结）。
+        self.scrub_round = 0
         self.last_evolve = None
         self.evolves = []
         self.last_tidy = None
         self.tidys = []
         # 数据健康不变量断言集结论（Pi⑤）：与 tidy 同节奏，只取结论不落盘
         self.last_conformance = None
+        # 活体进度面（issue #63）：当前档 / 上一档完成 / 上一档错误——
+        # 写点 = 既有心跳戳（见 `_progress_fields` / `_flush_progress`），
+        # **不造第二套状态文件**。
+        self.current_tick = None
+        self.last_tick_done = None
+        self.last_tick_error = None
+        self._ticks_wrapped = False          # 六档进度面包装的幂等标记
         self._started_at = None
         self._th = None
         self._stop = threading.Event()
@@ -1084,17 +1387,135 @@ class SustainLoop:
 
     # ---- 心跳 ----
 
-# 生效条件：task_running 非 None 时先置 self.task_running=bool(task_running)，再 write_stamp(self.name, self.d, task_running=self.task_running, root=self.cg.root, uptime=... if self._started_at else 0.0)，beats 自增并记 last_beat=rec["ts"]，返回该 rec；
+# 生效条件：task_running 非 None 时先置 self.task_running=bool(task_running)，再 write_stamp(self.name, self.d, task_running=self.task_running, root=self.cg.root, uptime=... if self._started_at else 0.0, **进度三字段)；写戳抛异常时先 record_heartbeat(ok=False, error=摘要) 再原样抛出；写戳成功则 beats 自增、记 last_beat=rec["ts"]、record_heartbeat(ok=True, t=rec["ts"])，返回该 rec；
     def beat(self, task_running: bool = None) -> dict:
         if task_running is not None:
             self.task_running = bool(task_running)
-        rec = write_stamp(
-            self.name, self.d, task_running=self.task_running, root=self.cg.root,
-            uptime=round(time.time() - self._started_at, 3)
-            if self._started_at else 0.0)
+        try:
+            rec = write_stamp(
+                self.name, self.d, task_running=self.task_running, root=self.cg.root,
+                uptime=round(time.time() - self._started_at, 3)
+                if self._started_at else 0.0,
+                **self._progress_fields())      # 进度面随心跳同落（单点状态面）
+        except Exception as e:                   # noqa: BLE001
+            # 写戳失败：台账如实记 error 摘要（「容忍≠静默」），随后**原样抛出**
+            # ——既有行为不变（写戳失败 beat 亦失败，只是现在多一条错误留痕）。
+            record_heartbeat(self.cg.root, self.name, ok=False,
+                             error="%s: %s" % (type(e).__name__, e))
+            raise
         self.beats += 1
         self.last_beat = rec["ts"]
+        # 心跳周期台账（append-only，缺省开）：写戳成功后再追加一行。**不改返回、
+        # 不改戳**（零判定变更，守卫 L1）——t 取戳的 ts，使台账与戳同源。
+        record_heartbeat(self.cg.root, self.name, ok=True, t=rec["ts"])
         return rec
+
+    # ---- 活体进度面（issue #63）----
+    #
+    # 为什么有这一段：`_run()` 单线程串行六档，任一档**无界阻塞**即全循环停摆
+    # （实测停 9.5 小时：心跳/自愈/巡检/演化/整理/睡眠全停）。卡住期间外部
+    # **无法知道卡在哪档**——tick 台账在 run_cycle **返回后**才写。故：
+    #   · 进入/退出每档各刷一次**既有状态面**（心跳戳）——不造第二套状态文件；
+    #   · `current_tick` 给出「此刻在哪档、已跑多久」，`stale_tick` 超限告警；
+    #   · 六档异常**不再静默**（容忍≠静默）：`last_tick_error` 记类名 + 摘要。
+    # 形态：全部经 `_wrap_ticks()` **单点包装**——`_run` 的六档 try/except 逐字
+    # 未改（`md_cg/test_sleep_p1.py` G3a 把它钉死；包装让异常在进入 `_run` 的
+    # except 之前就已被记录，那边的 `pass` 保留为兜底）。
+
+# 生效条件：无入参；返回进度三字段 dict（current_tick / last_tick_done / last_tick_error；None 值由 write_stamp 丢弃）——写戳与 status 读取的唯一取值面。
+    def _progress_fields(self) -> dict:
+        """进度三字段（写点与读取的**单一取值面**）。"""
+        return {"current_tick": self.current_tick,
+                "last_tick_done": self.last_tick_done,
+                "last_tick_error": self.last_tick_error}
+
+# 生效条件：以 write_stamp(self.name, self.d, task_running=self.task_running, root=self.cg.root, uptime=... if self._started_at else 0.0, **进度三字段) 刷新既有心跳戳（原子替换）；写失败静默（与心跳同纪律）——进度面缺失是已知边界（写失败时 status 的当前档读数退化为 null）。
+    def _flush_progress(self):
+        """把进度面刷新进**既有状态面**（心跳戳）——不新建状态文件。
+
+        为什么**进入**档时就要刷：卡死场景下「没有下一次写」正是常态——进度
+        必须在进入时就落盘，否则观测面恰好缺了要观测的那一刻。写失败静默
+        （与 `beat()` 同纪律），但失败即拉不到进度，属已知边界。
+        """
+        try:
+            write_stamp(self.name, self.d, task_running=self.task_running,
+                        root=self.cg.root,
+                        uptime=round(time.time() - self._started_at, 3)
+                        if self._started_at else 0.0,
+                        **self._progress_fields())
+        except Exception:                            # noqa: BLE001
+            pass                                     # 进度面刷新失败不拖垮常驻
+
+# 生效条件：无入参；把六档 tick 方法（beat / _tick_heal / _tick_scrub / _tick_evolve / _tick_tidy / _tick_sleep）就地包上 _wrap_tick（幂等：_ticks_wrapped 为真即直接返回 self）；返回 self。
+    def _wrap_ticks(self):
+        """把六档 tick 包上进度面（幂等）——**不改 `_run` 的逐字形态**。
+
+        为什么用包装而不是改 `_run` 的六档结构：`_run` 的六档 try/except 形态
+        被既有守卫**逐字**钉死（`md_cg/test_sleep_p1.py` G3a「第六档形态与
+        既有五档逐字同构（try/except 吞异常 + 末尾 _stop.wait(_POLL)）」），
+        而 issue #63 要求的「进/出留读数 + 异常不静默」是**每档同款**动作——
+        单点包装既保住既有形态（六档语义与顺序一字不动），又免六处重复
+        （改档名/加点只动 `TICK_INTERVAL_ATTRS`）。
+        """
+        if getattr(self, "_ticks_wrapped", False):
+            return self
+        for name, _attr in TICK_INTERVAL_ATTRS:
+            meth = "_tick_" + name if name != "beat" else "beat"
+            setattr(self, meth, self._wrap_tick(name, getattr(self, meth)))
+        self._ticks_wrapped = True
+        return self
+
+# 生效条件：name 为该档名、fn 为该档可调用；返回包装函数 wrapped——调用时先写 current_tick={name, started_at, pid} 并刷新戳，调 fn(*a, **kw)，异常记入 last_tick_error={name, error: 类名+摘要（截 200 字符）, t} 并**不重抛**（容忍≠静默；`_run` 的既有 except 保留为兜底），随后清 current_tick、记 last_tick_done={name, t, ok} 并再刷新戳。
+    def _wrap_tick(self, name: str, fn):
+        """单档 tick 的**进度面包裹**（issue #63）：进/出各留读数，异常不静默。
+
+        「容忍 ≠ 静默」：六档的 except 面此前只有 `pass`——失败的档在外部
+        读不到。现在失败一律进 `last_tick_error`（类名 + 摘要）；卡住靠
+        `current_tick` 的年龄与 `stale_tick` 告警判（不杀线程）。
+        """
+        def wrapped(*a, **kw):
+            self.current_tick = {"name": name, "started_at": time.time(),
+                                 "pid": os.getpid()}
+            self._flush_progress()
+            ok_ = True
+            try:
+                fn(*a, **kw)
+            except Exception as e:                   # noqa: BLE001
+                ok_ = False
+                self.last_tick_error = {"name": name, "t": time.time(),
+                                        "error": "%s: %s" % (type(e).__name__,
+                                                             str(e)[:200])}
+            self.current_tick = None
+            self.last_tick_done = {"name": name, "t": time.time(), "ok": ok_}
+            self._flush_progress()
+            return ok_
+        wrapped.__name__ = "wrapped_%s_tick" % name
+        return wrapped
+
+# 生效条件：ct 为 current_tick 形态（含 name 与 started_at）且 name 在 TICK_INTERVAL_ATTRS 内时，以该档 interval 算 lim=max(2×interval, TICK_STALE_MIN_S)，年龄（now-started_at）超 lim 返回 {tick, age_s, limit_s, alert}（alert 文案含档名与已运行时长）；未超或形态不符返回 None。
+    def _stale_tick(self, ct):
+        """`current_tick` 的 stale 判定：年龄 > `max(2×该档 interval, 1800s)`。
+
+        超限**只告警不杀线程**（线程不可安全强杀；处置=人工重启常驻进程，
+        见运维指南「常驻循环的卡死防护与观测」一节）。
+        """
+        if not isinstance(ct, dict):
+            return None
+        name = ct.get("name")
+        attr = dict(TICK_INTERVAL_ATTRS).get(name)
+        if attr is None:
+            return None
+        try:
+            lim = max(2.0 * float(getattr(self, attr)), TICK_STALE_MIN_S)
+            age = max(0.0, time.time() - float(ct.get("started_at") or 0.0))
+        except (TypeError, ValueError):
+            return None
+        if age <= lim:
+            return None
+        return {"tick": name, "age_s": round(age, 1), "limit_s": round(lim, 1),
+                "alert": ("档 %s 已运行 %.0fs（阈值 %.0fs = max(2×间隔, %.0fs)）"
+                          "——疑似卡死；不自动杀线程，处置=人工重启常驻进程"
+                          % (name, age, lim, TICK_STALE_MIN_S))}
 
     # ---- 生命周期 ----
 
@@ -1119,8 +1540,9 @@ class SustainLoop:
         clear_stamp(self.name, self.d)
         return self
 
-# 生效条件：self._stop 未置位期间轮询，按 beat_interval/heal_interval/scrub_interval/evolve_interval/tidy_interval/**sleep_interval（第六档）** 到期分别执行 beat 与 _tick_heal/_tick_scrub/_tick_evolve/_tick_tidy/_tick_sleep，各 tick 抛出的异常被吞掉不中断循环，末尾以 _stop.wait(_POLL) 休眠；
+# 生效条件：self._stop 未置位期间轮询（**先调 _wrap_ticks 给六档包上进度面，幂等**），按 beat_interval/heal_interval/scrub_interval/evolve_interval/tidy_interval/**sleep_interval（第六档）** 到期分别执行 beat 与 _tick_heal/_tick_scrub/_tick_evolve/_tick_tidy/_tick_sleep（六档调用形态与既有五档逐字同构：try/except 吞异常 + `_stop.wait(_POLL)` 收尾；进/出读数与异常记录由包装单点提供——issue #63）；
     def _run(self):
+        self._wrap_ticks()               # issue #63：六档包上进度面（幂等，形态不变）
         next_beat = time.time() + self.beat_interval
         next_heal = time.time() + self.heal_interval
         next_scrub = time.time() + self.scrub_interval
@@ -1266,19 +1688,33 @@ class SustainLoop:
             self.evolves.append(rec)
             self.evolves = self.evolves[-20:]
 
-# 生效条件：以 dry_run=not self.auto_scrub 调 scrub.sweep(self.cg)，把 t/ok/n_issues/n_high_medium/applied/dry_run 记入 last_scrub 与 scrubs（保留最近 20 条）；auto_scrub=False（默认）时 dry_run=True 只读巡检；
+# 生效条件：self.scrub_round 自增后以 seed=f"sustain:{self.scrub_round}"、dry_run=not self.auto_scrub 调 scrub.sweep(self.cg)，把 t/ok/n_issues/n_high_medium/applied/already_handled/planned_dry_run/checked_breakdown/seed/dry_run 记入 last_scrub 与 scrubs（保留最近 20 条）；auto_scrub=False（默认）时 dry_run=True 只读巡检；
     def _tick_scrub(self):
         """记忆自净：抽查 → 联想 → 去污染 → 校准偏差。
 
         `auto_scrub=False`（默认）时只做只读巡检并记账，不动任何节点；
         开启后才执行去污染（仍只做可逆动作、永不删节点）。
+
+        抽样轮转（issue #66）：seed 按**轮次**派生（`scrub_round` 每 tick
+        自增）——固定 seed=0 会让每轮样本逐字相同（抽样面冻结，「老面孔」
+        长期占用名额）；库层 `scrub.sample` 的缺省 seed=0 不变（显式调用的
+        可复现性不受影响）。
         """
         from . import scrub
-        rep = scrub.sweep(self.cg, dry_run=not self.auto_scrub)
+        self.scrub_round += 1
+        seed = f"sustain:{self.scrub_round}"
+        rep = scrub.sweep(self.cg, dry_run=not self.auto_scrub, seed=seed)
+        dec = rep["decontaminate"]
         rec = {"t": rep["t"], "ok": rep["ok"],
                "n_issues": rep["audit"]["n_issues"],
                "n_high_medium": rep["n_high_medium"],
-               "applied": rep["decontaminate"]["applied"],
+               "applied": dec["applied"],
+               # 覆盖账（issue #66）：轮读数可区分「旧面孔（名单命中跳过）」
+               # 与「本轮检查」（dry_run 轮是常驻默认下唯一的账）。
+               "already_handled": dec["already_handled"],
+               "planned_dry_run": dec["planned_dry_run"],
+               "checked_breakdown": dec["checked_breakdown"],
+               "seed": seed,
                "dry_run": rep["dry_run"]}
         self.last_scrub = rec
         with self._lock:
@@ -1309,12 +1745,25 @@ class SustainLoop:
 
     # ---- 状态 ----
 
-# 生效条件：以 read_stamp(self.name, self.d) 判定 state（有戳走 judge(age, interval=self.beat_interval, task_running=...)，无戳为 "stopped"），返回含 name/running/pid/uptime（无 _started_at 时为 0.0）/beats/last_beat/各 interval 与 auto_* 开关/heals[-5:]/evolves[-5:]/tidys[-5:]/peers(self.d)/ledger.summary() 的 dict；
+# 生效条件：以 read_stamp(self.name, self.d) 判定 state（有戳走 judge(age, interval=self.beat_interval, task_running=...)，无戳为 "stopped"）；进度面（issue #63）同进程内存优先、跨进程回落戳内字段，current_tick 附 running_s（已运行秒数）；stale_tick 在 current_tick 年龄超 max(2×该档 interval, 1800s) 时给出告警（含档名与时长）；返回含 name/running/pid/uptime（无 _started_at 时为 0.0）/beats/last_beat/各 interval 与 auto_* 开关/heals[-5:]/evolves[-5:]/tidys[-5:]/current_tick/last_tick_done/last_tick_error/stale_tick/peers(self.d)/ledger.summary() 的 dict；
     def status(self) -> dict:
         st = read_stamp(self.name, self.d)
         state = (judge(st["age"], interval=self.beat_interval,
                        task_running=bool(st.get("task_running")))
                  if st else "stopped")
+        # 进度面（issue #63）：同进程内存优先（最实时），跨进程回落戳内字段
+        # ——戳是**既有状态面**（不造第二套状态文件）；外部 `action=beat`
+        # 覆盖戳时内存侧不受影响。
+        cur = self.current_tick or (st or {}).get("current_tick")
+        if isinstance(cur, dict):
+            cur = dict(cur)
+            try:
+                cur["running_s"] = round(max(
+                    0.0, time.time() - float(cur.get("started_at") or 0.0)), 1)
+            except (TypeError, ValueError):
+                cur["running_s"] = None
+        last_done = self.last_tick_done or (st or {}).get("last_tick_done")
+        last_err = self.last_tick_error or (st or {}).get("last_tick_error")
         return {"name": self.name, "running": bool(self._th
                                                    and self._th.is_alive()),
                 "pid": os.getpid(),
@@ -1344,6 +1793,12 @@ class SustainLoop:
                 "last_sleep": self.last_sleep,
                 "sleeps": self.sleeps[-5:],
                 "last_conformance": self.last_conformance,
+                # 活体进度面（issue #63）：此刻在哪档 / 上一档完成 / 上一档错误
+                # / 超限告警（只上报，不杀线程）。
+                "current_tick": cur,
+                "last_tick_done": last_done,
+                "last_tick_error": last_err,
+                "stale_tick": self._stale_tick(cur),
                 "peers": peers(self.d),
                 "sessions": self.ledger.summary()}
 

@@ -28,6 +28,14 @@
     ① 换了身份（actor / tenant 不符）→ 解不开；
     ② 把密文拷贝到另一个节点 → 校验失败。
   即「密钥 + 身份」双因子，缺一不可。
+· **跨身份读的失败分类**（B1，2026-10-10；同日 DSH 端独立复核纠正）：密文块另携
+  **非敏感**指纹 `enc_id_fp`（= `identity_fingerprint(tenant, actor)`，与
+  `_keys.json` 信封同款，16 位 hex、不泄露身份原文）。**它不参与解密与否的判定**
+  ——MAC 校验（`open_node`）是唯一判据；只有当解密**失败**时才用该指纹把这次失败
+  归类：不等 ⇒ 预期隔离（`read_foreign`），其余（含存量旧格式无该段）⇒ 真异常
+  （`open_failed`）。之所以**不**用它预先跳过解密：它是**未认证明文段**（不在
+  `_node_aad` 里、`open_node` 解密前丢弃），让可篡改字段决定「是否执行唯一的完整性
+  校验」会派生假阴性（真密文被静默拒读）与假阳性（谎报指纹制造 `open_failed`）。
 
 密码学实现
 ----------
@@ -48,6 +56,7 @@ import time
 
 from .datapath import aux_root
 from .fsutil import FileLock
+from .rotate import Rotator
 
 # ---- 常量 ----------------------------------------------------------------
 
@@ -67,6 +76,26 @@ KEYS_FILE = "_keys.json"
 AUDIT_FILE = "_crypto.jsonl"
 MASTER_ENV = "MDCG_MASTER_KEY"
 MASTER_FILE = os.path.join(aux_root(), "master.key")
+
+# ---- 审计分片轮转（A2，2026-10-10）-------------------------------------
+# `_crypto.jsonl` 此前「直接 append + except OSError: pass」——无阈值/无归档/无
+# 索引/无淘汰/无体检/失败静默（在役库实测 682 MB / 302 万条无界增长）。现与
+# `_audit.jsonl` 共用唯一实现 `md_cg.rotate.Rotator`（参数化共享件）。
+AUDIT_BASENAME = "_crypto"
+CRYPTO_ARCHIVE = "_crypto_archive"
+CRYPTO_INDEX = "_index.json"
+CRYPTO_ROTATE_BYTES = 64 << 20     # 活动文件轮转阈值（≤0 关闭，退回无上界）
+CRYPTO_KEEP_SHARDS = 8             # 归档分片保留数（≤0 不淘汰；淘汰必留痕）
+CRYPTO_PROBE_EVERY = 32            # 每 N 次写入探测一次大小（写入税摊到 1/N）
+CRYPTO_COUNT_MAX_BYTES = 64 << 20  # 超此规模的分片只给量级（不付 O(n) 全量计数）
+
+#: 每 root 一个巡转器（进程内缓存）：分片索引缓存据此在重复体检间保持 O(1)。
+_ROTATORS = {}
+
+#: 审计写失败告警上限（进程内）：N126 点名「审计写入 best-effort 静默吞错」——
+#: 通道坏死时**不再静默**，但告警有界（防刷屏），计数面恒完整。
+_AUDIT_WRITE_FAILURES = 0
+_AUDIT_WRITE_WARN_CAP = 16
 
 # scrypt 参数（交互式场景：N=2^14 / r=8 / p=1，约 16MB 内存）
 SCRYPT_N, SCRYPT_R, SCRYPT_P, SCRYPT_DKLEN = 2 ** 14, 8, 1, 32
@@ -397,22 +426,46 @@ def is_encrypted(content):
     return bool(content) and content.lstrip().startswith(ENC_PREFIX)
 
 
-# 生效条件：content、dek、node_id、tenant、actor 为入参，生成 NONCE_LEN 随机 nonce，将 str(content).encode("utf-8") 以 aead_encrypt(dek, nonce, ..., _node_aad(node_id, tenant, actor)) 加密，返回 f"{ENC_PREFIX}{_b64e(nonce + tag + ct)}{ENC_SUFFIX}"。
+# 生效条件：content 为入参；非密文（is_encrypted 为假）时返回 None；密文块正文中不含 ":"（旧格式，仅 base64）时返回 None；否则返回 ":" 前的 enc_id_fp 字串（空串亦返回 None）。base64 标准字母表不含 ":"，故该分隔符无歧义；旧格式密文天然无此段 ⇒ 返回 None（调用方走旧路径）。
+def enc_id_fp(content):
+    """从密文标记块取出**非敏感**身份指纹 `enc_id_fp`（B1）。
+
+    新格式：`<!-- mdcg-enc:v1:<enc_id_fp>:<base64(nonce+tag+ct)> -->`
+    存量旧格式（无该段）返回 None —— 不需要迁移，读方走旧路径（新写逐步带上）。
+    """
+    if not is_encrypted(content):
+        return None
+    body = content.strip()[len(ENC_PREFIX):-len(ENC_SUFFIX)]
+    if ":" not in body:
+        return None
+    return body.split(":", 1)[0] or None
+
+
+# 生效条件：content、dek、node_id、tenant、actor 为入参，生成 NONCE_LEN 随机 nonce，将 str(content).encode("utf-8") 以 aead_encrypt(dek, nonce, ..., _node_aad(node_id, tenant, actor)) 加密，返回 f"{ENC_PREFIX}{enc_id_fp}:{_b64e(nonce + tag + ct)}{ENC_SUFFIX}"，其中 enc_id_fp=identity_fingerprint(tenant, actor)（非敏感 16 位 hex，随密文同行，读方零解密即可判跨身份）。
 def seal_node(content, dek, node_id, tenant, actor):
-    """明文 → 密文标记块（正文整体加密；frontmatter 不在此处处理）。"""
+    """明文 → 密文标记块（正文整体加密；frontmatter 不在此处处理）。
+
+    A2/B1（2026-10-10）：密文块携带 `identity_fingerprint(tenant, actor)`（16 位
+    hex，与 `_keys.json` 信封同款指纹）——它是**非敏感**标识（不泄露身份原文），
+    供读方在**解密失败后**给失败分类（跨身份预期隔离 vs 真异常）。它**不**决定
+    是否解密：MAC 校验恒为唯一判据（见 `_open_content`）。
+    """
     nonce = secrets.token_bytes(NONCE_LEN)
     ct, tag = aead_encrypt(dek, nonce, str(content).encode("utf-8"),
                            _node_aad(node_id, tenant, actor))
-    return f"{ENC_PREFIX}{_b64e(nonce + tag + ct)}{ENC_SUFFIX}"
+    return (f"{ENC_PREFIX}{identity_fingerprint(tenant, actor)}:"
+            f"{_b64e(nonce + tag + ct)}{ENC_SUFFIX}")
 
 
-# 生效条件：content、dek、node_id、tenant、actor 为入参；若 is_encrypted(content) 为假则原样返回 content；否则 strip 后切掉 ENC_PREFIX/ENC_SUFFIX，base64 解出 raw，按 NONCE_LEN、TAG_LEN 切出 nonce/tag/ct，调 aead_decrypt(dek, nonce, ct, tag, _node_aad(node_id, tenant, actor)) 并 utf-8 解码返回；aead_decrypt 失败抛 CryptoError。
+# 生效条件：content、dek、node_id、tenant、actor 为入参；若 is_encrypted(content) 为假则原样返回 content；否则 strip 后切掉 ENC_PREFIX/ENC_SUFFIX，正文含 ":" 时丢弃其前的 enc_id_fp 段（新格式），base64 解出 raw，按 NONCE_LEN、TAG_LEN 切出 nonce/tag/ct，调 aead_decrypt(dek, nonce, ct, tag, _node_aad(node_id, tenant, actor)) 并 utf-8 解码返回；aead_decrypt 失败抛 CryptoError；旧格式（无 ":" 段）与新格式同一路径解密（向后兼容）。
 def open_node(content, dek, node_id, tenant, actor):
-    """密文标记块 → 明文；未加密原样返回；失败抛 CryptoError。"""
+    """密文标记块 → 明文；未加密原样返回；失败抛 CryptoError（兼容旧格式）。"""
     if not is_encrypted(content):
         return content
     body = content.strip()
     body = body[len(ENC_PREFIX):-len(ENC_SUFFIX)]
+    if ":" in body:                        # 新格式：<enc_id_fp>:<b64>
+        body = body.split(":", 1)[1]
     raw = _b64d(body)
     nonce = raw[:NONCE_LEN]
     tag = raw[NONCE_LEN:NONCE_LEN + TAG_LEN]
@@ -423,22 +476,98 @@ def open_node(content, dek, node_id, tenant, actor):
 
 # ---- 审计（payload-free）-------------------------------------------------
 
-# 生效条件：root、rec 为入参，复制 rec，若未提供 ts 则设 time.time()，设 payload_free=True，尝试 append_jsonl(os.path.join(root, AUDIT_FILE), rec)；OSError 时静默忽略。
+# 生效条件：root 为入参，按 root 取/建进程内缓存的 Rotator（basename=_crypto、archive=_crypto_archive、index=_index.json、lock=<root>/_crypto.rotate.lock），每次调用把模块级 CRYPTO_* 常量同步进实例（守卫可原地改阈值）后返回；同一 root 复用同一实例（分片索引缓存 ⇒ 重复体检 O(1)）。
+def _rotator(root):
+    key = os.path.abspath(root)
+    r = _ROTATORS.get(key)
+    if r is None:
+        r = Rotator(root=root, basename=AUDIT_BASENAME,
+                    archive_name=CRYPTO_ARCHIVE, index_name=CRYPTO_INDEX,
+                    rotate_bytes=CRYPTO_ROTATE_BYTES,
+                    keep_shards=CRYPTO_KEEP_SHARDS,
+                    probe_every=CRYPTO_PROBE_EVERY,
+                    count_max_bytes=CRYPTO_COUNT_MAX_BYTES,
+                    mark_factory=_rotate_mark,
+                    clock=lambda: time.time())
+        _ROTATORS[key] = r
+    r.rotate_bytes = CRYPTO_ROTATE_BYTES
+    r.keep_shards = CRYPTO_KEEP_SHARDS
+    r.probe_every = CRYPTO_PROBE_EVERY
+    r.count_max_bytes = CRYPTO_COUNT_MAX_BYTES
+    return r
+
+
+# 生效条件：name（分片名）、size、events、pruned、reason 为入参，返回 crypto 协议形状的轮转自述记录（ts/op=crypto_rotate/node_id=分片名/bytes/events/pruned/reason/payload_free=True）。
+def _rotate_mark(name, size, events, pruned, reason):
+    return {"ts": time.time(), "op": "crypto_rotate", "node_id": name,
+            "bytes": size, "events": events, "pruned": pruned,
+            "reason": reason, "payload_free": True}
+
+
+# 生效条件：root、exc 为入参，无条件把 _AUDIT_WRITE_FAILURES 累加 1；累计不超过 _AUDIT_WRITE_WARN_CAP 时向 stderr 写一行含库根与异常类型的告警（N126：不再静默吞错）；返回是否写了告警行。
+def _note_audit_write_failure(root, exc):
+    """登记一次审计写失败 + stderr 告警（N126 口径：容忍 ≠ 静默）。
+
+    审计仍是 best-effort（写失败不阻断业务），但**通道坏死不得无痕**——磁盘满 /
+    文件被独占 / 权限回收时，运维必须有可见线索（有界告警，防刷屏）。
+    """
+    global _AUDIT_WRITE_FAILURES
+    _AUDIT_WRITE_FAILURES += 1
+    if _AUDIT_WRITE_FAILURES > _AUDIT_WRITE_WARN_CAP:
+        return False
+    sys.stderr.write(
+        "[mdcg-crypto] 审计写入失败（best-effort，已容忍）%s：%s: %s"
+        "——本次后进程内累计 %d 次。排查方向：磁盘满 / 文件被独占 / "
+        "权限回收；轮转面经 crypto.audit_scale(root) 可读。\n"
+        % (root, type(exc).__name__, exc, _AUDIT_WRITE_FAILURES))
+    return True
+
+
+# 生效条件：root、rec 为入参，复制 rec，若未提供 ts 则设 time.time()，设 payload_free=True；先经 _rotator(root).maybe_rotate() 做写前轮转闸门（阈值内零切分），再 append_jsonl(os.path.join(root, AUDIT_FILE), rec)；轮转或追加抛 (OSError, TimeoutError) 时经 _note_audit_write_failure 记账 + 有界 stderr 告警，不阻断调用方（best-effort 语义不变）。
 def audit(root, rec):
     from .fsutil import append_jsonl
     rec = dict(rec)
     rec.setdefault("ts", time.time())
     rec["payload_free"] = True
     try:
+        _rotator(root).maybe_rotate()
+    except (OSError, TimeoutError) as e:      # 轮转失败不得阻断审计写
+        _note_audit_write_failure(root, e)
+    try:
         append_jsonl(os.path.join(root, AUDIT_FILE), rec)
-    except OSError:
-        pass
+    except OSError as e:
+        _note_audit_write_failure(root, e)
 
 
-# 生效条件：root 为入参，返回 list(read_jsonl(os.path.join(root, AUDIT_FILE))) 得到的记录列表。
-def audit_records(root):
+# 生效条件：root 为入参；limit 为 None 时返回 _crypto_archive 各分片（时间序）与活动文件的全部记录（跨分片合并）；limit 非 None（含 0）时从 reversed(paths) 读取并在 len(out) >= limit 时停止，返回 out[-limit:]（有界日志不被读成 O(n) 全量）。
+def audit_records(root, limit: int = None):
+    """审计记录读取——轮转后跨分片按时间序（旧片在前）合并。
+
+    与 `MdCGOS.audit_records` 同款口径（A2 共享件）：默认全量语义保持既有调用方
+    零改动；`limit=N` 取尾部 N 条。**旧实现 `list(read_jsonl(...))` 无 limit、把
+    682 MB 单文件全量物化**——轮转后不改就会漏掉归档分片，故此处必须跨片合并。
+    """
     from .fsutil import read_jsonl
-    return list(read_jsonl(os.path.join(root, AUDIT_FILE)))
+    r = _rotator(root)
+    paths = [os.path.join(r.archive, n) for n in r.shards()]
+    paths.append(r.active)
+    if limit is None:
+        out = []
+        for p in paths:
+            out.extend(read_jsonl(p))
+        return out
+    out = []
+    for p in reversed(paths):                 # 从最新往回读，读满 limit 即停
+        if len(out) >= limit:
+            break
+        out = list(read_jsonl(p)) + out
+    return out[-limit:]
+
+
+# 生效条件：root 为入参，返回 _rotator(root).scale()——活动文件实时读数 + 归档分片索引缓存聚合（shards/shard_bytes/shard_events/oversized/total_bytes/total_events/total_exact/rotate_bytes/keep_shards）。
+def audit_scale(root) -> dict:
+    """审计面量级/有界性读数（O(1) 稳态，与 audit_scale 同款共享件）。"""
+    return _rotator(root).scale()
 
 
 # ---- 自描述 --------------------------------------------------------------
@@ -460,6 +589,8 @@ def catalog():
             "DEK 信封 AAD = mdcg-dek|v|tenant|actor",
             "节点 AAD = mdcg-node|v|tenant|actor|node_id",
             "信封另存 id_fp 指纹，解密前先比对（快速失败）",
+            "密文块携带 enc_id_fp 指纹（新格式）：解密失败后据此分类"
+            "（跨身份预期隔离 / 真异常），不参与解密与否的判定",
         ],
         "plaintext_metadata": ["layer", "tags", "condition_space", "importance",
                                "sensitivity", "created_at"],

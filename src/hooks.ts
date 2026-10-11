@@ -20,12 +20,33 @@
  * `origin` / `delegationDepth`）的自动记忆**整条会话拦掉**；② **消息级**——
  * `source.form === 'relay'`（「另一个 agent 发给本 agent 的消息」）不写。
  * 两条判据均为「**字段在场且取值匹配才拦**」：字段缺失一律退化为不过滤（默认放行），
- * 且宿主是否真写这些字段**未在真实会话事件上验证过**（见 installMemoryHooks 内注释）。
+ * 宿主字段面已在本机真实会话事件上观测（2026-10-05 订正：19 场，会话头
+ * `delegationDepth=0` 真实在写）；**仍未观测**的是 `origin='subagent'` /
+ * `delegationDepth>0` / `form='relay'` 的真实出现（见 installMemoryHooks 内注释）。
+ *
+ * contextWindow（滑动窗口，2026-10-06）：**短期记忆 = 运行态事件窗口**。
+ * 写侧把每条 user/assistant 消息（经既有 sanitize 的原文）追加进灵枢的
+ * `_recent.jsonl` 滚动窗口（`cg(op=recent, action=add)`）；注入侧在每次
+ * system-prompt/assemble 时注入独立的「【本会话近期对话】」块
+ * （`cg(op=session, action=recall)` 的 recent 段）——宿主压缩（retained 置空
+ * 后重新投影）时该块随既有块一起自然重现，即「上下文满后早期对话的接续锚」。
+ *
+ * ⚠️ **两轨关系（勿混）**：
+ *   · 知识面轨：`opts.userMessage` / `opts.assistantMessage` 管「消息沉淀成
+ *     记忆节点」（role:user/assistant，进检索正排）；使用者 2026-09-27 的
+ *     `userMessage=false` 决策关的是**这一轨**（消息不自动进知识面）。
+ *   · 窗口轨：`opts.contextWindow`（enabled/turns）管「消息进运行态窗口」
+ *     （`_recent.jsonl`：滚动淘汰、**不占知识层、不进检索正排、不是知识节点**）。
+ *   两轨**独立开关、互不替代**：知识面关掉时窗口照常工作（这正是本机制存在的
+ *   意义——压缩后的续接锚不依赖自动记忆的写入开关）。
  *
  * autoRecall：通过 system-prompt/assemble 事件（waterfall，异步允许）在每次
  * 模型请求组装 system prompt 时自动注入灵枢最近记忆
  * （`stg(op=timeline)`，最近记忆节点时间线），让记忆"自动可用"而不只依赖
  * Agent 主动调用 recall/think 工具。失败静默（不影响请求）。
+ * contextWindow 的注入面是**独立第二块**（`lingshu:session-window`）——既有块
+ * （timeline / `lingshu:auto-recall`）的行为一字不动；第二块的注入门控 =
+ * 注入面总开关 `opts.autoRecall` × 本机制开关 `contextWindow.enabled`。
  * ⚠️ 该注入块的**稳定性**决定宿主是否新追加快照：内容没变时也必须照旧 push
  * （宿主按渲染后的整段文本去重）；跳过 push 反而会各追加一份「有块/无块」的快照
  * —— 详见 installMemoryHooks 里的长注释。
@@ -48,6 +69,10 @@ import type { SessionEvent } from '@deepseek-ai/dsh-session'
 import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { MdcgClient } from './lib/mdcg_client.js'
 import { escapePromptBraces, renderUntrustedMemoryBlock } from './lib/prompt_safety.js'
+import { HookAuditRecorder, kindOf, type HookWriteRole } from './lib/hook_audit.js'
+// 运行期会话状态单点（B 治本批）：观测在 hooks 面，写归因注入在工具面
+// （src/tools.ts）——两处共用同一状态，见 lib/session_state.ts 头注。
+import { currentSession, noteSession, UNASSIGNED_SESSION } from './lib/session_state.js'
 
 /** 自动记忆开关。 */
 export interface MemoryHooksOptions {
@@ -65,6 +90,23 @@ export interface MemoryHooksOptions {
   autoRecallLimit: number
   /** 自动记忆脱敏：写入前过滤敏感信息（密钥/密码/令牌/身份证/手机号，默认 true）。 */
   desensitize: boolean
+  /** 落盘审计文件路径（issue #56，诊断面：哪些消息被设计滤除、source.kind 分布、
+   *  写入/跳过计数）。缺省 `~/.dsh/logs/dsh-memory-hook-audit.json`（与桥探针 /
+   *  apply 探针同目录同惯例），供测试与定制注入；审计自身失败静默降级，
+   *  绝不冒泡进记忆路径。不改任何既有选项语义。 */
+  auditPath?: string
+  /** **短期会话窗口**（滑动窗口，2026-10-06）：enabled（缺省 true）控制整条
+   *  机制（写侧 + 注入侧同时静默）；turns（缺省 10）= 窗口取数条数
+   *  （`session_recall` 的 `recent_limit`，语义是**条**不是轮）。
+   *
+   *  ⚠️ **两轨关系（勿混，头注有详述）**：`userMessage` / `assistantMessage`
+   *  管**知识面**（消息沉淀成记忆节点，进检索正排）；本组管**运行态窗口**
+   *  （`_recent.jsonl`：滚动淘汰、不占知识层、不进正排、不是知识节点）。
+   *  两轨独立开关、互不替代——知识面开关关掉时窗口照常工作。
+   *
+   *  可选（缺省视为 `{ enabled: true, turns: 10 }`）：既有调用方不传本项时
+   *  行为与缺省一致，不改变任何既有选项语义。 */
+  contextWindow?: { enabled: boolean; turns: number }
 }
 
 /** 从 ContentBlock[] 提取纯文本。 */
@@ -115,8 +157,18 @@ export const WORD_CHARS = `A-Za-z0-9_${FW_DIGITS}${FW_UPPER}${FW_LOWER}＿`
 /** 两宽数字类。 */
 const DIGIT_CHARS = `0-9${FW_DIGITS}`
 /** 两宽凭据值类：词字符 + `@ # $ % ^ & * ! . -` 的两宽形态。
- *  ASCII 连字符一律转义（`\\-`）——`[_-－]` 会被解析成 `_`→`－` 的**巨区间**。 */
-const CRED_VALUE_CHARS = `${WORD_CHARS}@＠#$＄%^＆*!.\\-－．`
+ *  ASCII 连字符一律转义（`\\-`）——`[_-－]` 会被解析成 `_`→`－` 的**巨区间**。
+ *
+ *  N265（本轮补齐）：半角 `&` 与全角 `＃％＾＊` 此前缺位——其对照形态（全角 `＆`、
+ *  半角 `# % ^ *`）早在类里，构成「同形不同过滤」：缺口字符落在值前 4 位内 ⇒ 整条漏检、
+ *  落在第 4 位之后 ⇒ 命中被截断在缺口处、尾部留明文。守卫
+ *  test/fullwidth_redact.test.ts ⑧（形态一）与 ⑨（形态二）钉住这两只退化形态。
+ *
+ *  ⚠️ 全角 `！` **不在**本类，且与半角 `!` 不对称（`!` 在类）——这是**有意保留**的现口径：
+ *  本文件「边界」段与同文件守卫 ④ 把全角叹号钉为句读边界（值在此收住）。
+ *  2026-10-05 使用者裁决：判 by-design——保留全角 ！ 为句读边界，不得并入值类
+ *  （并入必动守卫④），**勿在补字符集时顺手塞进来**——否则守卫 ④ 会红。 */
+const CRED_VALUE_CHARS = `${WORD_CHARS}@＠#＃$＄%％^＾&＆*＊!.\\-－．`
 /** 两宽令牌值类（本项目令牌 id/secret 的字符集：词字符 + `-`）。
  *  导出供守卫核对字面量规则的同源性（同 ⑦），不承诺稳定 ABI。 */
 export const TOKEN_VALUE_CHARS = `${WORD_CHARS}\\-－`
@@ -165,12 +217,28 @@ export const SENSITIVE_PATTERNS: Array<{ re: RegExp; label: string }> = [
       + `(?:${twoWidth('password')}|${twoWidth('passwd')}|${twoWidth('pwd')})`
       + `(?![${WORD_CHARS}])\\s*[:=＝：]\\s*[^\\s,，。;；]+`, 'gi'), label: '密码' },
   { re: new RegExp(`${twoWidth('Bearer')}\\s+[${BEARER_VALUE_CHARS}]{8,}`, 'gi'), label: '令牌' },
-  // 中文密码：值限定非中文连续串（凭据特征），避免误伤「密码是重要的安全概念」；
+  // 中文/日文密码标签：值限定非中文连续串（凭据特征），避免误伤「密码是重要的安全概念」；
   // 分隔符补全角等号 `＝`（半角 `=` 本就不在本规则的集合里，故只补全角形态）。
-  { re: new RegExp(`密码\\s*[:：是＝]\\s*[${CRED_VALUE_CHARS}]{4,}`, 'g'), label: '密码' },
+  // N269：词形补齐——繁体「密碼」、日文「パスワード」、中文「口令」与「密码」同表同口径
+  //（三者此前整条漏检：界面承诺 :66「密码…默认过滤」，却认不出这三种常见写法）；
+  // 日文 `は` 一类助词**刻意不并入分隔符集合**（`パスワードは重要です` 是普通句子，
+  // 并进去即刻误伤，与「值类不含中文」同一取舍）。
+  { re: new RegExp(`(?:密码|密碼|口令|パスワード)\\s*[:：是＝]\\s*[${CRED_VALUE_CHARS}]{4,}`, 'g'), label: '密码' },
   // 两宽：全角数字形态同样要被认（`\b` 换成两宽 lookaround，见上）
   { re: new RegExp(`(?<![${WORD_CHARS}])[${DIGIT_CHARS}]{17}[${DIGIT_CHARS}XxＸｘ](?![${WORD_CHARS}])`, 'g'), label: '身份证号' },
   { re: new RegExp(`(?<![${WORD_CHARS}])[1１][3-9３-９][${DIGIT_CHARS}]{9}(?![${WORD_CHARS}])`, 'g'), label: '手机号' },
+  // N269：凭据标签词形的「标签: 值」形态——密钥 / token / secret / creds 此前整条漏检
+  //（界面承诺 :66「密钥/密码/令牌…默认过滤」，而裸 `token:`/`secret=`/`creds=` 一个都不认）。
+  // 值类取共享单点 CRED_VALUE_CHARS 并设 `{4,}` 下限（与中文密码规则同口径）：比
+  // 「任意非空白续写」窄，避免吃掉 `token: 这句是说明文字` 一类普通文本；词形用
+  // twoWidth 单点生成（半角/全角拼写都认，`ＴＯＫＥＮ：…` 同样命中）；标签前后沿用
+  // 两宽 lookaround（`mytoken=`/`tokenize:` 不命中）。
+  // 位置约束：两条令牌规则必须留在数组**最后两位**（test/token_redact_parity.test.ts
+  // 的交换序按 n-2/n-1 取它们做对拍），故本规则插在其前。
+  { re: new RegExp(
+      `(?<![${WORD_CHARS}])`
+      + `(?:密钥|${twoWidth('token')}|${twoWidth('secret')}|${twoWidth('creds')})`
+      + `(?![${WORD_CHARS}])\\s*[:=＝：]\\s*[${CRED_VALUE_CHARS}]{4,}`, 'gi'), label: '密钥' },
   // 本项目自有令牌（issue #45）：批次71 已把形态加进**写入闸门**的禁表，但自动
   // 记忆走的是 mdcg_remember(gated=true)、**不过 audit**，此处是这条路上唯一的
   // 防线——此前不认自家令牌，用户粘一次即明文落进共用记忆库。
@@ -286,6 +354,57 @@ function formatTimelineDecayed(payload: unknown): string {
   return out.join('\n').slice(0, RECALL_MAX_CHARS)
 }
 
+// ---------------------------------------------------------------- 会话窗口渲染
+// 「短期会话窗口」（contextWindow）的取数/渲染常量。与上方 RECALL_* 同款纪律：
+// 常量写死在此处（而非 config schema——未知键会被 schema 剥离）。
+/** 窗口块取数的整包 token 预算（服务端 `session_recall` 的 budget_tokens）。
+ *
+ *  ⚠️ 这是**整包**预算，不是 recent 段的独立预算：notes/goals/tasks/self_state
+ *  与 recent 共享（服务端裁剪循环交替丢 recent / notes 尾部，md_cg/mdcos.py:
+ *  3351-3362）。取 600 是**有意保守**——本块定位是「存在性锚点 / 接续提示」，
+ *  宁可少注入几条，也不挤占宿主上下文。实测（空库 + 10 条窗口条目）：
+ *  budget_tokens=600 → recent 段 8 条；1200 → 10 条。 */
+const WINDOW_BUDGET_TOKENS = 600
+/** 单条窗口条目预览上限（字符）。 */
+const WINDOW_ITEM_CHARS = 120
+/** 窗口块总长上限（字符）。 */
+const WINDOW_MAX_CHARS = 800
+
+/** 会话窗口载荷 → 注入文本（限幅沿 RECALL 分级渲染的风格：单条 ≤120 字、
+ *  整块 ≤800 字）。
+ *
+ *  `cg(op=session, action=recall)` 的 `recent` 段 = `{role, text, t}` 列表，
+ *  按**新→旧**排列（服务端 `recent_events` 的 newest_first）。渲染取**旧→新**
+ *  （对话流水的自然阅读序），但**裁剪保最新**：先按服务端序（新→旧）逐条
+ *  试放入上限（放不下就**停在更旧的条目上**，整条不放入），最后整体反转
+ *  ——总长受限时丢掉的是**最旧**条目（近因优先），且**不切条目中间**
+ *  （逐条整放/整弃；最后才 slice 是错的——那会把最新一条切掉半截）。
+ *
+ *  空载荷 / 无 recent 段 / 全空条目 → 返回空串（调用方据此**不 push** 第二块）。 */
+function formatSessionWindow(payload: unknown, limit: number): string {
+  const items = (payload && typeof payload === 'object'
+    && Array.isArray((payload as { recent?: unknown }).recent))
+    ? (payload as { recent: Array<Record<string, unknown>> }).recent
+    : []
+  const rows: string[] = []
+  const max = Math.max(1, Math.floor(limit) || 10)
+  let used = 0
+  for (const it of items.slice(0, max)) {
+    const role = String(it['role'] ?? '').trim() || 'user'
+    const preview = String(it['text'] ?? '').replace(/\s+/g, ' ').trim()
+    if (!preview) continue
+    const body = preview.length > WINDOW_ITEM_CHARS
+      ? preview.slice(0, WINDOW_ITEM_CHARS) + '…'
+      : preview
+    const row = `[${role}] ${body}`
+    const next = used === 0 ? row.length : used + 1 + row.length
+    if (used > 0 && next > WINDOW_MAX_CHARS) break
+    rows.push(row)
+    used = next
+  }
+  return rows.reverse().join('\n')
+}
+
 /** 取宿主会话标识（只用于**归因/隔离**，不参与任何权限判断）。
  *
  *  动机：记忆写入必须带会话身份才能区分不同会话；读取默认只看本会话（防串台），
@@ -300,27 +419,22 @@ function sessionIdOf(raw: unknown): string {
   return typeof v === 'string' ? v.trim() : ''
 }
 
-/** 会话归属未知时的**显式占位**（H2③，2026-09-30）。
- *
- *  ⚠️ 不可退回「不传 session 键」：md_cg 的 `Principal.__init__` 在 session 为假值时
- *  生成**进程级随机** `sess_<hex>`（md_cg/security.py:117）——插件不传，等于让一个
- *  进程内所有「宿主未给标识」的会话共用一个**不可辨认**的随机桶：归属在审计上既
- *  读不出是谁、跨进程也对不上，是静默的归属丢失。
- *  本常量把这一态写成**显式值**：跨进程一致、可辨认、可审计，且不是伪造的宿主
- *  会话 id（非 DSH 形态，服务端 `_normalize_session` 原样采用、不会被改写成别的桶）。
- *  要读这个桶：`stg(op=timeline, session="unassigned")`。 */
-const UNASSIGNED_SESSION = 'unassigned'
+// UNASSIGNED_SESSION（会话归属未知时的显式占位常量）单点已移至
+// lib/session_state.ts（B 治本批：本文件与工具面共用同一常量与同一会话状态）。
 
 /** H1 **会话级**判据：这条 session 是否「子代理/委派子会话」。
  *
- *  字段来源（DSH 类型面，node_modules/@deepseek-ai/dsh-session/lib/types/types.d.ts）：
- *    · `header.origin?: 'subagent'`（:64「Coarse product classification for a
- *      session created as a subagent child」）；
- *    · `header.delegationDepth?: number`（:70「absent (zero) for a top-level
- *      session, parent depth + 1 for a subagent child」）。
+ *  字段来源（DSH 类型面，dsh-session/lib/types/types.d.ts）：实装 DSH 2.0
+ *  （`dsh-0.2.0-rc.2`）:81 `header.origin?: 'subagent'`「Coarse product
+ *  classification for a session created as a subagent child」；:87
+ *  `header.delegationDepth?: number`「absent (zero) for a top-level session,
+ *  parent depth + 1 for a subagent child」（本仓 devDeps `0.1.0-rc.8` 同字段
+ *  在 :64 / :70）。
  *
- *  ⚠️ **未验证项（如实标注）**：本机未装 DSH harness，真实宿主是否真给子代理
- *  子会话写这两个字段，**只在类型面成立、未在真实会话事件上观测过**。故判据取
+ *  ⚠️ **观测面（2026-10-05 订正）**：本机**已装** DSH 2.0（`dsh-0.2.0-rc.2`）；
+ *  19 场真实会话（`sessions/…/session.v4.jsonl.zstd`）观测到会话头
+ *  `delegationDepth=0` 真实在写（19/19），`origin` 键从未出现。**仍未观测**：
+ *  `origin='subagent'` / `delegationDepth>0` 的真实出现。故判据取
  *  「**字段在场且取值匹配才拦**」的形态：header 缺失 / 非对象 / 两个字段都取不到
  *  或不匹配 → 一律返回 false（**不拦**，安全退化为既有行为），绝不因字段缺失而
  *  报错，也不因此改变既有写入行为。
@@ -340,18 +454,22 @@ function isSubagentSession(session: unknown): boolean {
 
 /** H1 **消息级**判据：这条消息是否是「另一个 agent 发给本 agent 的」（委派/中继）。
  *
- *  字段来源（DSH 类型面，node_modules/@deepseek-ai/dsh-llm/lib/types/message.d.ts）：
- *  `ContextForm` 的 `'relay'`（:52 注释原文「A message another agent addressed to
- *  this one」），按类型只挂在 `kind: 'plugin'` 变体的 `form` 上（:98-101）。
+ *  字段来源（DSH 类型面，dsh-llm/lib/types/message.d.ts）：实装 DSH 2.0 里 `'relay'`
+ *  在 `ContextFormed` 判别联合上（:90 `readonly form: 'relay';`；:55-56 注释原文
+ *  「A message another agent addressed to this one」），该联合由各生产者按需混入自己的
+ *  source 类型——2.0 的 `MessageSourceMap` 注释明确**无共享 catch-all `plugin`
+ *  类别**，`kind` 由各生产者声明在自己的模块里（:94-100；本仓 devDeps
+ *  `0.1.0-rc.8` 同段在 :52 / :86）。
  *
- *  ⚠️ **未验证项（如实标注）**：真实宿主是否真给委派消息写 `form: 'relay'`
- *  **未观测过**。故同样取「字段在场且取值匹配才拦」；source 缺失/非对象 → false。
+ *  ⚠️ **观测面（2026-10-05 订正）**：本机**已装** DSH 2.0；19 场真实会话中
+ *  `form='relay'` 从未出现（270 条 `user/message` 实测无 relay），即**真实出现
+ *  仍未观测**。故同样取「字段在场且取值匹配才拦」；source 缺失/非对象 → false。
  *
- *  与既有 `kind !== 'user'` 判据的关系：类型面下 `kind='plugin'` 的中继**本就被**
- *  那条拦掉；本判据放在它**之前**，是为了 ① 不把委派判定押在 `source.kind` 单点上、
- *  ② 覆盖「生产者把中继标成 `kind='user'` 且带 form」这一类型面之外的形态——子会话
- *  的**首轮用户提示**就可能是这种：它与真人输入在 `kind` 上不可分，只有会话级判据
- *  （或这里的 form）能拦。 */
+ *  与既有 `kind !== 'user'` 判据的关系：`kind` 非 `'user'` 的中继**本就被**那条拦掉
+ *  （19 场实测的注入类 kind 均非 `'user'`）；本判据放在它**之前**，是为了
+ *  ① 不把委派判定押在 `source.kind` 单点上、② 覆盖「生产者把中继标成
+ *  `kind='user'` 且带 form」这一类型面之外的形态——子会话的**首轮用户提示**就可能
+ *  是这种：它与真人输入在 `kind` 上不可分，只有会话级判据（或这里的 form）能拦。 */
 function isRelayedMessage(source: unknown): boolean {
   const s = source as { form?: unknown } | null | undefined
   return !!s && typeof s === 'object' && s.form === 'relay'
@@ -368,19 +486,103 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
   }
   const graph = mdcg
 
-  /** 最近一次观测到的宿主会话标识（见 sessionIdOf；空串 = 未知/无会话）。 */
-  let lastSession = ''
   /** 最近一次真实用户消息（脱敏后，截断 300 字）；knowledge 召回查询词来源。 */
   let lastUserMsg = ''
+  /** 落盘审计（issue #56，诊断面）：三处过滤分支与写入/跳过路径各留一道**盘面**
+   *  痕迹——宿主 logger 不落盘时，单看记忆侧无法区分「被设计滤除」与
+   *  「写入失败/漏记」。审计失败静默降级（见 src/lib/hook_audit.ts），
+   *  绝不冒泡进记忆路径、不改任何写入/过滤判定。 */
+  const audit = new HookAuditRecorder(opts.auditPath)
 
-  /** 记忆沉淀（fire-and-forget）。认知图未就绪则跳过并告警（不退回 AEIS）。 */
-  const memorize = (label: string, run: (g: MdcgClient) => Promise<unknown>): void => {
+  // ── 短期会话窗口（contextWindow）：与知识面写入**独立成轨**（见文件头）──
+  // 缺省开启（{ enabled: true, turns: 10 }）；enabled=false → 写侧与注入侧
+  // **同时静默**。turns = 窗口取数条数（session_recall 的 recent_limit 语义是
+  // **条**不是轮）；clamp 到 1~50（与既有 recallLimit 同款纪律，防配置失手）。
+  const cw = opts.contextWindow ?? { enabled: true, turns: 10 }
+  const cwEnabled = cw.enabled !== false
+  const cwTurns = Math.max(1, Math.min(50, Math.floor(cw.turns || 10)))
+
+  /** 窗口条目判定（contextWindow 写侧）：这条事件是否值得进「近期对话」窗口。
+   *  返回 null = 不写。
+   *
+   *  过滤面与知识面**同源**（复用同一组谓词函数，故两处口径不会各自漂移）：
+   *    · user/message：`form==='relay'`（H1 消息级）与 `kind!=='user'`（插件注入 /
+   *      系统上下文）不写——与自动记忆同一判定；有文本才写；
+   *    · assistant/message：有文本即写；
+   *    · 其它事件类型（tool/result 等）：一律不写（窗口是**对话**记录）。
+   *
+   *  ⚠️ 两处**有意不同门**（这是设计，不是遗漏）：本判定**不看**
+   *  `opts.userMessage` / `opts.assistantMessage`——那两个开关管知识面（消息沉淀
+   *  成记忆节点），本机制由 `contextWindow.enabled` 管（运行态窗口）。若把窗口写
+   *  也挂到那两个开关上，使用者既有的 `userMessage=false` 就会连带关掉窗口，
+   *  「知识面关、窗口开」的独立轨道即不成立（两轨关系见文件头）。
+   *
+   *  ⚠️ 子代理会话（H1 会话级）由调用点**更早**拦回（在取 sid 之前），不在此重判
+   *  ——与自动记忆同口径：委派指令不进真人窗口。 */
+  const windowEntry = (event: SessionEvent): { role: 'user' | 'assistant'; text: string } | null => {
+    if (event.type === 'user/message') {
+      if (isRelayedMessage(event.data.source)) return null
+      if (event.data.source?.kind !== 'user') return null
+      const text = extractText(event.data.content)
+      return text ? { role: 'user', text } : null
+    }
+    if (event.type === 'assistant/message') {
+      const text = extractText(event.data.message.content)
+      return text ? { role: 'assistant', text } : null
+    }
+    return null
+  }
+
+  /** 窗口写入（fire-and-forget）：失败只记 warn，**绝不炸会话流**（沿 memorize
+   *  的 catch 风格）。桥未就绪静默跳过（窗口是运行态面，不阻塞对话；「未就绪」
+   *  的告警已由 memorize 路径负责，不在此重复刷屏）。
+   *
+   *  ⚠️ 同步抛出也必须被吞（catch 两段）：真实部署下 graph 是 MdcgClient 全量
+   *  实现；但桥替换实现 / 降级替身缺该方法时，抛错同样不得越过会话流边界。 */
+  const noteRecent = (role: 'user' | 'assistant', text: string,
+                      meta: Record<string, unknown>): void => {
+    if (!graph.isReady()) return
+    try {
+      void graph.recentAdd(role, text, meta, ['dsh', 'recent-window'])
+        .catch((err: Error) => ctx.logger.warn(`dsh-memory: 短期窗口写入失败: ${err.message}`))
+    } catch (err) {
+      ctx.logger.warn(`dsh-memory: 短期窗口写入失败: ${(err as Error).message}`)
+    }
+  }
+
+  /** 本实例是否曾观测到会话（B 治本批）。
+   *
+   *  会话状态本体是**进程级单点**（lib/session_state.ts；hooks 面观测、工具面
+   *  src/tools.ts 的写归因注入共用）；而「本实例有没有观测过」是**实例级**事实：
+   *  多实例并存时（测试；或宿主重装钩子），不得让**别的实例**的观测替本实例决定
+   *  召回过滤——否则新装的钩子在尚未观测到会话时就按别的实例的会话去读
+   *  （读错会话，正是 P45 会话隔离要防的形态）。真机单实例下两者等价：首个
+   *  session/event 之前模块状态为空，之后回落值恒为同一单点值。
+   *
+   *  ⚠️ 这是**经 owner 裁定的契约字面偏离（dwfq-7b3a555e-1）**：契约给的形态是
+   *  下方回落处直接 `|| currentSession()`（无本门）；但字面形态与硬边界
+   *  「test/session-attribution.test.ts 逐字未动且全绿」互斥——该守卫 ② 以
+   *  「新建 harness = 未观测」为前提，字面回落会读成前一实例的 sess_B。裁定
+   *  接受本门，两条理由：① 保留原闭包变量「新实例 = 干净状态」的**有意**语义
+   *  （新装钩子未观测时不加召回过滤）；② 冻结守卫零误伤。真机单实例与字面
+   *  **逐位等价**（差异窗口「本实例未观测 ∧ 模块单点非空」单实例下不可达；
+   *  HMR 重载时新实例回落 '' 属更保守行为）。 */
+  let observedSession = false
+
+  /** 记忆沉淀（fire-and-forget）。认知图未就绪则跳过并告警（不退回 AEIS）。
+   *  `role`=null 表示**读预热**（user-recall）——审计只统计写入路径，
+   *  故读预热不参与 written/skipped 计数（它不写记忆）。 */
+  const memorize = (label: string, role: HookWriteRole | null, run: (g: MdcgClient) => Promise<unknown>): void => {
     if (!graph.isReady()) {
+      if (role) audit.skipped('not_ready', role)
       ctx.logger.warn(`dsh-memory: 认知图未就绪，跳过自动记忆（${label}）`)
       return
     }
-    void run(graph).catch((err: Error) =>
-      ctx.logger.warn(`dsh-memory: 自动记忆 ${label} 失败: ${err.message}`))
+    if (role) audit.written(role)
+    void run(graph).catch((err: Error) => {
+      if (role) audit.skipped('failed', role)
+      ctx.logger.warn(`dsh-memory: 自动记忆 ${label} 失败: ${err.message}`)
+    })
   }
 
   // P1 完善（GPT 审查·自动记忆脱敏）：写入前过滤敏感信息（默认开启）。
@@ -425,7 +627,13 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
           // 想读**所有**会话做了什么：别走自动召回（它会串台），显式调
           // `stg(op=timeline, session="*")`，返回项带 session 归属。
           const hostCtx = (_ctx as unknown) as { agent?: { session?: unknown } } | undefined
-          const sid = sessionIdOf(hostCtx?.agent?.session) || lastSession
+          // 回落 = **本实例观测门 × 模块单点值**（裁定项 dwfq-7b3a555e-1，见上方
+          // observedSession 注释）：本实例尚未观测 → 回落 ''（保持「新实例 =
+          // 干净状态」，与 test/session-attribution.test.ts ② 的「未观测 → 不加
+          // 过滤」相容）；已观测 → 取 lib/session_state.ts 的进程级单点值。
+          // 真机单实例下两者逐位等价（差异窗口不可达）。
+          const sid = sessionIdOf(hostCtx?.agent?.session)
+            || (observedSession ? currentSession() : '')
           const text = formatTimelineDecayed(
             await graph.timeline(recallLimit, sid ? { session: sid } : {}))
             .replace(/\uFFFD/g, '')
@@ -533,6 +741,30 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
               }
             } catch (e: any) { ctx.logger.warn(`dsh-memory: knowledge-recall 失败: ${e.message}`) }
           }
+
+          // ── 独立第二块：「【本会话近期对话】」（contextWindow 注入面）──
+          // 与上方 timeline 块**块名/取数/开关各自独立**（既有块一字未动）。
+          // 稳定性口径与既有块同等：**每步都 push**（内容随新轮增长属预期——
+          // 宿主对内容变化追加快照的既有行为不变；窗口不变时两块逐字节相同）。
+          // fail-soft：取数/渲染失败 → 静默、不 push 第二块，绝不抛——且因
+          // 上方既有块已先 push，本块的失败**不影响**既有块（反之亦然）。
+          // 门控 = 注入面总开关 autoRecall（本 handler 的注册条件）× 本机制开关
+          // contextWindow.enabled。
+          if (cwEnabled) {
+            try {
+              const win = await graph.sessionRecall(sid, cwTurns, WINDOW_BUDGET_TOKENS)
+              const winText = formatSessionWindow(win, cwTurns)
+              if (winText) {
+                // 注入边界同规（文件头硬约束）：不可信内容边界 + `{{` 转义，
+                // 都只改注入副本——窗口原文在库内保真。
+                assembly.contexts.push({
+                  name: 'lingshu:session-window',
+                  text: escapePromptBraces(renderUntrustedMemoryBlock(
+                    `【本会话近期对话】\n${winText}`)),
+                })
+              }
+            } catch { /* 静默：窗口取数失败不影响请求，也不影响既有块 */ }
+          }
         }
       }
       catch { /* 静默：召回失败不影响请求 */ }
@@ -542,23 +774,34 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
 
   ctx.on('session/event', (session, event: SessionEvent) => {
     // H1（2026-09-30）**会话级**判据：子代理/委派子会话的自动记忆**整条会话**拦掉。
-    // 位置在取 sid **之前**——子代理会话不得污染 lastSession，否则顶层会话的自动
-    // 召回会拿子代理的 session 去读（读错会话）。字段缺失即不拦，见 isSubagentSession。
+    // 位置在取 sid **之前**——子代理会话不得污染会话状态（lib/session_state.ts
+    // 单点），否则顶层会话的自动召回会拿子代理的 session 去读（读错会话）。
+    // 字段缺失即不拦，见 isSubagentSession。
     if (isSubagentSession(session)) {
       ctx.logger.info('dsh-memory: 子代理会话的自动记忆被拦（H1：header.origin/delegationDepth）')
+      audit.filtered('subagent')
       return
     }
     // 会话归属（P45）：记忆写入必须带会话身份，用来区分不同会话的记忆。
     // 空串 = 宿主未给出会话标识 → **显式标注 unassigned**（H2③：不落内核的进程级
-    // 随机 sess_*，也不编造宿主会话 id——见 UNASSIGNED_SESSION 的注释）。
+    // 随机 sess_*，也不编造宿主会话 id——见 lib/session_state.ts 的常量注释）。
     const sid = sessionIdOf(session)
-    if (sid) lastSession = sid
+    // 观测即记录（B 治本批）：注入单点在 lib/session_state.ts——工具面
+    // （src/tools.ts 的写归因转发）读同一个状态；位置不动（H1 子代理闸之后）。
+    if (sid) {
+      noteSession(sid)
+      observedSession = true
+    }
     const sessionTag = sid ? { session: sid } : { session: UNASSIGNED_SESSION }
     if (event.type === 'user/message' && opts.userMessage) {
+      // 落盘审计（issue #56）：source.kind 分布——先于两级判据记录**完整**输入分布
+      // （含被滤与放行），「宿主到底给这条消息标了什么 kind」是排障第一问。
+      audit.observeKind(kindOf(event.data.source))
       // H1 **消息级**判据：委派/中继消息（`form: 'relay'` 语义＝「另一个 agent
       // 发给本 agent 的消息」）不写。先于 kind 判据，理由见 isRelayedMessage 注释。
       if (isRelayedMessage(event.data.source)) {
         ctx.logger.info('dsh-memory: 委派/中继消息的自动记忆被拦（H1：source.form=relay）')
+        audit.filtered('relay', kindOf(event.data.source))
         return
       }
       // 只记真实用户输入（kind='user'），跳过插件注入/系统上下文
@@ -566,14 +809,15 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
         // T4 诊断（2026-08-30）：dsh 端对话零写入排查——记录被滤事件的实际
         // source.kind（若 dsh 新版改了 kind 值，此处日志可定位）
         ctx.logger.info(`dsh-memory: user/message 事件被滤（source.kind=${event.data.source?.kind ?? 'undefined'}）`)
+        audit.filtered('kind', kindOf(event.data.source))
         return
       }
       const text = extractText(event.data.content)
       if (!text) return
       const safe = sanitize(text)  // 脱敏：纯凭据消息 → null → 跳过写入
-      if (safe === null) return
+      if (safe === null) { audit.skipped('sanitized', 'user'); return }
       lastUserMsg = safe.slice(0, 300) // 缓存最近用户消息供 knowledge 召回使用
-      memorize('user', (g) => g.remember(safe, {
+      memorize('user', 'user', (g) => g.remember(safe, {
         role: 'user', tags: ['dsh', 'user'], importance: opts.importance,
         ...sessionTag,
       }))
@@ -589,13 +833,13 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       // 改 mdcg_client.ts（本件放行面之外），故在调用点改走等价出口。
       // 带上它不构成越权：cg 读路径的 session 是**归因/视图**维度，不参与任何授权
       // （issue #35 定稿「身份不可自报」，见 md_cg/mdcos.py 的 _candidates）。
-      memorize('user-recall', (g) => g.read(safe.slice(0, 200), { k: 3, ...sessionTag }))
+      memorize('user-recall', null, (g) => g.read(safe.slice(0, 200), { k: 3, ...sessionTag }))
     } else if (event.type === 'assistant/message' && opts.assistantMessage) {
       const text = extractText(event.data.message.content)
       if (!text) return
       const safe = sanitize(text)
-      if (safe === null) return
-      memorize('assistant', (g) => g.remember(safe, {
+      if (safe === null) { audit.skipped('sanitized', 'assistant'); return }
+      memorize('assistant', 'assistant', (g) => g.remember(safe, {
         role: 'assistant', tags: ['dsh', 'assistant'], importance: opts.importance * 0.8,
         ...sessionTag,
       }))
@@ -604,11 +848,27 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       const text = extractText(event.data.message.content)
       if (!text) return
       const safe = sanitize(text)
-      if (safe === null) return
-      memorize('tool', (g) => g.remember(safe, {
+      if (safe === null) { audit.skipped('sanitized', 'tool'); return }
+      memorize('tool', 'tool', (g) => g.remember(safe, {
         role: 'tool-output', tags: ['dsh', 'tool'], importance: opts.importance * 0.6,
         ...sessionTag,
       }))
+    }
+
+    // ── 短期窗口写侧（contextWindow）：与上方知识面写入**独立成轨** ──
+    // 位置在既有分支链**之外**：不受 opts.userMessage / opts.assistantMessage
+    // 门控（那两个开关管知识面；本机制由 contextWindow.enabled 管——两轨关系
+    // 见文件头与 windowEntry 注释）。
+    // 过滤面与知识面同源：H1 会话级（子代理整条会话）已在函数首拦回；此处经
+    // windowEntry 复用同一组谓词（relay / kind），再经**同一个** sanitize 脱敏
+    // ——纯凭据消息（sanitize 返回 null）同样不写（不把明文凭据引进窗口）。
+    // 失败只记 warn（noteRecent），绝不冒泡进会话流。
+    if (cwEnabled) {
+      const entry = windowEntry(event)
+      if (entry) {
+        const safe = sanitize(entry.text)
+        if (safe !== null) noteRecent(entry.role, safe, { ...sessionTag })
+      }
     }
   })
 }

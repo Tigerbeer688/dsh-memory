@@ -92,6 +92,7 @@ FUNC_DESC: dict[tuple[str, str], str] = {
     ("cg", "goal"): "目标（写入 / 状态 / 清单）",
     ("cg", "task"): "任务实体（登记 / 计划 / 状态 / 结果；done 无结果拒收）",
     ("cg", "recent"): "最近记忆（事件窗口）",
+    ("cg", "state_event"): "状态事件记账（追加五元事件；查询走 stg(state_chain)）",
     ("cg", "verify"): "外部裁决回填（节点证据验证）",
     ("cg", "review"): "审核队列（DEFER / 提案裁决）",
     ("cg", "forget"): "主动遗忘 / 恢复",
@@ -120,6 +121,7 @@ FUNC_DESC: dict[tuple[str, str], str] = {
     ("stg", "timeline"): "时间线",
     ("stg", "anchors"): "锚点检索（时空窗口）",
     ("stg", "consistency"): "时空一致性",
+    ("stg", "state_chain"): "状态槽位投影（现值 / 区间 / 变迁史）",
     ("whitebox", "ask"): "白箱问答",
     ("whitebox", "remember"): "白箱编码（知识写入能力库）",
     ("whitebox", "verify_encoding"): "验证编码能力（写入口令→追问命中）",
@@ -542,10 +544,10 @@ def _check_doc(e: dict, dname: str, text: str, sections: list[tuple[str, str, st
                 )
 
     # 2) op / 工具名引用 ⊆ 真源
-    valid_ops = set(e["cg_ops"]) | set(e["stg_ops"])
-    for op in sorted(set(_CG_OP_RE.findall(text)) - valid_ops):
+    #    按基元各用各集合——并集同服两循环会让 cg(op=仅stg)/stg(op=仅cg) 跨基元误引零报错通过
+    for op in sorted(set(_CG_OP_RE.findall(text)) - set(e["cg_ops"])):
         errors.append(f"{dname} 引用了不存在的 cg op：cg(op={op})")
-    for op in sorted(set(_STG_OP_RE.findall(text)) - valid_ops):
+    for op in sorted(set(_STG_OP_RE.findall(text)) - set(e["stg_ops"])):
         errors.append(f"{dname} 引用了不存在的 stg op：stg(op={op})")
     valid_names = set(e["mdcg_tools"]) | set(NAME_ALLOWLIST)
     for name in sorted(set(_MDCG_RE.findall(text)) - valid_names):

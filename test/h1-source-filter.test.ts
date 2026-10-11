@@ -10,12 +10,17 @@
  *   · 消息级：`source.form === 'relay'`（「另一个 agent 发给本 agent 的消息」）
  *     ⇒ 该条不写。
  *
- * ⚠️ **未验证项（如实标注，不要把本文件读成「已验证委派会被拦住」）**：
- *   本机未装 DSH harness，**真实宿主是否真给子代理子会话写 origin / delegationDepth**、
- *   **委派消息是否真带 form: 'relay'**，这两点**只在 DSH 类型面成立**
- *   （dsh-session/lib/types/types.d.ts:64,70；dsh-llm/lib/types/message.d.ts:52），
- *   未在真实会话事件上观测过。本守卫证明的是「判据在场即拦、缺失即不拦」这一
- *   可机械判定的性质，**不是**「真实委派一定被拦住」。
+ * ⚠️ **观测面（2026-10-05 订正，不要把本文件读成「已验证委派会被拦住」）**：
+ *   本机**已装** DSH 2.0（`dsh-0.2.0-rc.2`；profile `web` 内已装
+ *   `@furongjun1999/dsh-memory` 0.7.2）；接口面已按实装包复核
+ *   （dsh-session/lib/types/types.d.ts:81,87；dsh-llm/lib/types/message.d.ts:56,90；
+ *   本仓 devDeps 0.1.0-rc.8 同字段为 :64,70 / :52），真实会话事件面亦已观测
+ *   （19 场：会话头 delegationDepth=0 19/19 真实在写；270 条 user/message 的
+ *   source.kind 分布 = user 80／roleplay-tasks 82／roleplay-context 72／
+ *   runtime-context 19／skill-catalog 14／user-approval 2／goal 1，注入类均非 'user'、
+ *   被既有 kind !== 'user' 判据设计滤除）。**仍未观测**的是 origin='subagent' /
+ *   delegationDepth>0 / form='relay' 的真实出现。本守卫证明的是「判据在场即拦、
+ *   缺失即不拦」这一可机械判定的性质，**不是**「真实委派一定被拦住」。
  *
  * 被守卫的不变量
  * --------------
@@ -28,6 +33,8 @@
  */
 import { test } from 'node:test'
 import assert from 'node:assert/strict'
+import { tmpdir } from 'node:os'
+import { join } from 'node:path'
 import { installMemoryHooks, type MemoryHooksOptions } from '../src/hooks.ts'
 
 interface Assembly {
@@ -80,6 +87,9 @@ function makeHarness(graph: object, overrides: Partial<MemoryHooksOptions> = {})
   installMemoryHooks(ctx as never, graph as never, {
     userMessage: true, assistantMessage: true, toolResult: true,
     importance: 0.6, autoRecall: true, autoRecallLimit: 4, desensitize: false,
+    // 落盘审计（issue #56）指向临时目录：本文件不测审计面，但**绝不得写真实 ~/.dsh**
+    // （本文件的会话事件会触发审计记录，缺省路径是用户家目录）。
+    auditPath: join(tmpdir(), 'dsh-hook-audit-h1.json'),
     ...overrides,
   })
   const assemble = async (hostCtx: unknown): Promise<Assembly> => {
