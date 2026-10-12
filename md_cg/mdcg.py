@@ -392,7 +392,7 @@ CN_STOP_GRAMS = {
 }
 
 
-# 生效条件：当 query 非空且环境变量 MDCG_CN_GRAMS 不为 "0" 时，对 query 中长度 ≥ max(min_run,2) 的连续中文串切 2-gram，去重且排除 CN_STOP_GRAMS，最多 cap 个返回；MDCG_CN_GRAMS=="0" 或 query 为假值时返回 []（cap<=0 仍会 append 后立即返回首个 gram）。
+# 生效条件：当 query 非空且环境变量 MDCG_CN_GRAMS 不为 "0" 时，对 query 中长度 ≥ max(min_run,2) 的连续中文串切 2-gram，去重且排除 CN_STOP_GRAMS；cap 为 None 时**不限**（返回全部 gram），cap<=0 时逐位保留旧行为（append 后立即返回首个 gram——注意 cap=0 **不是**「不限」）；否则各段 gram 总数 ≤ cap 时按段序拼接返回（与旧实现逐位相同），超过 cap 时**跨段轮转**取键（各段按比例进入召回面，长查询的末尾段不再恒为 0），最多返回 cap 个。
 def cn_recall_grams(query: str, min_run: int = 4, cap: int = 16) -> list:
     """构词法 v1 · 中文召回扩展：把连续中文串切成 2-gram 作为额外召回键。
 
@@ -402,18 +402,47 @@ def cn_recall_grams(query: str, min_run: int = 4, cap: int = 16) -> list:
 
     约束：只扩召回，不改打分口径（bigrams(q) 的 _score 不变）；纯标准库，零依赖；
     仅当中文连续串 ≥ min_run 字时触发（短词本身已是召回词，无需扩展）。
+
+    #108（2026-10-10）· **预算分配**：旧实现对每段 gram 顺次 append，一旦
+    len(out) >= cap 就整函数返回 ⇒ 长查询（题卡式「两段以换行拼接」）只有
+    **开头段**进入召回键。实测 64 字 + 12 字两段查询：cap=16 时全查询 gram
+    覆盖 0.218、**末段覆盖 0.000**；cap=32 仍 0.000；cap=64 为 0.159。现改为
+    预算不足时**跨段轮转**（段内保序），使末段按比例进入召回面（同例 cap=16 时
+    末段覆盖 0.727）。预算够时**逐位同旧**（短查询零差异）。cap=None 是「不限」的
+    显式表示（返回全部 gram，覆盖率 1.000；代价是 LIKE 召回词数增多、候选面变大，
+    由调用方/评测按需选用）。cap<=0 逐位保留旧行为（cap=0 不是「不限」）。
     """
     if os.environ.get("MDCG_CN_GRAMS") == "0":   # A/B 开关：关闭即回退旧行为
         return []
-    out = []
+    # 先按段收集（段内保序、跨段全局去重）——去重/停用词语义与旧实现逐位一致。
+    runs, seen = [], set()
     for run in re.findall(r"[\u4e00-\u9fff]{%d,}" % max(min_run, 2), query or ""):
+        grams = []
         for i in range(len(run) - 1):
             g = run[i:i + 2]
-            if g in CN_STOP_GRAMS or g in out:
+            if g in CN_STOP_GRAMS or g in seen:
                 continue
-            out.append(g)
-            if len(out) >= cap:
-                return out
+            seen.add(g)
+            grams.append(g)
+        if grams:
+            runs.append(grams)
+    if cap is not None and cap <= 0:     # 旧行为逐位保留（cap=0 不是「不限」）
+        return [runs[0][0]] if runs else []
+    total = sum(len(r) for r in runs)
+    if cap is None or total <= cap:      # 预算够：段序拼接（与旧实现逐位相同）
+        return [g for r in runs for g in r]
+    out, depth = [], 0                   # 预算不足：跨段轮转（各段按比例）
+    while len(out) < cap:
+        moved = False
+        for r in runs:
+            if depth < len(r):
+                out.append(r[depth])
+                moved = True
+                if len(out) >= cap:
+                    break
+        if not moved:
+            break
+        depth += 1
     return out
 
 
@@ -565,7 +594,12 @@ EXACT_MIN_LEN = 2
 
 
 # 生效条件：q 与 content 去全部空白后，q 长度 >= EXACT_MIN_LEN 且作为**连续子串**出现在 content 中 -> 返回 1，否则 0（假值按 "" 处理）。
-def exact_hit_of(q: str, content: str) -> int:
+def compact_exact_text(text: str) -> str:
+    """The existing exact-match whitespace normalization, without case folding."""
+    return re.sub(r"\s+", "", text or "")
+
+
+def exact_hit_of(q: str, content: str, *, _prepared=None) -> int:
     """整串精确命中（0/1）——**分数之外的次级排序键**（issue #89①）。
 
     缺陷（本端实测复现，2026-10-09）：打分走 bigram 覆盖度，**连续整串**与
@@ -582,10 +616,13 @@ def exact_hit_of(q: str, content: str) -> int:
     取首位、MCP 三处把 score 透给调用方），改 cap 或让分数越过 1.0 会破契约；
     本判据只加 0/1 标记，**分数与阈值语义一字不动**。
     """
-    _q = re.sub(r"\s+", "", q or "")
+    # Only the scoring loop supplies prepared texts. The public two-argument
+    # entry keeps normalizing its own inputs and uses the same predicate.
+    _q = compact_exact_text(q) if _prepared is None else _prepared[0]
     if len(_q) < EXACT_MIN_LEN:
         return 0
-    return 1 if _q in re.sub(r"\s+", "", content or "") else 0
+    body = compact_exact_text(content) if _prepared is None else _prepared[1]
+    return 1 if _q in body else 0
 
 
 # 负条件判据的词长下限（批次76）：空白切词会把中文句子里夹的裸标识符切成独立词、
@@ -3553,6 +3590,18 @@ class MdCG:
         """
         return nodefile.positive_body(content)
 
+    def _like_body_lower(self, entry, content):
+        """Lowercase positive body; readcache reuses this pure projection."""
+        return self._positive_body(entry, content).lower()
+
+    def _doc_exact_text(self, entry, content):
+        """Whitespace-free full content for the existing exact-hit tie break.
+
+        Readcache wraps this document-only projection with its existing dirty
+        generations. Query normalization stays local to each scoring call.
+        """
+        return compact_exact_text(content)
+
     # ---------- 资格判定（与性能 tier 正交）----------
 
     @staticmethod
@@ -4009,7 +4058,8 @@ class MdCG:
                         if self._like(d[2], d[1], terms,
                                       index_key_hits(d[0], terms, q),
                                       entry=d[0],
-                                      positive_body=self._positive_body)
+                                      positive_body=self._positive_body,
+                                      body_lower=self._like_body_lower)
                         or (semantic_on() and d[1].get("semantic"))]
                 out = try_stage(hits, TIER_BUCKET_LIKE)
                 if out:
@@ -4038,7 +4088,8 @@ class MdCG:
                       if self._like(d[2], d[1], terms,
                                     index_key_hits(d[0], terms, q),
                                     entry=d[0],
-                                    positive_body=self._positive_body)
+                                    positive_body=self._positive_body,
+                                    body_lower=self._like_body_lower)
                       or (semantic_on() and d[1].get("semantic"))
                       or d[0].get("path") in _dif]     # 图扩散补召回：无词面命中也放行进打分
             stat["pre_cap"] = len(hits_r)     # 与 T2 同序：截断**前**的候选数
@@ -4143,7 +4194,8 @@ class MdCG:
                 if self._like(d[2], d[1], terms,
                               index_key_hits(d[0], terms, q),
                               entry=d[0],
-                              positive_body=self._positive_body)
+                              positive_body=self._positive_body,
+                              body_lower=self._like_body_lower)
                 or (semantic_on() and d[1].get("semantic"))]
         # ---- S3 图扩散激活（契约 §3 S3；flag 控，默认关）----
         # 为何：审计偏差 1 曾成立——「edges 一直只被写入、检索从不使用」。**该偏差
@@ -4291,7 +4343,8 @@ class MdCG:
 
     @staticmethod
 # 生效条件：terms 为空时返回 False；否则任一 t 在 body 的小写串中出现（body 取自 positive_body 钩子——透传绑定方法时走 readcache 缓存版，未传时回落 nodefile.positive_body(content) 直调，两者同值），或该 t 的小写形式出现在 fm 的 tags（tags 取自 fm.get("tags") or []，缺键或假值按空列表拼接）小写串中，或 index_keys 为真值（六要素后两行的索引键命中，见 index_key_hits）即返回 True。
-    def _like(content, fm, terms, index_keys=None, entry=None, positive_body=None):
+    def _like(content, fm, terms, index_keys=None, entry=None, positive_body=None,
+              body_lower=None):
         # 负条件行（`# 不适用条件：`）是反例声明，不作召回键：命中它只应由
         # judge_qualification 走 REJECT，不能把节点召回。tags 仍参与匹配。
         #
@@ -4310,12 +4363,12 @@ class MdCG:
         if index_keys and index_keys.get("hit"):
             return True
         tags = " ".join(str(t) for t in (fm.get("tags") or []))
-        if positive_body is not None:
-            body = positive_body(entry, content)
+        if body_lower is not None:
+            body_l = body_lower(entry, content)
         else:
-            body = nodefile.positive_body(content)
-        # 双边小写化：英文大小写统一（中文无大小写不受影响）
-        body_l = body.lower()
+            body = (positive_body(entry, content) if positive_body is not None
+                    else nodefile.positive_body(content))
+            body_l = body.lower()
         tags_l = tags.lower()
         return any(t in body_l or t.lower() in tags_l for t in terms)
 
@@ -4351,6 +4404,7 @@ class MdCG:
         _fr_on = freshness.enabled()
         _fr_now = freshness.freshness_now() if _fr_on else None
         _fr_gamma = freshness.resolve_gamma(None) if _fr_on else None
+        _exact_q = compact_exact_text(q)
         scored = []
         for e, fm, c in docs:
             # 归一化 content 后取 bigram（与 query 侧 normalize_en 对称）；
@@ -4386,7 +4440,9 @@ class MdCG:
                             "content": c, "path": e["path"],
                             # issue #89①：精确命中标记随 doc 携带，供排序键消费；
                             # _emit 出口剥离（内部键，不透出）。
-                            EXACT_HIT_KEY: exact_hit_of(q, c)}, raw))
+                            EXACT_HIT_KEY: exact_hit_of(q, c, _prepared=(
+                                _exact_q, self._doc_exact_text(e, c)
+                                if len(_exact_q) >= EXACT_MIN_LEN else ""))}, raw))
         return scored
 
 

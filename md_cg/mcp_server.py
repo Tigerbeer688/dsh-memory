@@ -214,6 +214,7 @@ TOOLS = [
                           k=_p("integer", "候选上限"), context=_p("object", "当前情境条件空间"),
                           include_work=_p("boolean", "是否含工具输出/命令/编辑（默认否）"),
                           fuzzy=_p("boolean", "启用第 5 路模糊召回（分级隶属度，默认否）"),
+                          bm25=_p("boolean", "用 BM25 倒排词频评分替换词法路（默认否；仍经可见性与门控）"),
                          semantic=_p("boolean", "启用第 6 路条件空间结构化匹配"
                                                "（白箱语义路：CCG 生效条件 + condition_space "
                                                "四槽，不适用条件命中即剔除；默认否）"),
@@ -857,6 +858,7 @@ KERNEL_TOOLS = [
                              "receipt（回执审计：命令与预期输出）；"
                              "非法值库层报错（fail-closed）"),
             budget_tokens=_p("integer", "read 的 token 预算"),
+            bm25=_p("boolean", "read：显式使用 BM25 倒排评分（默认否）"),
             evidence=_p("string", "verify 的证据；state_event：出处（五元之一，"
                                  "回指原文/轮次）"),
             verdict=_p("string", "verify 裁决：confirmed|weakened|falsified；"
@@ -2440,12 +2442,17 @@ def _cg_dispatch(cg, a):
                              include_recent=bool(a.get("include_recent")),
                              recent_limit=int(a.get("limit") or 10),
                              session=a.get("session"),
-                             validity=a.get("validity"), **_tkw)
+                             validity=a.get("validity"),
+                             **({"paths": ("bm25",)} if a.get("bm25") else {}), **_tkw)
         from . import refindex
-        res, meta = cg.search(q, layer=a.get("layer"), k=_int_arg(a, "k", 20),
-                              context=a.get("context"),
-                              session=a.get("session"),
-                              validity=a.get("validity"), **_tkw)
+        search_args = dict(layer=a.get("layer"), k=_int_arg(a, "k", 20),
+                           context=a.get("context"), session=a.get("session"),
+                           validity=a.get("validity"), **_tkw)
+        if a.get("bm25"):
+            ranked, meta = cg.search_rrf(q, paths=("bm25",), **search_args)
+            res = [(n, s, qual) for n, s, qual, _provenance in ranked]
+        else:
+            res, meta = cg.search(q, **search_args)
         return {"meta": meta, "results": [
             {"node": _node_view(n), "score": s, "state": q2.get("state"),
              "reason": q2.get("reason"), **refindex.ref_fields(n)}
@@ -3648,9 +3655,12 @@ def _dispatch(cg, name, args):
                     "action_name": _dec["action_name"],
                     "decision": _dec["decision"]}
             if _dec["decision"] == _am.FORBID:
+                # 同属 gate_short_circuit 形态（兜底拒绝分支）：补 verdict 键，
+                # 与出单分支同口径——直写面无校验闸，故取 None（不编造裁决）。
                 return {"ok": False, "id": nid, "committed": False,
                         "moved_to": "autonomy_forbidden",
                         "error": "autonomy_forbid", "autonomy": _aut,
+                        "verdict": None,
                         "hint": _dec["hint"]}
             _meta = {k: a[k] for k in
                      ("tags", "condition_space", "verification_basis",
@@ -3675,8 +3685,19 @@ def _dispatch(cg, name, args):
                                        layer=_layer,
                                        sensitivity=a.get("sensitivity"),
                                        info=True)
+            # 自治档位出单属 protocol.gate_short_circuit 形态：WRITE_TRIO +
+            # moved_to + verdict + hint。**verdict 键必在场**——直写面不跑校验闸
+            # （audit 在 gated 分支的链上），本路径**没有 audit 裁决可透出**，故取
+            # None。
+            # ★2026-10-12 设计者裁定（对 #109 题3(b) 的收束）：None 不是「编造裁决」，
+            # 而是**盲区声明**——「我们知道这里没填」。原裁定「硬补 verdict 等于编造
+            # 判据」的判断仍然成立（那说的是编造一个**有值**的裁决）；正因如此才需要
+            # 为「无法识别/未填」这件事**留一个显式标记**，而盲区就是为这种情况设计的。
+            # 形态见 protocol.VERB_SPECS["write"]["shapes"]["autonomy_ticket"]
+            # （required 含 verdict；None 的语义由 protocol.VERDICT_BLINDSPOT 声明）。
             return {"ok": True, "id": nid, "committed": False,
-                    "moved_to": "review_queue", "pid": _pr["pid"],
+                    "moved_to": "review_queue", "verdict": None,
+                    "pid": _pr["pid"],
                     "mutation": _pay, "autonomy": _aut,
                     "hint": "%s 本次未落盘：变更单已入审核队列（pid=%s，目标 %s）。"
                             % (_dec["hint"], _pr["pid"], nid)}
@@ -3698,9 +3719,26 @@ def _dispatch(cg, name, args):
                          derived_from=_split_ids(a.get("derived_from")),
                          relation=a.get("relation"))
         if written is None:
-            return {"ok": False, "id": nid, "verdict": "DEFER",
-                    "reason": "节点间冲突检测未通过（on_conflict=defer）"}
-        out = {"ok": True, "id": nid}
+            # 冲突 DEFER 同属 protocol.gate_short_circuit 形态：WRITE_TRIO +
+            # moved_to + verdict + hint。此前只有 ok/id/verdict/reason ⇒ 判 committed
+            # 的调用方读不到「未提交」，也读不到去向与下一步。
+            # 语义（mdcg.py:2192 生效条件 + :2319-2321）：on_conflict=defer 时
+            # REJECT/BLINDSPOT **既不落盘也不入队**——故去向**不可**写 review_queue，
+            # 用 conflict_deferred 表达「被冲突闸挡下、未进任何队列」。
+            # （去向词：2026-10-12 设计者裁定为 conflict_deferred。）
+            return {"ok": False, "id": nid, "committed": False,
+                    "moved_to": "conflict_deferred",
+                    "verdict": "DEFER",
+                    "reason": "节点间冲突检测未通过（on_conflict=defer）",
+                    "hint": "本次未落盘、未入队（defer 语义）：如需落盘请显式处置冲突——"
+                            "修正正文后重写 / on_conflict=reject 取明确拒绝 / "
+                            "override=true 覆写（需相应权限）"}
+        # issue #109 相邻面：工具面**同一返回体**在闸门短路分支给 committed=False，
+        # 成功分支此前却不给 committed ⇒ 判 committed 的调用方会把「成功」读成
+        # 「未提交」（与 #109 报的「把待审读成已提交」是同一处的两面）。
+        # 三键铁律（protocol.WRITE_TRIO / 协议文档 :28「任一形态必含 ok/id/committed」）
+        # 在此补齐：不改写入语义，只补判据键。
+        out = {"ok": True, "id": nid, "committed": True}
         if _prior is not None:
             out["overwrite_of"] = _prior
             out["overwrite_ratio"] = _prior_cov
@@ -3717,6 +3755,7 @@ def _dispatch(cg, name, args):
         return out
 
     if name == "mdcg_recall":
+        use_bm25 = bool(a.get("bm25"))
         use_fuzzy = bool(a.get("fuzzy"))
         use_semantic = bool(a.get("semantic"))
         use_goal = bool(a.get("goal_path") or a.get("goal"))
@@ -3728,9 +3767,9 @@ def _dispatch(cg, name, args):
         use_temporal = a.get("temporal")
         use_causal = True if use_causal is None else bool(use_causal)
         use_temporal = True if use_temporal is None else bool(use_temporal)
-        if (use_fuzzy or use_semantic or use_goal
+        if (use_bm25 or use_fuzzy or use_semantic or use_goal
                 or not use_causal or not use_temporal):
-            paths = ["lexical", "bucket", "entity", "graph"]
+            paths = ["bm25" if use_bm25 else "lexical", "bucket", "entity", "graph"]
             if use_fuzzy:
                 paths.append("fuzzy")
             if use_semantic:

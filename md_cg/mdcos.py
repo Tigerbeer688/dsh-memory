@@ -142,6 +142,11 @@ def temporal_gamma(environ=None) -> float:
     return math.log(2.0) / float(DECAY_DAYS)
 
 
+def _tokens_from_counts(cjk: int, other: int) -> int:
+    """Shared nonempty-text estimate, preserving the existing float formula."""
+    return int(cjk * 0.6 + other / 4) + 1
+
+
 # 生效条件：text 为假值（None/空串）时返回 0，否则按「CJK 0.6/字 + 其余 /4」计算并返回 int(cjk*0.6 + other/4) + 1。
 def est_tokens(text: str) -> int:
     """确定性 token 估算：CJK 0.6/字 + 其余 /4（与白箱 adapter 口径一致）。"""
@@ -150,7 +155,7 @@ def est_tokens(text: str) -> int:
     cjk = sum(1 for ch in text if 0x4e00 <= ord(ch) <= 0x9fff
               or 0x3040 <= ord(ch) <= 0x30ff)
     other = len(text) - cjk
-    return int(cjk * 0.6 + other / 4) + 1
+    return _tokens_from_counts(cjk, other)
 
 
 # 生效条件：text 非空且 max_tokens > 0 时返回 est_tokens 口径 ≤ max_tokens 的摘录，text 为空或 max_tokens ≤ 0 时返回空串 ''，est_tokens(text) ≤ max_tokens 时原样返回 text。
@@ -159,28 +164,28 @@ def excerpt_tokens(text: str, max_tokens: int) -> str:
 
     定义在模块级而非类内：它被 MdCGOS.recall 的装包循环调用，放在任一类的内部
     都可能让另一处拿不到（同类错误曾导致 AttributeError）。
-    预算含省略号本身（"…" 也是 CJK 字符，会被计费），因此先扣除其开销再取正文，
-    保证返回值的 est_tokens 严格 ≤ max_tokens。
+    预算按「正文前缀 + 省略号」整体估算，保留能够容纳的最长前缀。
+    省略号属于其余字符；整体估算中的固定 +1 只计一次。
     """
     if not text or max_tokens <= 0:
         return ""
     if est_tokens(text) <= max_tokens:
         return text                      # 已足够小，原样返回（不放大）
     ellipsis = "…"
-    ell_cost = est_tokens(ellipsis)
-    body_budget = max_tokens - ell_cost
-    if body_budget <= 0:
-        return ellipsis if ell_cost <= max_tokens else ""
-    approx = min(len(text), max(1, int(body_budget / 0.6)))
-    while approx > 1 and est_tokens(text[:approx]) > body_budget:
-        approx -= max(1, approx // 10)   # 精确口径回退，步长随窗口收缩
-    keep = max(0, approx)
-    out = text[:keep].rstrip() + ellipsis
-    if est_tokens(out) > max_tokens:      # 兜底：仍超则继续收缩
-        while keep > 1 and est_tokens(text[:keep].rstrip() + ellipsis) > max_tokens:
-            keep -= max(1, keep // 10)
-        out = text[:keep].rstrip() + ellipsis
-    return out
+    cjk = other = keep = 0
+    for index, char in enumerate(text):
+        if 0x4e00 <= ord(char) <= 0x9fff or 0x3040 <= ord(char) <= 0x30ff:
+            cjk += 1
+        else:
+            other += 1
+        # rstrip removes trailing whitespace; an internal gap still counts
+        # when a later nonspace character is admitted.
+        if char.isspace():
+            continue
+        if _tokens_from_counts(cjk, other + 1) > max_tokens:
+            break
+        keep = index + 1
+    return text[:keep] + ellipsis
 
 
 # 生效条件：text 为可调用 .strip().encode("utf-8") 的字符串时，返回 hashlib.sha1(text.strip().encode("utf-8")).hexdigest()[:n]，n 默认 12 只决定摘要截取长度。
@@ -1087,7 +1092,8 @@ class MdCGOS(MdCG):
                         if self._like(d[2], d[1], terms,
                                       index_key_hits(d[0], terms, q),
                                       entry=d[0],
-                                      positive_body=self._positive_body)
+                                      positive_body=self._positive_body,
+                                      body_lower=self._like_body_lower)
                         or (semantic_on() and d[1].get("semantic"))]
                 out = try_stage(hits, TIER_BUCKET_LIKE)
                 if out:
@@ -1116,7 +1122,8 @@ class MdCGOS(MdCG):
                       if self._like(d[2], d[1], terms,
                                     index_key_hits(d[0], terms, q),
                                     entry=d[0],
-                                    positive_body=self._positive_body)
+                                    positive_body=self._positive_body,
+                                    body_lower=self._like_body_lower)
                       or (semantic_on() and d[1].get("semantic"))
                       or d[0].get("path") in _dif]     # 图扩散补召回：无词面命中也放行进打分
             stat["pre_cap"] = len(hits_r)     # 与 T2 同序：截断**前**的候选数
@@ -1152,7 +1159,8 @@ class MdCGOS(MdCG):
                 if self._like(d[2], d[1], terms,
                               index_key_hits(d[0], terms, q),
                               entry=d[0],
-                              positive_body=self._positive_body)
+                              positive_body=self._positive_body,
+                              body_lower=self._like_body_lower)
                 or (semantic_on() and d[1].get("semantic"))]
         stat["pre_cap"] = len(hits)
         stat["cap"] = GLOBAL_CAP
@@ -1206,7 +1214,8 @@ class MdCGOS(MdCG):
                 if self._like(d[2], d[1], terms,
                               index_key_hits(d[0], terms, query),
                               entry=d[0],
-                              positive_body=self._positive_body)
+                              positive_body=self._positive_body,
+                              body_lower=self._like_body_lower)
                 or (semantic_on() and d[1].get("semantic"))]
         if not hits:
             if entries is not full_entries:
@@ -1472,6 +1481,9 @@ class MdCGOS(MdCG):
             ctx_domain = routing.route_key(ctx, ctx.get("tags"))
         stat = {"scanned": 0}
         out = []
+        # Domain affinity depends on this query and the domain key, not on
+        # each document. Reuse it within this call; no cross-query cache.
+        domain_affinity = {}
         for e, fm, c in self._read_many(entries, stat):
             tags = " ".join(str(t) for t in (fm.get("tags") or []))
             # 负条件行不作召回键（反例命中应由 judge 走 REJECT，不该召回节点）。
@@ -1482,11 +1494,14 @@ class MdCGOS(MdCG):
             if cov <= 0.0:
                 continue
             e_dom = routing.route_key(None, e.get("tags"))
-            aff = 0.0
-            for d, s in top_domains:
-                aff = max(aff, routing.domain_similarity(e_dom, d) * (s / dom_total))
-            ctx_aff = (routing.domain_similarity(e_dom, ctx_domain)
-                       if ctx_domain else 0.0)
+            if e_dom not in domain_affinity:
+                aff = 0.0
+                for d, s in top_domains:
+                    aff = max(aff, routing.domain_similarity(e_dom, d) * (s / dom_total))
+                ctx_aff = (routing.domain_similarity(e_dom, ctx_domain)
+                           if ctx_domain else 0.0)
+                domain_affinity[e_dom] = (aff, ctx_aff)
+            aff, ctx_aff = domain_affinity[e_dom]
             score = min(1.0, 0.6 * cov + 0.3 * aff + 0.1 * ctx_aff)
             out.append(({"id": fm.get("id") or e["path"], "frontmatter": fm,
                          "content": c, "path": e["path"]}, round(score, 6)))
@@ -1570,6 +1585,7 @@ class MdCGOS(MdCG):
                              key=lambda kv: (-kv[1], str(kv[0])))[:3]
         stat = {"scanned": 0}
         out = []
+        domain_affinity = {}
         for e, fm, c in self._read_many(entries, stat):
             if e.get("layer") == "goals":
                 continue
@@ -1578,9 +1594,12 @@ class MdCGOS(MdCG):
             if cov <= 0.0:
                 continue
             e_dom = routing.route_key(None, e.get("tags"))
-            aff = 0.0
-            for d, s in top_domains:
-                aff = max(aff, routing.domain_similarity(e_dom, d) * (s / dom_total))
+            if e_dom not in domain_affinity:
+                aff = 0.0
+                for d, s in top_domains:
+                    aff = max(aff, routing.domain_similarity(e_dom, d) * (s / dom_total))
+                domain_affinity[e_dom] = aff
+            aff = domain_affinity[e_dom]
             score = min(1.0, 0.7 * cov + 0.3 * aff)
             out.append(({"id": fm.get("id") or e["path"], "frontmatter": fm,
                          "content": c, "path": e["path"]}, round(score, 6)))
@@ -1696,6 +1715,9 @@ class MdCGOS(MdCG):
             # MDCG_EN_ATOMS / MDCG_UNIFY_QUERY 等不入键即跨口径命中（2026-09-24 修复）。
             "env_switch": _hc.env_switch_key(),
         }
+        if "bm25" in paths:
+            from . import bm25
+            _cache_extra["bm25_access"] = bm25.access_key(self)
         # 不可稳定进键的参数（自定义可调用 query_expand）：非默认即**绕行**
         # 缓存（读+写双侧闭合）——fail-closed，宁可不用缓存也不串味。
         _bypass = query_expand is not None
@@ -1707,12 +1729,16 @@ class MdCGOS(MdCG):
                 _results, _meta = cached
                 _meta["cached"] = True
                 return _results, _meta
-        entries = self._candidates(layer=layer, roles=roles, include_work=include_work,
-                                   session=session, branch=branch, validity=validity,
-                                   start_time=start_time, end_time=end_time,
-                                   start_operator=start_operator,
-                                   end_operator=end_operator, time_axis=time_axis,
-                                   view=view)
+        candidate_fn = self._candidates
+        if "bm25" in paths:
+            from . import bm25
+            candidate_fn = lambda **options: bm25.candidate_pool(self, **options)
+        entries = candidate_fn(layer=layer, roles=roles, include_work=include_work,
+                               session=session, branch=branch, validity=validity,
+                               start_time=start_time, end_time=end_time,
+                               start_operator=start_operator,
+                               end_operator=end_operator, time_axis=time_axis,
+                               view=view)
         _tf = getattr(self, "_time_filter_stat", None)
         if not entries:
             _m = {"tier": None, "reason": "no_candidates", "paths": {}}
@@ -1754,14 +1780,18 @@ class MdCGOS(MdCG):
                         if _t_en else (None, None))
         if "lexical" in paths:
             ranked["lexical"] = self._lexical(q, entries, stat)
+        if "bm25" in paths:
+            from . import bm25
+            ranked["bm25"], _index_meta["bm25"] = bm25.search(self, q, entries, stat)
         if "bucket" in paths:
             ranked["bucket"] = self._path_bucket(q, entries, context)
         if "entity" in paths:
             ranked["entity"] = self._path_entity(q, entries)
         if "graph" in paths:
-            ranked["graph"] = self._path_graph(q, entries, ranked.get("lexical") or [])
+            ranked["graph"] = self._path_graph(
+                q, entries, ranked.get("lexical") or ranked.get("bm25") or [])
         if "chain" in paths:
-            seeds = (ranked.get("lexical") or []) + (ranked.get("entity") or [])
+            seeds = (ranked.get("lexical") or ranked.get("bm25") or []) + (ranked.get("entity") or [])
             ranked["chain"], chain_prov = self._path_chain(q, entries, seeds, context)
         if "temporal" in paths:
             # P3-temporal：时间路（排名项）。时间算子/区间未启用时恒空——默认
@@ -3187,8 +3217,11 @@ class MdCGOS(MdCG):
         aut = {"mode": dec["mode"], "action": dec["action"],
                "action_name": dec["action_name"], "decision": dec["decision"]}
         if dec["decision"] == autonomy_modes.FORBID:
-            return {"ok": False, "id": node_id, "deleted": False,
-                    "moved_to": "autonomy_forbidden", "error": "autonomy_forbid",
+            # 协议 gate_short_circuit：WRITE_TRIO + moved_to + verdict + hint
+            # （此前缺 committed 与 verdict——同族缺口，本批补齐；本路径无校验裁决故 None）
+            return {"ok": False, "id": node_id, "committed": False, "deleted": False,
+                    "moved_to": "autonomy_forbidden", "verdict": None,
+                    "error": "autonomy_forbid",
                     "autonomy": aut, "hint": dec["hint"]}
         pay = autonomy_modes.mutation_payload(
             autonomy_modes.D_DELETE, node_id, after="",
@@ -3198,8 +3231,10 @@ class MdCGOS(MdCG):
             self, autonomy_modes.D_DELETE, node_id, payload=pay,
             layer=e.get("layer") or "knowledge",
             sensitivity=e.get("sensitivity"), info=True)
+        # 协议 gate_short_circuit：补 verdict 键（无校验裁决 ⇒ None，与写链面同口径）
         return {"ok": True, "id": node_id, "committed": False, "deleted": False,
-                "moved_to": "review_queue", "pid": pr["pid"], "mutation": pay,
+                "moved_to": "review_queue", "verdict": None,
+                "pid": pr["pid"], "mutation": pay,
                 "autonomy": aut,
                 "hint": "%s 本次未删除（节点原样在位）：变更单已入审核队列"
                         "（pid=%s，目标 %s）。" % (dec["hint"], pr["pid"], node_id)}
@@ -4216,7 +4251,10 @@ class MdCGOS(MdCG):
         if dec["decision"] == _am.FORBID:
             # 形态对齐原 MERGE 出口（gate / merged_into 两键照带）：调用方按
             # 「gate.reason」取值读判断依据的既有读法不因本闸断裂。
-            return {"verdict": "FORBID", "node_id": node_id, "gate": gate,
+            # 协议 gate_gated：WRITE_TRIO + (gate, verdict)。此前只有 verdict/gate
+            # 而无三键 ⇒ 按 committed 判落盘的调用方读不到键（同族缺口，本批补齐）。
+            return {"ok": False, "id": node_id, "committed": False,
+                    "verdict": "FORBID", "node_id": node_id, "gate": gate,
                     "merged_into": tgt, "moved_to": "autonomy_forbidden",
                     "autonomy": aut, "hint": dec["hint"]}
         # 队列的层闸（MdCGSecure.propose）按**目标节点的真层**校验：合并落点
@@ -4235,7 +4273,9 @@ class MdCGOS(MdCG):
         pr = _am.propose_mutation(self, _am.B_MERGE, tgt, payload=pay,
                                   layer=tlayer,
                                   sensitivity=kw.get("sensitivity"), info=True)
-        return {"verdict": "CONFIRM", "node_id": node_id, "gate": gate,
+        # 协议 gate_gated：同上补三键（ok=True=已受理待审，与写链面口径一致）
+        return {"ok": True, "id": node_id, "committed": False,
+                "verdict": "CONFIRM", "node_id": node_id, "gate": gate,
                 "merged_into": tgt, "moved_to": "review_queue",
                 "pid": pr["pid"], "mutation": pay, "autonomy": aut,
                 "hint": "%s 本次未合并：变更单已入审核队列（pid=%s，目标 %s，"
@@ -4295,7 +4335,8 @@ class MdCGOS(MdCG):
         aut = {"mode": dec["mode"], "action": dec["action"],
                "action_name": dec["action_name"], "decision": dec["decision"]}
         if dec["decision"] == _am.FORBID:
-            return {"ok": False, "verdict": "FORBID", "node_id": node_id,
+            # 协议 gate_gated 需三键中的 id（此处此前只给 node_id）
+            return {"ok": False, "id": node_id, "verdict": "FORBID", "node_id": node_id,
                     "committed": False, "gate": gate,
                     "moved_to": "autonomy_forbidden", "error": "autonomy_forbid",
                     "autonomy": aut, "hint": dec["hint"]}
@@ -4313,7 +4354,8 @@ class MdCGOS(MdCG):
         pr = _am.propose_mutation(self, action, node_id, payload=pay,
                                   layer=layer,
                                   sensitivity=kw.get("sensitivity"), info=True)
-        return {"ok": True, "verdict": "CONFIRM", "node_id": node_id,
+        # 协议 gate_gated 需三键中的 id（同上）
+        return {"ok": True, "id": node_id, "verdict": "CONFIRM", "node_id": node_id,
                 "committed": False, "gate": gate, "moved_to": "review_queue",
                 "pid": pr["pid"], "mutation": pay, "autonomy": aut,
                 "hint": "%s 本次未落盘：变更单已入审核队列（pid=%s，目标 %s）。"
