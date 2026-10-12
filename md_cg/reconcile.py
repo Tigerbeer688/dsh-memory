@@ -76,12 +76,17 @@ def _disk_hashes(content: str) -> tuple:
 
 # 生效条件：遍历 mdcg.LAYERS 各层目录树（os.walk，与 _scan_nodes 同序同口径），逐个 .md 读取并 nodefile.loads 切分；成功解析的以 nid（fm.get("id") 或文件名去 .md）登入 by_nid（同 nid 后到覆盖，与 _scan_nodes dict 覆盖语义一致）并登记 path_owner[relpath]=nid；读失败（OSError）/解码失败（UnicodeDecodeError）/frontmatter 无闭合（fm 为空且原文以 "---\n" 开头）的登入 problems（kind=read_error/decode_error/frontmatter_unterminated，附 relpath），不进 by_nid 与 path_owner；返回 (by_nid, path_owner, problems)。
 def _scan_disk(cg):
+    from .mdcg import LAYER_SKIP_DIRS
     by_nid = {}
     path_owner = {}
     problems = []
     for layer in _layers():
         base = os.path.join(cg.root, layer)
-        for dirpath, _dirs, files in os.walk(base):
+        for dirpath, dirs, files in os.walk(base):
+            # 剪层内归档子目录（_trash）：与 mdcg._scan_nodes 同口径——否则
+            # reconcile 会把索引里的幽灵条目判成 missing（盘面扫得到、索引
+            # 应有），apply 时又 _stage 回来，幽灵复活。
+            dirs[:] = [d for d in dirs if d not in LAYER_SKIP_DIRS]
             for fn in files:
                 if not fn.endswith(".md"):
                     continue

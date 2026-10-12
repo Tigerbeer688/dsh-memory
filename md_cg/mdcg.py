@@ -45,6 +45,13 @@ BUCKETED_LAYERS = ("knowledge",)
 #: 口径与生产路径 `MdCGOS._candidates`（mdcos.py:748-749）一致。
 NEG_ROUTE_LAYERS = ("rejected", "unresolved", "goals")
 
+#: 层内不应被扫描的子目录名：正式 trash 在根级（`trash/`，不在 LAYERS，天然
+#: 不被 walk 到）；一次性运维脚本曾把文件搬进 `knowledge/_trash/<批次>/` 而
+#: 不走 forget API，递归扫描会把它们当正常节点收录——lifecycle=active 仍被
+#: 候选/召回（2026-10-12 实测 93 条幽灵，ac 最高 809）。_scan_nodes /
+#: _count_md_files / _dir_fingerprint / reconcile._scan_disk 四处 walk 同口径剪枝。
+LAYER_SKIP_DIRS = ("_trash",)
+
 # ---- S4 层级激活优先级（契约 §3 S4）----
 # 认知优先级：anchor/self（自我与锚点）先激活，其次 structural，再次 knowledge/contextual。
 # 语义是**加成**而非过滤：只改初始激活值/排序，不改变任何门控（不会把被门控剔除的节点拉回来）。
@@ -1910,7 +1917,10 @@ class MdCG:
         fp = {}
         for layer in LAYERS:
             base = os.path.join(self.root, layer)
-            for dirpath, _dirs, files in os.walk(base):
+            for dirpath, dirs, files in os.walk(base):
+                # 剪层内归档子目录（_trash）：与 _scan_nodes 同口径——指纹面
+                # 不含幽灵文件，否则 trash 目录 mtime 变化会触发无谓全量重扫。
+                dirs[:] = [d for d in dirs if d not in LAYER_SKIP_DIRS]
                 try:
                     mtime_ns = os.stat(dirpath).st_mtime_ns
                 except OSError:
@@ -1926,7 +1936,11 @@ class MdCG:
         n = 0
         for layer in LAYERS:
             base = os.path.join(self.root, layer)
-            for _dp, _dirs, files in os.walk(base):
+            for _dp, dirs, files in os.walk(base):
+                # 剪层内归档子目录（_trash）：与 _scan_nodes 同口径——否则
+                # compact 的计数对账（_count_md_files vs len(nodes)）永久失配，
+                # 每次 compact 都触发无谓全量重扫。
+                dirs[:] = [d for d in dirs if d not in LAYER_SKIP_DIRS]
                 n += sum(1 for fn in files if fn.endswith(".md"))
         return n
 
@@ -2164,7 +2178,11 @@ class MdCG:
         nodes = {}
         for layer in LAYERS:
             base = os.path.join(self.root, layer)
-            for dirpath, _dirs, files in os.walk(base):
+            for dirpath, dirs, files in os.walk(base):
+                # 剪层内归档子目录（_trash）：正式 trash 在根级不在 LAYERS；
+                # 层内 _trash 是绕过 forget API 的手搬产物，不得进索引
+                # （详见 LAYER_SKIP_DIRS 注释）。
+                dirs[:] = [d for d in dirs if d not in LAYER_SKIP_DIRS]
                 for fn in files:
                     if not fn.endswith(".md"):
                         continue

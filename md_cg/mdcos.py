@@ -882,6 +882,12 @@ class MdCGOS(MdCG):
             if e.get("layer") in NEG_ROUTE_LAYERS:
                 continue  # 负记忆走覆盖标记；目标只做定向，都不进正排
                           # （真源 mdcg.NEG_ROUTE_LAYERS，本处直接导入，不留第二份字面量）
+            # 层内 _trash 兜底（B2）：_scan_nodes 已剪目录，但存量索引里可能
+            # 仍有 path 指向 knowledge/_trash/** 的幽灵条目（绕过 forget API
+            # 的手搬产物）——候选面再滤一次，等 rebuild/reconcile 清库。
+            _p = e.get("path") or ""
+            if "/_trash/" in _p or _p.startswith("_trash/"):
+                continue
             if lifecycle.is_archived(e):
                 continue  # lifecycle.py:42 标称兑现：archived 不参与默认检索。
                           # 本处是 **cg 检索面单点**——`MdCGSecure._candidates`
