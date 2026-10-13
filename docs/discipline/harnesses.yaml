@@ -83,6 +83,8 @@ targets:
       严格 {{variable}} 插值 ⇒ 正文禁含裸 {{ 。
     # 端差异与落地边界 → 注入 compact 模板的 %%PREAMBLE%%（模板保持通用，差异留在矩阵）
     preamble: |-
+      %%PRIVATE%%
+
       【本端（DSH）与其它端的差异】
       - 记忆通路：插件内建 lingshu_cg / lingshu_stg 两个基元（tools = core），即正文纪律中的 cg / stg——同一服务，勿因名字不同而猜测；其余能力经 cg(op=…) / stg(op=…) 分发，op 为必填参数（漏传会被参数签名推导兜底并标记 op_derived）。
       - 注入时机：本段在系统提示 order=0（DEPLOYMENT_PERSONA_PREFIX），每轮都在；codebuddy / zcode 端是会话起始一次性注入全文。
