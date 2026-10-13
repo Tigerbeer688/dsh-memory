@@ -614,6 +614,10 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     let skippedSincePush = 0
     // 跨轮轮换：最近注入过的 knowledge 节点 id，窗口内不重复注入同一节点。
     const recentInjected: string[] = []
+    // route 起手兑底（评估优化②）：每会话自动 route 一次并缓存结果文本——
+    // agent 不调 cg(op=route) 也拿得到「相关知识 + 建议能力」。空串 = 已尝试
+    // （成功但无内容，或失败）→ 本会话不再重试，防每步撞墙。
+    const routeSeed = new Map<string, string>()
     ctx.on('system-prompt/assemble', async (assembly, _ctx, next) => {
       try {
         // 异步取最近记忆节点（失败静默——不阻塞模型请求）
@@ -667,7 +671,10 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
               // ——被静默丢弃、semantic 从未参与召回（A/B 逐位相同）。契约由
               // test/recall-params-contract.test.ts 钉死，传未声明参数即红。
               const query = lastUserMsg.slice(0, 80) + ' 教训 经验 错误'
-              const kr = await graph.read(query, { k: 16, layer: 'knowledge' })
+              // k=10（评估优化③）：与 autoRecallLimit 同口径；code_/doc_ 已
+              // 服务端归档（不再进候选），k=10 全是 mem 教训，选 5 足够。
+              // _access.log 曾因 k=16 出现批次 avg 13.8 > limit 10 超限。
+              const kr = await graph.read(query, { k: 10, layer: 'knowledge' })
               const kItems = (kr && Array.isArray((kr as any).pack)) ? (kr as any).pack : (kr && Array.isArray((kr as any).results)) ? (kr as any).results : (Array.isArray(kr) ? kr : [])
               ctx.logger.info(`dsh-memory: knowledge-recall(query="${query.slice(0, 40)}") 返回 ${kItems.length} 条`)
               // 候选策略（与 lib 同步，重编译以 src 为准）：排除 code_/doc_ 节点（knowledge 层
@@ -740,6 +747,36 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
                 })
               }
             } catch (e: any) { ctx.logger.warn(`dsh-memory: knowledge-recall 失败: ${e.message}`) }
+          }
+
+          // 2.5) route 起手兜底（评估优化②）：纪律 0.1 要求「先 route 再干活」，
+          // 但实测 47 次会话仅 2 次显式调用——插件侧每会话自动 route 一次，把
+          // 建议能力注入，agent 不调也拿得到。结果按会话缓存后**每步原样重推**
+          // （内容不变 → 宿主零追加，符合稳定性契约）；空串 = 无能力命中或
+          // 失败 → 本会话不再重试。route 服务端 record=False，不污染访问日志；
+          // 归档后的 code_/doc_ 不进候选，能力列表只剩 mem 节点的 cap。
+          const rKey = sid || '__global__'
+          if (!routeSeed.has(rKey) && lastUserMsg) {
+            try {
+              const rr = (await graph.route(lastUserMsg.slice(0, 80))) as any
+              const caps = (rr && Array.isArray(rr.suggested_capabilities))
+                ? (rr.suggested_capabilities as unknown[]).map(String).filter(Boolean)
+                : []
+              routeSeed.set(rKey, caps.length
+                ? `建议能力：${caps.slice(0, 8).join('、')}`
+                : '')
+            } catch (e: any) {
+              ctx.logger.warn(`dsh-memory: route 起手失败: ${e.message}`)
+              routeSeed.set(rKey, '')
+            }
+          }
+          const rText = routeSeed.get(rKey) || ''
+          if (rText) {
+            assembly.contexts.push({
+              name: 'lingshu:route-seed',
+              text: escapePromptBraces(renderUntrustedMemoryBlock(
+                `【灵枢路由起手——本会话预路由结果，按需调用对应能力】\n${rText}`)),
+            })
           }
 
           // ── 独立第二块：「【本会话近期对话】」（contextWindow 注入面）──

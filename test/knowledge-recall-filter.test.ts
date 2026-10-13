@@ -136,7 +136,7 @@ test('生产路径候选过滤：日志节点挡、correction 豁免、code/低�
   assert.ok(knowledgeRead, '应触发一次 layer=knowledge 的 read')
   const extra = knowledgeRead!.extra
   assert.deepEqual(Object.keys(extra).sort(), ['k', 'layer'], 'read extra 只允许 {k, layer}（paths 已撤回）')
-  assert.equal(extra['k'], 16, 'k=16')
+  assert.equal(extra['k'], 10, 'k=10（评估优化③：与 autoRecallLimit 同口径）')
   assert.equal(extra['layer'], 'knowledge', '必须限定 knowledge 层（否则 contextual 回声顶掉教训）')
   assert.ok(!('paths' in extra), '不得传 paths：read 面不收该参数（2026-10-07 静默丢参事故）')
 
