@@ -736,7 +736,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
               if (kText) {
                 assembly.contexts.push({
                   name: 'lingshu:knowledge-recall',
-                  text: escapePromptBraces(`【灵枢交易教训】\n${kText}`),
+                  text: escapePromptBraces(`【灵枢交易教训——分析前必须逐条对照：命中任何一条，结论必须体现该教训或明确写出为何不适用】\n${kText}`),
                 })
               }
             } catch (e: any) { ctx.logger.warn(`dsh-memory: knowledge-recall 失败: ${e.message}`) }
