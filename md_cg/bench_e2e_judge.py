@@ -237,7 +237,30 @@ def llm_chat(model, base, key, messages, timeout=120, max_tokens=1500,
                  "Authorization": f"Bearer {key}"})
     t0 = time.time()
     with urllib.request.urlopen(req, timeout=timeout) as resp:
-        data = json.loads(resp.read().decode("utf-8"))
+        ctype = resp.headers.get("Content-Type", "")
+        raw_bytes = resp.read()
+    if "text/event-stream" in ctype:
+        # SSE（如本机 zai-api 网关恒返回流式）：拼 delta.content；
+        # 思考型模型的 reasoning_content 不计入正文
+        content = ""
+        usage = {}
+        for line in raw_bytes.decode("utf-8", "replace").splitlines():
+            line = line.strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            try:
+                obj = json.loads(data)
+            except ValueError:
+                continue
+            if obj.get("usage"):
+                usage = obj["usage"]
+            delta = (obj.get("choices") or [{}])[0].get("delta") or {}
+            content += delta.get("content") or ""
+        return content, usage, time.time() - t0
+    data = json.loads(raw_bytes.decode("utf-8"))
     content = data["choices"][0]["message"].get("content") or ""
     return content, (data.get("usage") or {}), time.time() - t0
 

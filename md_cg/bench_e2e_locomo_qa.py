@@ -165,7 +165,8 @@ def build_dialog_pool(ids, zh_turns, root_dir):
         try:
             m = json.load(open(os.path.join(root, "_manifest.json"),
                                encoding="utf-8"))
-            if m == {"turns": len(ids)}:
+            if m == {"turns": len(ids)} and os.path.isdir(
+                    os.path.join(root, "mem")):
                 from md_cg.mdcos import MdCGOS
                 return MdCGOS(os.path.join(root, "mem"))
         except Exception:
@@ -190,20 +191,34 @@ READER_USER = "问题：{q}\n\n候选记忆：\n{cards}"
 def run_one(cfg, cache_dir, qid, qtype, zh_q, en_q, gold, cards_text, arm):
     row = {"qid": qid, "qtype": qtype, "arm": arm, "gold": gold}
 
+    def _chat(sysm, userm, mt):
+        # 免费网关（如本机 18899）并发/限流会间歇 502——退避重试，
+        # 否则整行判分失败（2026-10-15 dsh 跑分 978/1000 error 的形态）
+        last = None
+        for attempt in range(4):
+            try:
+                return llm_chat(cfg["model"], cfg["base"], cfg["key"],
+                                [{"role": "system", "content": sysm},
+                                 {"role": "user", "content": userm}],
+                                timeout=cfg["timeout"], max_tokens=mt,
+                                extra_payload=cfg.get("extra"))
+            except Exception as exc:  # noqa: BLE001
+                last = exc
+                if ("502" in str(exc) or "429" in str(exc)
+                        or "10054" in str(exc) or "10061" in str(exc)):
+                    time.sleep(5 * (attempt + 1))
+                    continue
+                raise
+        raise last
+
     def call_reader():
-        return llm_chat(cfg["model"], cfg["base"], cfg["key"],
-                        [{"role": "system", "content": READER_SYS},
-                         {"role": "user", "content": READER_USER.format(
-                             q=zh_q, cards=cards_text)}],
-                        timeout=cfg["timeout"], max_tokens=300)
+        return _chat(READER_SYS, READER_USER.format(
+            q=zh_q, cards=cards_text), 300)
 
     def call_judge():
-        return llm_chat(cfg["model"], cfg["base"], cfg["key"],
-                        [{"role": "system", "content": JUDGE_SYS},
-                         {"role": "user", "content":
-                          f"问题：{en_q}\ngold：{gold or ''}\n"
-                          f"模型回答：{row['answer']}"}],
-                        timeout=cfg["timeout"], max_tokens=200)
+        return _chat(JUDGE_SYS,
+                     f"问题：{en_q}\ngold：{gold or ''}\n"
+                     f"模型回答：{row['answer']}", 200)
 
     try:
         pkey = f"{cfg['model']}|{arm}|{qid}|{cards_text[:200]}"
@@ -251,6 +266,8 @@ def main(argv=None):
     ap = argparse.ArgumentParser(description="LoCoMo QA 同口径对照（中文全对话）")
     ap.add_argument("--data-root", default=DEFAULT_ROOT)
     ap.add_argument("--n", type=int, default=0, help="题数（0=全量500）")
+    ap.add_argument("--offset", type=int, default=0,
+                    help="起始题下标（与 --n 搭配做分段并行跑）")
     ap.add_argument("--model", default="deepseek-chat")
     ap.add_argument("--base-url", default="https://api.deepseek.com/v1")
     ap.add_argument("--key", default="")
@@ -267,6 +284,10 @@ def main(argv=None):
     ap.add_argument("--batch-q", type=int, default=10,
                     help="问句翻译每请求数（LM Studio 建议 6）")
     ap.add_argument("--quick", action="store_true")
+    ap.add_argument("--no-thinking", action="store_true",
+                    help="全局压制思考（顶层 reasoning_effort=none，"
+                         "GLM 等思考型模型经 OpenAI 兼容网关必开，"
+                         "否则思考吃满 max_tokens 输出空 JSON）")
     a = ap.parse_args(argv)
     if a.quick:
         a.n = 3
@@ -276,6 +297,8 @@ def main(argv=None):
         return 2
     cfg = {"model": a.model, "base": a.base_url, "key": key,
            "timeout": a.timeout, "workers": a.workers}
+    if a.no_thinking:
+        cfg["extra"] = {"reasoning_effort": "none"}
     print(f"[locomo_qa] 归一层开关 MDCG_UNIFY_QUERY="
           f"{os.environ.get('MDCG_UNIFY_QUERY', '0')}（缺省关；=1 为英文对照口径，"
           f"见模块头注）")
@@ -285,7 +308,7 @@ def main(argv=None):
     ours = [json.loads(l) for l in open(os.path.join(
         HERE, "data", "benchmarks", "locomo-zh-500", "questions500.jsonl"),
         encoding="utf-8") if l.strip()]
-    qs = ours[:a.n] if a.n else ours
+    qs = ours[a.offset:a.offset + a.n] if a.n else ours[a.offset:]
 
     if a.translate or not (os.path.isfile(ZH_TURNS)
                            and os.path.isfile(ZH_QUERIES)):
@@ -328,7 +351,9 @@ def main(argv=None):
     cache_dir = os.path.join(a.data_root, "lq_cache")
     os.makedirs(cache_dir, exist_ok=True)
     from md_cg.mdcos import MdCGOS
+    print("[phase] loading pool ...", flush=True)
     cg = build_dialog_pool(ids, zh_turns, a.data_root)
+    print("[phase] pool ready, searching %d qids ..." % len(qs), flush=True)
     # scene → 全对话中文（full-context 臂用）
     scene_turns = {}
     for nid in ids:
@@ -353,13 +378,22 @@ def main(argv=None):
         full = "\n".join(zh_turns.get(t, "") for t in scene_turns[scene])
         tasks.append((qid, q.get("qtype"), zh_q, en_q, gold, full[:110000],
                       "full_context"))
+    print(f"[phase] tasks={len(tasks)} dispatching", flush=True)
     t0 = time.time()
     with ThreadPoolExecutor(max_workers=a.workers) as ex:
-        rows = list(ex.map(lambda t: run_one(cfg, cache_dir, *t), tasks))
+        rows = []
+        for i, row in enumerate(ex.map(lambda t: run_one(cfg, cache_dir,
+                                                         *t), tasks), 1):
+            rows.append(row)
+            if i % 50 == 0:
+                print(f"[progress] {i}/{len(tasks)} "
+                      f"{time.time()-t0:.0f}s errs="
+                      f"{sum(1 for r in rows if r.get('error'))}", flush=True)
     print(f"[locomo_qa] {len(tasks)} 次 reader+judge 耗时 {time.time()-t0:.0f}s")
     errs = sum(1 for r in rows if r.get("error"))
     print(f"判分失败 {errs} 行\n")
-    summary = {"meta": {"model": a.model, "n_q": len(qs), "k": a.k,
+    summary = {"meta": {"model": a.model, "base": a.base_url, "n_q": len(qs),
+                        "k": a.k, "no_thinking": bool(a.no_thinking),
                         "unify": os.environ.get("MDCG_UNIFY_QUERY", "0")}}
     for arm in ("retrieval", "full_context"):
         summary[arm] = report([r for r in rows if r["arm"] == arm], arm)

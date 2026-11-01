@@ -72,6 +72,12 @@ def _cache_call(cache_dir, kind, payload_key, fn):
         d = json.load(open(path, encoding="utf-8"))
         return d["out"], d.get("tokens", 0), 0.0, True
     out, usage, dt = fn()
+    # 2026-10-27 修：空输出（502 风暴期上游返回空 content）绝不能缓存，
+    # 否则毒缓存永久固化 → 重跑永远命中同一空结果（10/23 仍有 95 行
+    # "judge 不可解析(空)" 即此形态）。空 = 视为 LLM 失败，抛错不落缓存，
+    # 该行记为 error，下一轮补跑自然重试。
+    if not (out or "").strip():
+        raise RuntimeError("empty LLM output（上游过载/502 返回空 content）")
     json.dump({"out": out, "tokens": int(usage.get("total_tokens") or 0)},
               open(path, "w", encoding="utf-8"), ensure_ascii=False)
     return out, int(usage.get("total_tokens") or 0), dt, False
