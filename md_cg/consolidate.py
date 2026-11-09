@@ -175,7 +175,9 @@ REFLECT_PROMPT = (
     '  "不适用条件": 什么查询/情境下该知识**不**适用（短语数组，1~3 条）\n'
     "硬约束：\n"
     "  1. 每条短语必须能在正文中找到依据，禁止编造正文里没有的工具/概念；\n"
-    "  2. 不适用条件必须是**正文之外的邻近易混情境**，不得与生效条件语义重叠；\n"
+    "  2. 不适用条件必须**用正文里出现过的词**组合出「邻近易混情境」"
+    "（正文讲 A 场景，就写「A 场景下对象/范围不同的情形」），不得与生效条件语义重叠；"
+    "正文里确实找不到可组合的词时，输出 [\"无\"]；\n"
     "  3. 短语要短（不超过 20 字），不要写完整句子。\n"
     "输出格式："
     '{{"生效条件": ["..."], "子功能": ["..."], "执行": "...", "不适用条件": ["..."]}}\n'
@@ -515,6 +517,19 @@ def grounding_filter(cand: dict, body: str, thresholds: dict = None):
         detail[field] = {"scores": scores, "kept": len(ok_terms)}
         if ok_terms:
             kept[field] = ok_terms if field in MULTI_FIELDS else ok_terms[0]
+    # 设计者批准（2026-11-09）：显式「无」= 反思单元声明「本节点无明确负例」，
+    # 与两态拦截要拦的两种缺陷语义不同——neg_absent 是**根本没产出**负条件，
+    # neg_dropped_all 是**产出了但被 grounding 删光**（幻觉被拦下）；「无」是
+    # 第三种：真实判断为无负例。放行落盘为「不适用条件：无」，由 replay 的
+    # neg_separated（「无」零命中正文 → 域外成立）与 no_conflict（无内容词、
+    # 不会与生效条件重叠）自然校验，不绕过任何闸门。
+    neg = cand.get("不适用条件")
+    neg_terms = neg if isinstance(neg, list) else ([neg] if neg else [])
+    if (neg_terms and all(str(t).strip() == "无" for t in neg_terms)
+            and "不适用条件" not in kept):
+        kept["不适用条件"] = ["无"]
+        detail["不适用条件"] = {"scores": {"无": "explicit-none"}, "kept": 1,
+                               "note": "显式无负例（设计者批准 2026-11-09）"}
     return kept, detail
 
 
@@ -685,7 +700,7 @@ def consolidate(root: str, layer: str = None, limit: int = None, apply: bool = F
                 verify_fn=None, reflect_model: str = "", verify_model: str = "",
                 verification_basis: str = "", basis_enum: str = BASIS_ENUM_DEFAULT,
                 require_verify: bool = True, thresholds: dict = None,
-                verbose: bool = True) -> dict:
+                ids: list = None, verbose: bool = True) -> dict:
     """对正排层节点做「反思单元产出候选 → 白箱闸门 → 验证单元否决 → 固化」。
 
     llm_fn 是 reflect_fn 的旧名（向后兼容，单模型模式）。
@@ -698,8 +713,19 @@ def consolidate(root: str, layer: str = None, limit: int = None, apply: bool = F
     reflect_fn = reflect_fn or llm_fn
     cg = MdCGOS(root)
     entries = cg._candidates(layer=layer)
+    # 定向模式（ids）：只处理名单内节点，并**按名单顺序**遍历——这样「按
+    # access_count 降序喂头部教训」才成立（--layer/--limit 取的是目录序，会撞大运）。
+    # 不带 ids 时 entries 与改动前逐字相同（默认行为零变化）。
+    _ids_missing = []
+    if ids:
+        _want = [str(x).strip() for x in ids if str(x).strip()]
+        _by_id = {os.path.basename(e["path"])[:-3]: e for e in entries}
+        _ids_missing = [i for i in _want if i not in _by_id]
+        entries = [_by_id[i] for i in _want if i in _by_id]
     t0 = time.time()
     rep = {"root": root, "layer": layer, "dry_run": not apply,
+           "ids_count": (len(ids) if ids else None),
+           "ids_missing": _ids_missing,
            "reflect_model": reflect_model, "verify_model": verify_model,
            "reflect": bool(reflect_fn), "verify": bool(verify_fn), "llm": bool(reflect_fn),
            "require_verify": require_verify,
@@ -718,6 +744,13 @@ def consolidate(root: str, layer: str = None, limit: int = None, apply: bool = F
         if limit is not None and rep["targeted"] >= limit:
             break
         nid = os.path.basename(e["path"])[:-3]
+        # 2026-11-09 用户拍板：code_*/doc_* 源码文档节点不参与补要素——
+        # 它们是 index_code/index_doc 的派生物（knowledge 层 2153 个），
+        # 按目录序排在 correction 教训前面吃光 --limit 名额（试点实测 20 条
+        # 全被占）。注入侧（hooks.ts:714）早有同款过滤，此处对齐。
+        if nid.startswith("code_") or nid.startswith("doc_"):
+            _bump("skipped_code_doc")
+            continue
         fm, content = direct_read(cg, e)   # 写前重查走盘上真值（读缓存口径，见 readcache.direct_read）
         if fm is None:
             _bump("read_failed")
@@ -1518,6 +1551,11 @@ def _cli(argv=None) -> int:
     ap.add_argument("--root", required=True, help="md 认知图根目录")
     ap.add_argument("--layer", default=None, help="只处理某层（如 knowledge）")
     ap.add_argument("--limit", type=int, default=None, help="只处理前 N 个待补节点")
+    ap.add_argument("--ids", default=None,
+                    help="定向名单（逗号分隔节点 id）；给定时只处理这些节点，"
+                         "并按名单顺序遍历（用于「按 access_count 降序救头部教训」）")
+    ap.add_argument("--ids-file", default=None,
+                    help="定向名单文件（每行一个 id，# 开头为注释，空行忽略）")
     ap.add_argument("--apply", action="store_true", help="真正写盘（默认只验证）")
     ap.add_argument("--dry-run", action="store_true", help="只验证不写盘（默认行为）")
     ap.add_argument("--overwrite", action="store_true",
@@ -1559,6 +1597,22 @@ def _cli(argv=None) -> int:
                     help="零 token 探测两个角色网关的可用模型后退出")
     ap.add_argument("--report", default=None, help="把汇总 JSON 另存一份")
     a = ap.parse_args(argv)
+
+    # 定向名单（--ids / --ids-file）：两者可并用，按出现顺序去重后交给 consolidate()。
+    ids_list = None
+    if a.ids or a.ids_file:
+        _raw = []
+        if a.ids:
+            _raw += [x.strip() for x in a.ids.split(",")]
+        if a.ids_file:
+            with open(a.ids_file, encoding="utf-8") as _f:
+                _raw += [ln.strip() for ln in _f
+                         if ln.strip() and not ln.strip().startswith("#")]
+        _seen = set()
+        _raw = [x for x in _raw if x and not (x in _seen or _seen.add(x))]
+        ids_list = _raw or None
+        if ids_list is None:
+            print("[warn] --ids/--ids-file 均为空，按原目录序执行", file=sys.stderr)
 
     r_model, _, r_key = role_config(REFLECT_ROLE, a.reflect_model)
     v_model, _, v_key = role_config(VERIFY_ROLE, a.verify_model)
@@ -1636,7 +1690,8 @@ def _cli(argv=None) -> int:
                       verify_fn=verify_fn, reflect_model=r_model,
                       verify_model=v_model if verify_fn else "",
                       verification_basis=basis or "",
-                      require_verify=not a.no_verify, thresholds=thresholds)
+                      require_verify=not a.no_verify, thresholds=thresholds,
+                      ids=ids_list)
     print(json.dumps(rep, ensure_ascii=False, indent=2))
     if a.report:
         with open(a.report, "w", encoding="utf-8") as f:
