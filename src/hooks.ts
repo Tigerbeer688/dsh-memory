@@ -688,7 +688,15 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
                 preview: string
                 key: string
                 adjusted: number
+                domainPenalized: boolean
               }
+              // ── 域过滤（2026-11-09，A组实测 50 条注入 68% 为交易域、对工程任务 0 贡献）──
+              // 判据：节点 tags/正文含交易域词（market/实盘/回测/策略/涨停/仓位/恐慌日/oversold…）
+              // 而查询不含交易域词 → 该节点对当轮任务大概率是噪声。
+              // 不硬丢弃：adjusted × 0.35 降权（选不满 2 条时第二轮 allowRecent 会回补），
+              // 避免域判定误伤时注入变空。交易查询不受影响（query 命中交易词则不降权）。
+              const MARKET_DOMAIN_RE = /(market|实盘|回测|策略|涨停|跌停|仓位|恐慌日|oversold|cup_handle|复盘|选股|信号池|买入|卖出|止损|止盈|盈亏|持仓)/i
+              const queryIsMarket = MARKET_DOMAIN_RE.test(query)
               const candidates: KnowledgeCandidate[] = []
               for (const r of kItems as any[]) {
                 const content = String((r && r.content) || (r && r.node && r.node.content) || '')
@@ -712,22 +720,28 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
                 const isConfirmedLesson = tagText.includes('correction') || tagText.includes('已确认教训')
                 if (!isConfirmedLesson && /^##\s*\d{4}-\d{2}-\d{2}/m.test(content)) continue
                 if (!(preview.length > 20 && score >= 0.1)) continue
+                const nodeIsMarket = MARKET_DOMAIN_RE.test(tagText) || MARKET_DOMAIN_RE.test(preview)
+                const domainPenalized = !queryIsMarket && nodeIsMarket
                 candidates.push({
                   nid,
                   score,
                   preview,
                   key: preview.slice(0, 160),
-                  adjusted: score / (1 + Math.log1p(access) / Math.log(21)),
+                  adjusted: (score / (1 + Math.log1p(access) / Math.log(21))) * (domainPenalized ? 0.35 : 1),
+                  domainPenalized,
                 })
               }
               candidates.sort((left, right) => right.adjusted - left.adjusted)
+              // 域匹配优先：先在同域（未降权）里选，选不满 3 条再放开到降权候选——
+              // 保证工程任务首轮至少能被通用纪律类填满，交易域只做回补。
               const chosen: KnowledgeCandidate[] = []
               const kSeen = new Set<string>()
-              for (const allowRecent of [false, true]) {
+              for (const [allowRecent, allowPenalized] of [[false, false], [false, true], [true, true]] as const) {
                 for (const c of candidates) {
                   if (chosen.length >= 5) break
                   if (kSeen.has(c.key)) continue
                   if (!allowRecent && recentInjected.includes(c.nid)) continue
+                  if (!allowPenalized && c.domainPenalized) continue
                   kSeen.add(c.key)
                   chosen.push(c)
                 }
