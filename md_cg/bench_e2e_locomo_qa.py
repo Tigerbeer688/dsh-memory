@@ -41,7 +41,10 @@ import hashlib
 import json
 import os
 import re
+import shutil
+import subprocess
 import sys
+import tempfile
 import time
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
@@ -188,10 +191,53 @@ def build_dialog_pool(ids, zh_turns, root_dir):
 READER_USER = "问题：{q}\n\n候选记忆：\n{cards}"
 
 
+_CLI_TMP = os.path.join(tempfile.gettempdir(), "opencode_locomo_cli")
+
+
+def _cli_chat(cfg, sysm, userm):
+    """经 `opencode run` 子进程调 OpenCode Zen 免费模型（2026-11-12）。
+
+    返回 (content, usage, dt) 以匹配 llm_chat 签名；重试 4 次退避。
+    stdin 传 prompt 规避 32k argv 上限；--pure 防项目插件拖累；
+    cwd 用独立临时目录防项目发现干扰。
+    """
+    model = os.environ.get("EVAL_CLI_MODEL") or cfg["model"]
+    prompt = "[SYSTEM]\n%s\n\n[USER]\n%s" % (sysm, userm)
+    os.makedirs(_CLI_TMP, exist_ok=True)
+    oc = shutil.which("opencode")
+    if not oc:
+        raise RuntimeError("opencode CLI 不在 PATH")
+    last = None
+    for attempt in range(4):
+        t0 = time.time()
+        try:
+            r = subprocess.run(
+                [oc, "run", "-m", "opencode/" + model, "--pure"],
+                input=prompt, capture_output=True, text=True,
+                encoding="utf-8", errors="replace", timeout=240,
+                cwd=_CLI_TMP)
+            out = (r.stdout or "").strip()
+            if out:
+                return out, {"total_tokens": 0}, time.time() - t0
+            last = RuntimeError("cli empty rc=%s tail=%s" % (
+                r.returncode, (r.stderr or "")[-120:]))
+        except Exception as exc:                     # noqa: BLE001
+            last = exc
+        time.sleep(5 * (attempt + 1))
+    raise last
+
+
 def run_one(cfg, cache_dir, qid, qtype, zh_q, en_q, gold, cards_text, arm):
     row = {"qid": qid, "qtype": qtype, "arm": arm, "gold": gold}
 
     def _chat(sysm, userm, mt):
+        # 2026-11-12 新增：EVAL_VIA_CLI=1 时走 opencode run 子进程（OpenCode
+        # Zen 免费层，模型 id 与 10/23 缓存同款 deepseek-v4.1-flash-free），
+        # 18899 网关死时仍可补齐缓存缺口。prompt 经 stdin 传入（规避
+        # Windows 32k argv 上限），--pure + 普通 cwd 防项目插件拖累。
+        if os.environ.get("EVAL_VIA_CLI"):
+            return _cli_chat(cfg, sysm, userm)
+
         # 免费网关（如本机 18899）并发/限流会间歇 502——退避重试，
         # 否则整行判分失败（2026-10-15 dsh 跑分 978/1000 error 的形态）
         last = None
