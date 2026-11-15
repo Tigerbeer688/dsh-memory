@@ -6,7 +6,7 @@
  *      lingshu:route-seed 块（agent 不调 route 也拿得到）。
  *   2. 同会话第二步：不再发第二次 route（按会话缓存），块每步原样重推
  *      且逐字节相同（稳定性契约：内容不变 → 宿主零追加）。
- *   3. route 返回空能力 → 不注入块；失败 → 不注入块且本会话不再重试。
+ *   3. route 返回空能力 → 不注入块；失败 → 不注入块，重试至 3 次后放弃（C5）。
  *
  * 走的是真生产路径：installMemoryHooks 的 session/event → system-prompt/assemble。
  */
@@ -111,16 +111,19 @@ test('③ route 返回空能力：不注入块', async () => {
     '无能力命中不注入空块')
 })
 
-test('④ route 失败：不注入块，且本会话不再重试', async () => {
+test('④ route 失败：不注入块，失败不写缓存、按 20s 节流重试', async () => {
   const h = makeHarness(async () => { throw new Error('MCP down') })
   await feedUserMessage(h.listeners, '帮我看看要不要止损')
+  // C5（2026-11-15）：原实现失败即写空串并置位 has() → 本会话永久禁用；且与
+  // 「成功但无内容」不可区分。新契约：失败不缓存，20s 节流重试，**不设次数上限**
+  //（桥懒加载实测可达数分钟，设上限会在就绪前耗尽配额）。此处只验证节流窗内不重撞。
   const first = await assemble(h.listeners)
   assert.equal(h.routeCalls, 1, '首次尝试一次')
   assert.ok(!first.contexts.some((c) => c.name === 'lingshu:route-seed'),
     '失败不注入块')
 
   const second = await assemble(h.listeners)
-  assert.equal(h.routeCalls, 1, '失败后本会话不得重试（防每步撞墙）')
+  assert.equal(h.routeCalls, 1, '20s 节流窗内不得重复调用（防每步撞墙）')
   assert.ok(!second.contexts.some((c) => c.name === 'lingshu:route-seed'))
 })
 

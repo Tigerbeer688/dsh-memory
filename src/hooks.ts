@@ -70,9 +70,28 @@ import type { ContentBlock } from '@deepseek-ai/dsh-llm'
 import type { MdcgClient } from './lib/mdcg_client.js'
 import { escapePromptBraces, renderUntrustedMemoryBlock } from './lib/prompt_safety.js'
 import { HookAuditRecorder, kindOf, type HookWriteRole } from './lib/hook_audit.js'
+import { InjectReceiptLogger, type InjectReceipt, type RouteReceiptState } from './lib/inject_receipt.js'
 // 运行期会话状态单点（B 治本批）：观测在 hooks 面，写归因注入在工具面
 // （src/tools.ts）——两处共用同一状态，见 lib/session_state.ts 头注。
 import { currentSession, noteSession, UNASSIGNED_SESSION } from './lib/session_state.js'
+
+/** 注入块形态版本戳（C0，2026-11-15）。
+ *
+ *  动机（实测事故，非假想）：2026-11-15 中午出现「运行面模块 ≠ 磁盘 HEAD」的漂移——
+ *  宿主内存里跑的是另一份带 `mem_xxx｜…` + 回执指令的构建，而磁盘/HEAD 只有
+ *  `[layer|score=x]` 模板。两者除注入块外观外完全同形，只能靠解压会话日志逐块反推
+ *  才定位得到（花了整整一轮审计）。更麻烦的是该漂移**在未重启的情况下自行消失**
+ *  （12:17:21 之后的下一条注入就回到磁盘版本）——说明「磁盘改动是否即时上线」本身
+ *  不可控。既然运行面不可控，就把版本做成 **in-band** 的：漂移必须在下一条注入里
+ *  肉眼可见，而不是只能靠事后考古。
+ *
+ *  纪律：**改动任一注入块的文本形态（标题 / 条目格式 / 分隔符 / 尾部指令）必须 +1**。
+ *  只标「形态版本」而不标 commit：每改一行源码就变会让注入文本天天漂移，反而制造
+ *  宿主快照追加（见 system-prompt/assemble 处的稳定性契约）。
+ *  1 = 无戳形态（≤ 22ca6995）。 */
+const INJECT_FMT = 2
+/** 渲染进各注入块标题行的版本标记。纯静态串，不随数据变动，不引入快照churn。 */
+const INJECT_STAMP = `lingshu:fmt=${INJECT_FMT}`
 
 /** 自动记忆开关。 */
 export interface MemoryHooksOptions {
@@ -95,6 +114,11 @@ export interface MemoryHooksOptions {
    *  apply 探针同目录同惯例），供测试与定制注入；审计自身失败静默降级，
    *  绝不冒泡进记忆路径。不改任何既有选项语义。 */
   auditPath?: string
+  /** 注入**回执**文件路径（C4，2026-11-15，诊断面）：每步 system-prompt/assemble
+   *  追加一行 JSONL——块名 / 教训条数与节点 id / route 结局（ok|empty|fail|
+   *  throttled|cached）/ 是否定版复用。缺省 `~/.dsh/logs/dsh-memory-inject.jsonl`。
+   *  只记结构不记正文；写失败静默降级。用来取代「重启后靠猜」的验收方式。 */
+  injectLogPath?: string
   /** **短期会话窗口**（滑动窗口，2026-10-06）：enabled（缺省 true）控制整条
    *  机制（写侧 + 注入侧同时静默）；turns（缺省 10）= 窗口取数条数
    *  （`session_recall` 的 `recent_limit`，语义是**条**不是轮）。
@@ -486,13 +510,25 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
   }
   const graph = mdcg
 
-  /** 最近一次真实用户消息（脱敏后，截断 300 字）；knowledge 召回查询词来源。 */
-  let lastUserMsg = ''
+  /** 最近一次真实用户消息（脱敏后，截断 300 字）；knowledge 召回查询词来源。
+   *  ⚠️ **必须按会话隔离**（C6，2026-11-15）：一个宿主进程同时服务多个工作区/会话，
+   *  原先这是**实例级单值** `let lastUserMsg`，后一条消息覆盖前一条。实测事故：
+   *  本会话（工程域，最后一条用户消息是「已经重启」）20:39 的注入块里出现 5 条
+   *  「双模型交叉验证 / check_taoguba_review / 复盘断言」交易语料，分数 0.82/0.78/0.55。
+   *  「已经重启」不可能召回这些；同一进程里 C:\study\newtest 会话在 20:39:18 发出
+   *  「market-review 系统性复盘」，把单值覆盖成交易语料 → 查询词含「复盘」→
+   *  queryIsMarket=true → **C1 跨域配额整条失效**（5 槽位全被交易语料填满）。
+   *  即：C1 的修复被另一条会话从侧门绕过。缓存键与 routeSeed/knowledgePin 同构。 */
+  const lastUserMsgBySession = new Map<string, string>()
+  /** 会话数上限（防长时间运行实例无限增长；键序≈插入序，满则淘汰最早）。 */
+  const LAST_USER_MSGS_MAX = 64
   /** 落盘审计（issue #56，诊断面）：三处过滤分支与写入/跳过路径各留一道**盘面**
    *  痕迹——宿主 logger 不落盘时，单看记忆侧无法区分「被设计滤除」与
    *  「写入失败/漏记」。审计失败静默降级（见 src/lib/hook_audit.ts），
    *  绝不冒泡进记忆路径、不改任何写入/过滤判定。 */
   const audit = new HookAuditRecorder(opts.auditPath)
+  /** 注入回执（C4）：每步一行，替掉「重启后靠日志/靠猜」的验收方式。 */
+  const receipt = new InjectReceiptLogger(opts.injectLogPath)
 
   // ── 短期会话窗口（contextWindow）：与知识面写入**独立成轨**（见文件头）──
   // 缺省开启（{ enabled: true, turns: 10 }）；enabled=false → 写侧与注入侧
@@ -614,11 +650,41 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
     let skippedSincePush = 0
     // 跨轮轮换：最近注入过的 knowledge 节点 id，窗口内不重复注入同一节点。
     const recentInjected: string[] = []
-    // route 起手兑底（评估优化②）：每会话自动 route 一次并缓存结果文本——
-    // agent 不调 cg(op=route) 也拿得到「相关知识 + 建议能力」。空串 = 已尝试
-    // （成功但无内容，或失败）→ 本会话不再重试，防每步撞墙。
+    // route 起手兜底（评估优化②）：每会话自动 route 一次并缓存结果文本——
+    // agent 不调 cg(op=route) 也拿得到「相关知识 + 建议能力」。
+    //
+    // ⚠️ 只缓存**成功**结果（`''` = 成功但无能力命中）；**失败不进缓存**，改为按时间
+    // 节流重试（ROUTE_RETRY_MS），**不设次数上限**。原实现把失败也写 `''` 并置位
+    // `has()`，等于「失败一次 → 本会话永久没有路由起手块」，且与「成功但无内容」在
+    // 缓存里不可区分。
+    //
+    // 2026-11-15 实测（C5）：重启后 13:02:22 起的注入全无该块，**13:05:30 才出现**——
+    // 即桥懒加载完成后才可 route，延迟约 3.8 分钟。所以**不能设次数上限**：首版实现
+    // 用「最多 3 次」会在桥就绪前就把配额耗尽，等于把同一个 bug 换个写法保留下来。
+    // 只节流不放弃：坏掉时每 20s 至多一次调用，桥一就绪立刻接上。
     const routeSeed = new Map<string, string>()
+    const routeNextTryAt = new Map<string, number>()
+    const ROUTE_RETRY_MS = 20000
+    // ── 选择稳定化（C2，2026-11-15）──
+    // 病：相邻两步 injected 块变化率 36%（1,299 对相邻步统计），而"分数抖动"只能解释
+    // 1.9%（1,274/1,299 对标题集合相同的相邻步，分数逐条相同）。真因是**每步重算选择集**：
+    // recentInjected 窗口一推，下一轮就换一批，于是同一小块在两组候选之间来回跳，
+    // 宿主每步判定"渲染文本变了"→ 追加快照，白烧上下文（本块实测平均 ~3.6 KB/次）。
+    // 改：按会话**定版（pin）**——选定的一组连同渲染文本一起钉住，连续 PIN_ROTATE_STEPS
+    // 步原样重推；只有 ①无定版 ②域类翻转 ③轮换期到 ④定版节点从候选中消失 才重选。
+    interface KnowledgePin { text: string; ids: string[]; domain: boolean; born: number }
+    const knowledgePin = new Map<string, KnowledgePin>()
+    /** 定版轮换期（步）。12 步一轮 → 相邻步变化率上限约 1/12 ≈ 8%。 */
+    const PIN_ROTATE_STEPS = 12
+    let assembleSeq = 0
     ctx.on('system-prompt/assemble', async (assembly, _ctx, next) => {
+      // ── C4 回执（2026-11-15）：本步的**结构**摘要，收尾处落一行 JSONL ──
+      // 没有它，验收只能靠「重启后猜」：C5 第一轮我就是这么错断的，重启 #5 那次
+      // 「route 块没出现」至今也无法区分「成功但无能力」与「仍在失败」。
+      let stepSid = '__global__'
+      let lessonReceipt: InjectReceipt['lesson'] = null
+      let routeReceipt: InjectReceipt['route'] = null
+      let routeErrText: string | undefined
       try {
         // 异步取最近记忆节点（失败静默——不阻塞模型请求）
         if (graph.isReady()) {
@@ -636,8 +702,20 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
           // 干净状态」，与 test/session-attribution.test.ts ② 的「未观测 → 不加
           // 过滤」相容）；已观测 → 取 lib/session_state.ts 的进程级单点值。
           // 真机单实例下两者逐位等价（差异窗口不可达）。
-          const sid = sessionIdOf(hostCtx?.agent?.session)
+          const explicitSid = sessionIdOf(hostCtx?.agent?.session)
+          const sid = explicitSid
             || (observedSession ? currentSession() : '')
+          // 会话键（查询词 C6 / 知识块定版 C2 / route 缓存共用）：**只认显式会话**。
+          // ctx 未给会话时**不**回落进程级单点——那可能是**另一个会话**（与 C6 同源：
+          // 同进程多工作区并发时「最近观测到的会话」≠「当前请求的会话」）。退化到
+          // '__global__' 后该键没有用户消息缓存 → 本步不注入知识块：宁可缺块，不可串台。
+          // 上面的 `sid` 保留回落，仅供 timeline 会话过滤与写入归因使用。
+          const rKey = explicitSid || '__global__'
+          stepSid = rKey
+          // 装配序号：每步 +1，只用于 C2 的定版轮换期判定（不参与内容）。
+          assembleSeq += 1
+          // C6：查询词只取**本会话**最近一条真实用户输入（同进程多会话不串台）
+          const lastUserMsg = lastUserMsgBySession.get(rKey) ?? ''
           const text = formatTimelineDecayed(
             await graph.timeline(recallLimit, sid ? { session: sid } : {}))
             .replace(/\uFFFD/g, '')
@@ -654,7 +732,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
             assembly.contexts.push({
               name: 'lingshu:auto-recall',
               text: escapePromptBraces(renderUntrustedMemoryBlock(
-                `【灵枢最近记忆】\n${text.slice(0, RECALL_MAX_CHARS)}`)),
+                `【灵枢最近记忆】〔${INJECT_STAMP}〕\n${text.slice(0, RECALL_MAX_CHARS)}`)),
             })
           }
           // 2) knowledge 层：基于当前对话上下文召回高相关度教训
@@ -695,7 +773,20 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
               // 而查询不含交易域词 → 该节点对当轮任务大概率是噪声。
               // 不硬丢弃：adjusted × 0.35 降权（选不满 2 条时第二轮 allowRecent 会回补），
               // 避免域判定误伤时注入变空。交易查询不受影响（query 命中交易词则不降权）。
-              const MARKET_DOMAIN_RE = /(market|实盘|回测|策略|涨停|跌停|仓位|恐慌日|oversold|cup_handle|复盘|选股|信号池|买入|卖出|止损|止盈|盈亏|持仓)/i
+              //
+              // ⚠️ 词表扩展（C1.5，2026-11-15）：原词表只认 20 个词，而交易语料大量条目
+              // 用的是「收盘轮 / 开盘轮 / 闸门 / 信号 / 清仓 / 均利 / K线」这类说法。实测
+              // （18,370 条注入项）：原词表只判出 70.7%，在**真实交易域**条目里漏检 12.5%
+              // （1,851 条）。漏检的后果不是"少降权"，而是 C1 的跨域配额根本不生效——
+              // 2026-11-15 重启后本会话（工程域，query 无交易词）实际注入 3 条全为交易
+              // 语料（收盘轮/闸门/管道），只有 1 条被旧词表认出来，配额形同虚设。
+              // 扩展后同一语料漏检 12.5% → 0.5%（68 条）。刻意**不加** `门禁`：本仓
+              // 自身的锚点/发布门禁也叫门禁，加了会误伤工程域条目（宁可留 1.5% 残差）。
+              const MARKET_DOMAIN_RE = new RegExp(
+                '(market|实盘|回测|backtest|策略|涨停|跌停|仓位|持仓|恐慌日|oversold|cup_handle'
+                + '|复盘|选股|信号池|信号|买入|卖出|止损|止盈|盈亏'
+                + '|清仓|建仓|交易|板块|收盘|开盘|盘中|闸门|均利|K线|行情|交割单|成交额|个股|标的'
+                + '|daily_qfq|review_winner|run_market_analysis)', 'i')
               const queryIsMarket = MARKET_DOMAIN_RE.test(query)
               const candidates: KnowledgeCandidate[] = []
               for (const r of kItems as any[]) {
@@ -732,20 +823,62 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
                 })
               }
               candidates.sort((left, right) => right.adjusted - left.adjusted)
-              // 域匹配优先：先在同域（未降权）里选，选不满 3 条再放开到降权候选——
+              // 域匹配优先：先在同域（未降权）里选，选不满 5 条再放开到降权候选——
               // 保证工程任务首轮至少能被通用纪律类填满，交易域只做回补。
+              //
+              // ⚠️ 跨域回补**必须有硬上限**（C1，2026-11-15）：无上限时第二轮会把 5 个
+              // 槽位全部用 0.35 降权的跨域节点填满，11-09 的域过滤等于整条作废。
+              // 实测（86 会话 / 18,370 条注入项）：工程会话 session-4990 的 knowledge 块
+              // 62.6% 是交易域（645 trade : 140 eng），全库注入项交易域占 72.2%。
+              // 上限 1 个槽位（≤20%）既挡住噪声灌注，又保留「域判定误伤时不至于注入变空」
+              // 的原始安全阀（原注释担心的正是空块，而非稀缺）。
+              // ── C3 断言化（2026-11-15）──
+              // 本块是**清单**不是文章：单条 ≤ ITEM_MAX_CHARS 字符、强制单行；整块
+              // ≤ KNOWLEDGE_MAX_CHARS。原先本块没有任何长度上限（timeline 块有
+              // RECALL_MAX_CHARS=1400，这里没有），实测均值 ~3.6 KB、最长 8 KB+，
+              // 其中大量是「## 事实（…实测…）```python…```」的过程叙述——对当轮判断
+              // 没有可执行信息，只稀释注意力。超长条目截断成一句断言 + 省略号。
+              const ITEM_MAX_CHARS = 120
+              const KNOWLEDGE_MAX_CHARS = 1200
+              const renderItem = (c: KnowledgeCandidate): string => {
+                const oneLine = c.preview.replace(/\s+/g, ' ').trim()
+                const body = oneLine.length > ITEM_MAX_CHARS
+                  ? `${oneLine.slice(0, ITEM_MAX_CHARS)}…` : oneLine
+                return `- [knowledge|score=${c.score.toFixed(2)}] ${body}`
+              }
+              // ── C2 定版复用（2026-11-15）──
+              // 命中条件：已有定版、域类未翻转、未到轮换期、且定版节点仍在本轮候选里。
+              // 命中则**逐字节重推上一份渲染文本**——宿主按文本比较决定是否追加快照，
+              // 文本不变就不追加，这是把「变化率 36%」压到「1/12」的唯一手段。
+              let kText = ''
+              const pin = knowledgePin.get(rKey)
+              const canReusePin = !!pin && pin.text !== '' && pin.domain === queryIsMarket
+                && (assembleSeq - pin.born) < PIN_ROTATE_STEPS
+                && pin.ids.every((id) => candidates.some((c) => c.nid === id))
+              if (canReusePin) {
+                kText = pin!.text
+                lessonReceipt = { n: pin!.ids.length, ids: pin!.ids, pinned: true }
+              }
+              // 未命中定版 → 重选（C1 跨域配额 + 轮换 + 断言化渲染）
+              if (!canReusePin) {
+              const RECALL_K = 5
+              const CROSS_DOMAIN_MAX = 1
+              let crossUsed = 0
               const chosen: KnowledgeCandidate[] = []
               const kSeen = new Set<string>()
               for (const [allowRecent, allowPenalized] of [[false, false], [false, true], [true, true]] as const) {
                 for (const c of candidates) {
-                  if (chosen.length >= 5) break
+                  if (chosen.length >= RECALL_K) break
                   if (kSeen.has(c.key)) continue
                   if (!allowRecent && recentInjected.includes(c.nid)) continue
                   if (!allowPenalized && c.domainPenalized) continue
+                  // 跨域回补配额：只约束降权（跨域）候选，同域候选不受影响
+                  if (c.domainPenalized && crossUsed >= CROSS_DOMAIN_MAX) continue
+                  if (c.domainPenalized) crossUsed += 1
                   kSeen.add(c.key)
                   chosen.push(c)
                 }
-                if (chosen.length >= 5) break
+                if (chosen.length >= RECALL_K) break
               }
               for (const c of chosen) {
                 const at = recentInjected.indexOf(c.nid)
@@ -753,11 +886,32 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
                 recentInjected.push(c.nid)
               }
               while (recentInjected.length > 40) recentInjected.shift()
-              const kText = chosen.map(c => `- [knowledge|score=${c.score.toFixed(2)}] ${c.preview}`).join('\n')
+              // C3：逐条渲染并累计长度；超整块上限即停（不切半条，避免半句误导）
+              const lines: string[] = []
+              let total = 0
+              for (const c of chosen) {
+                const line = renderItem(c)
+                if (total + line.length + 1 > KNOWLEDGE_MAX_CHARS) break
+                lines.push(line)
+                total += line.length + 1
+              }
+              kText = lines.join('\n')
+              const renderedIds = chosen.slice(0, lines.length).map(c => c.nid)
+              // 定版：渲染文本与所用节点 id 一并钉住；域类/出生序号用于失效判定
+              if (kText) {
+                knowledgePin.set(rKey, {
+                  text: kText,
+                  ids: renderedIds,
+                  domain: queryIsMarket,
+                  born: assembleSeq,
+                })
+                lessonReceipt = { n: renderedIds.length, ids: renderedIds, pinned: false }
+              }
+              }
               if (kText) {
                 assembly.contexts.push({
                   name: 'lingshu:knowledge-recall',
-                  text: escapePromptBraces(`【灵枢交易教训——分析前必须逐条对照：命中任何一条，结论必须体现该教训或明确写出为何不适用】\n${kText}`),
+                  text: escapePromptBraces(`【灵枢交易教训——分析前必须逐条对照：命中任何一条，结论必须体现该教训或明确写出为何不适用】〔${INJECT_STAMP}〕\n${kText}`),
                 })
               }
             } catch (e: any) { ctx.logger.warn(`dsh-memory: knowledge-recall 失败: ${e.message}`) }
@@ -766,11 +920,18 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
           // 2.5) route 起手兜底（评估优化②）：纪律 0.1 要求「先 route 再干活」，
           // 但实测 47 次会话仅 2 次显式调用——插件侧每会话自动 route 一次，把
           // 建议能力注入，agent 不调也拿得到。结果按会话缓存后**每步原样重推**
-          // （内容不变 → 宿主零追加，符合稳定性契约）；空串 = 无能力命中或
-          // 失败 → 本会话不再重试。route 服务端 record=False，不污染访问日志；
+          // （内容不变 → 宿主零追加，符合稳定性契约）；`''` = **成功**但无能力命中
+          // → 本会话不再重试。route 服务端 record=False，不污染访问日志；
           // 归档后的 code_/doc_ 不进候选，能力列表只剩 mem 节点的 cap。
-          const rKey = sid || '__global__'
-          if (!routeSeed.has(rKey) && lastUserMsg) {
+          if (routeSeed.has(rKey)) {
+            // 命中上一步缓存（本会话已有结论，含 '成功但无能力' 的空结论）
+            routeReceipt = { state: 'cached', caps: [] }
+          } else if (!lastUserMsg) {
+            routeReceipt = { state: 'skip', caps: [] }
+          } else if (Date.now() < (routeNextTryAt.get(rKey) ?? 0)) {
+            // 失败后的 20s 节流窗内：本步不撞墙（回执里也留痕，别让"没试"看起来像"没成"）
+            routeReceipt = { state: 'throttled', caps: [] }
+          } else {
             try {
               const rr = (await graph.route(lastUserMsg.slice(0, 80))) as any
               const caps = (rr && Array.isArray(rr.suggested_capabilities))
@@ -779,9 +940,13 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
               routeSeed.set(rKey, caps.length
                 ? `建议能力：${caps.slice(0, 8).join('、')}`
                 : '')
+              routeReceipt = { state: caps.length ? 'ok' : 'empty', caps: caps.slice(0, 8) }
             } catch (e: any) {
-              ctx.logger.warn(`dsh-memory: route 起手失败: ${e.message}`)
-              routeSeed.set(rKey, '')
+              routeNextTryAt.set(rKey, Date.now() + ROUTE_RETRY_MS)
+              routeErrText = String(e?.message ?? e)
+              routeReceipt = { state: 'fail', caps: [] }
+              ctx.logger.warn(`dsh-memory: route 起手失败（${ROUTE_RETRY_MS / 1000}s 后重试，`
+                + `不放弃）: ${e.message}`)
             }
           }
           const rText = routeSeed.get(rKey) || ''
@@ -789,7 +954,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
             assembly.contexts.push({
               name: 'lingshu:route-seed',
               text: escapePromptBraces(renderUntrustedMemoryBlock(
-                `【灵枢路由起手——本会话预路由结果，按需调用对应能力】\n${rText}`)),
+                `【灵枢路由起手——本会话预路由结果，按需调用对应能力】〔${INJECT_STAMP}〕\n${rText}`)),
             })
           }
 
@@ -811,7 +976,7 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
                 assembly.contexts.push({
                   name: 'lingshu:session-window',
                   text: escapePromptBraces(renderUntrustedMemoryBlock(
-                    `【本会话近期对话】\n${winText}`)),
+                    `【本会话近期对话】〔${INJECT_STAMP}〕\n${winText}`)),
                 })
               }
             } catch { /* 静默：窗口取数失败不影响请求，也不影响既有块 */ }
@@ -819,6 +984,18 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
         }
       }
       catch { /* 静默：召回失败不影响请求 */ }
+      // C4 回执落盘（静默，不参与任何判定）：本步注入了什么、route 什么结局。
+      // 之后验收直接读 ~/.dsh/logs/dsh-memory-inject.jsonl，不必重启猜因。
+      receipt.log({
+        t: new Date().toISOString(),
+        sid: stepSid,
+        blocks: assembly.contexts
+          .map((c) => c.name)
+          .filter((name) => name.startsWith('lingshu:')),
+        lesson: lessonReceipt,
+        route: routeReceipt,
+        ...(routeErrText === undefined ? {} : { err: routeErrText }),
+      })
       return next()
     })
   }
@@ -867,7 +1044,13 @@ export function installMemoryHooks(ctx: Context, mdcg: MdcgClient | null, opts: 
       if (!text) return
       const safe = sanitize(text)  // 脱敏：纯凭据消息 → null → 跳过写入
       if (safe === null) { audit.skipped('sanitized', 'user'); return }
-      lastUserMsg = safe.slice(0, 300) // 缓存最近用户消息供 knowledge 召回使用
+      // C6：按会话缓存（同进程多会话各存各的，见 lastUserMsgBySession 注释）
+      const lk = sid || '__global__'
+      lastUserMsgBySession.set(lk, safe.slice(0, 300))
+      if (lastUserMsgBySession.size > LAST_USER_MSGS_MAX) {
+        const oldest = lastUserMsgBySession.keys().next().value
+        if (oldest !== undefined) lastUserMsgBySession.delete(oldest)
+      }
       memorize('user', 'user', (g) => g.remember(safe, {
         role: 'user', tags: ['dsh', 'user'], importance: opts.importance,
         ...sessionTag,

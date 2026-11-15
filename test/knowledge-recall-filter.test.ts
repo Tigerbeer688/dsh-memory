@@ -125,7 +125,9 @@ test('生产路径候选过滤：日志节点挡、correction 豁免、code/低�
   const onAssemble = listeners.get('system-prompt/assemble')
   assert.ok(onAssemble, '应注册 system-prompt/assemble 监听')
   const assembly: Assembly = { contexts: [{ name: 'clock', text: '当前时间 12:00' }], variables: {} }
-  await onAssemble(assembly, {}, async () => assembly)
+  // C6：带显式会话（生产宿主由 ctx.agent.session 提供）；不带时插件不借用别的会话缓存
+  await onAssemble(assembly, { agent: { session: { id: 's-test-1' } } } as never,
+    async () => assembly)
 
   // ③ 契约：knowledge 召回只允许 protocol.read 白名单参数（{k, layer}），paths 必须缺席
   // （同轮还有 memorize 的 user-recall g.read({k, session})，一并核对会话槽）
