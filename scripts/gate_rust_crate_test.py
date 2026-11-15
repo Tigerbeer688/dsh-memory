@@ -87,7 +87,17 @@ def main() -> int:
         return 0
 
     argv = [cargo, "test", "--manifest-path", manifest]
-    env = dict(os.environ, PYTHONUTF8="1")
+    # 临时根**显式落在仓内**（2026-11-15 实测故障现场）：
+    # 用例经 `std::env::temp_dir()` 建临时目录（store/engine/serve 各有 temp_root 助手，
+    # 失败点在 rust/src/store.rs 的 `create_dir_all(d.join("knowledge"))`）。在受限宿主上，
+    # 子进程拿到的 %TEMP% 可能是**沙箱重定向目录**（形如 `…\AppData\Local\Temp\2`）——
+    # 该目录对测试二进制拒绝建目录，os error 5 / PermissionDenied，12 条用例假红
+    # （19 passed / 12 failed，rc=101）；同一条用例把 TEMP 指到仓内可写目录即通过。
+    # 故本腿给 cargo test 一个与宿主 %TEMP% 解耦的仓内临时根（`.tmp/` 已被 gitignore，
+    # 与其它门的沙箱惯例一致；CI 上同样无害）。
+    tmp_root = os.path.join(_REPO, ".tmp", "rust-test-temp")
+    os.makedirs(tmp_root, exist_ok=True)
+    env = dict(os.environ, PYTHONUTF8="1", TEMP=tmp_root, TMP=tmp_root)
     t0 = time.time()
     p = subprocess.run(argv, cwd=_REPO, capture_output=True, text=True,
                        encoding="utf-8", errors="replace", env=env)

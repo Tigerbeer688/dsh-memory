@@ -629,7 +629,11 @@ def phase_d(tmp):
 # ---------------------------- E 集成（真源存在才跑） ----------------------------
 
 #: 2026-09-15 审计（node_26b0973a，欠账 11195）对应的真源库；E2 的量级窗口只描述它。
-AUDITED_BASELINE_ROOT = "D:/Program Files/2_ai/AEIS/data/mdcg"
+#: 2026-11-15：原常量钉的是**旧机绝对路径**（`Program Files` 下的 `2_ai/AEIS/data/mdcg`），
+#: 被本机路径门禁（`scripts/check_local_paths.py`）判红——机器专属前缀不得进追踪面。
+#: 改为中性占位：真源在场时优先由 `MDCG_ROOT` / `datapath.mdcg_root()` /
+#: `MDCG_CONFORMANCE_ROOT` 提供，本常量只是最后一档兜底（缺则整组 E 跳过，不伪造读数）。
+AUDITED_BASELINE_ROOT = os.path.join(os.path.expanduser("~"), "AEIS", "data", "mdcg")
 
 
 def _real_root():

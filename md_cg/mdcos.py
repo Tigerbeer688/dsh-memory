@@ -74,7 +74,7 @@ DEFAULT_MAX_ITEM_TOKENS = 250
 # （该模块 docstring 逐字点名 `exp(-t/τ)` 为 bug）；本模块**不写任何指数核**。
 #: γ（衰减率）可配 env —— 与 `MDCG_SPREAD_DECAY` 同款：缺失/非法即回落缺省。
 TEMPORAL_GAMMA_ENV = "MDCG_TEMPORAL_GAMMA"
-#: 半衰期真源 = `links.DECAY_DAYS`（30 天，`md_cg/links.py:53`）——不复制字面量，
+#: 半衰期真源 = `links.DECAY_DAYS`（30 天，`md_cg/links.py`）——不复制字面量，
 #: 由 `temporal_gamma()` 现取；此处只写明「γ 缺省 = ln2 / 半衰期」这一换算。
 #: 单位口径（**最易错处**）：γ 是「每天」的速率，故 Δt 必须**以天为单位**喂入。
 TEMPORAL_DT_UNIT = "day"
